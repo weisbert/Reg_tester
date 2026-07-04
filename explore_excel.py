@@ -93,6 +93,43 @@ def preview_value(v, width=18):
     return s.ljust(width)
 
 
+def _guess_header(all_rows):
+    """前 10 行里非空单元格最多的那一行，当表头。返回 (行号0基, 该行值)。"""
+    idx, vals, best = None, None, -1
+    for i, row in enumerate(all_rows[:10]):
+        cnt = sum(1 for v in row if v is not None and str(v).strip() != "")
+        if cnt > best:
+            best, idx, vals = cnt, i, row
+    return idx, vals
+
+
+def _norm(v, cell_maxlen=32):
+    if v is None:
+        return None
+    if isinstance(v, (int, float, bool)):
+        return v
+    s = str(v)
+    return s if len(s) <= cell_maxlen else s[: cell_maxlen - 1] + "…"
+
+
+def build_index(ws):
+    """超精简：一个 sheet 只留最基本的形状信息，体积极小。"""
+    all_rows = list(ws.iter_rows(values_only=True))
+    idx, header_vals = _guess_header(all_rows)
+    n = ws.max_column
+    headers = [_norm(header_vals[c]) if header_vals and c < len(header_vals) else None
+               for c in range(n)] if header_vals else []
+    return {
+        "title": ws.title,
+        "dimensions": ws.dimensions,
+        "n_rows": ws.max_row,
+        "n_cols": ws.max_column,
+        "merged_cells_count": len(ws.merged_cells.ranges),
+        "header_row_index_0based": idx,
+        "headers": headers,
+    }
+
+
 def build_schema(ws, sample_rows=6, examples_per_col=6, max_merged=40, cell_maxlen=40):
     """只提取"理解结构所需的最小信息"，体积小、可直接发出去。
 
@@ -229,9 +266,14 @@ def main():
     ap.add_argument("--rows", type=int, default=20, help="每个 sheet 预览多少行 (默认 20)")
     ap.add_argument("--sheet", default=None, help="只看指定名字的 sheet")
     ap.add_argument("--dump", default=None, help="把【完整】内容导出到该 JSON 文件（会很大）")
+    ap.add_argument("--index", nargs="?", const="-", default=None,
+                    help="【超精简】每个 sheet 只列 名字/尺寸/行列/合并数/表头，几乎一定很小；"
+                         "给路径写文件，不给则打印到控制台。先发这个看整体形状。")
     ap.add_argument("--schema", nargs="?", const="-", default=None,
-                    help="只导出【结构骨架】的最小 JSON（体积小，可直接发出）；"
+                    help="【结构骨架】每个 sheet 出 类型+样例+样本行；配 --sheet/--max-sheets 控体积；"
                          "给路径写文件，不给则打印到控制台")
+    ap.add_argument("--max-sheets", type=int, default=None,
+                    help="只处理前 N 个 sheet（配 --index/--schema 压体积）")
     ap.add_argument("--formulas", action="store_true",
                     help="读公式原文而非缓存计算值（宏/公式算出的值读成空时用）")
     args = ap.parse_args()
@@ -259,24 +301,42 @@ def main():
     for name in targets:
         if name not in wb.sheetnames:
             print(f"!! 没有名为 {name!r} 的 sheet，跳过")
+    if args.max_sheets is not None:
+        valid = valid[: args.max_sheets]
 
-    # --- 结构骨架（最小集合），优先处理 ---
-    if args.schema is not None:
-        schema = {
-            "file": os.path.basename(args.path),
-            "sheet_names": wb.sheetnames,
-            "sheets": [build_schema(wb[n]) for n in valid],
-        }
-        text = json.dumps(schema, ensure_ascii=False, indent=2)
-        if args.schema == "-":
-            print("\n" + "=" * 100)
-            print("结构骨架（可直接复制发出）：\n")
+    def emit(obj, dest, label):
+        """dest=='-' 打印到控制台，否则写文件；都会报字节数。"""
+        text = json.dumps(obj, ensure_ascii=False, indent=2)
+        nbytes = len(text.encode("utf-8"))
+        print("\n" + "=" * 100)
+        if dest == "-":
+            print(f"{label}（{nbytes} bytes，可直接复制发出）：\n")
             print(text)
         else:
-            with open(args.schema, "w", encoding="utf-8") as f:
+            with open(dest, "w", encoding="utf-8") as f:
                 f.write(text)
-            print("\n" + "=" * 100)
-            print(f"结构骨架已导出到: {args.schema}  (体积小，可直接发出)")
+            print(f"{label}已导出到: {dest}  ({nbytes} bytes = {nbytes/1024:.1f} KB)")
+            if nbytes > 60 * 1024:
+                print("  ⚠ 还是偏大：可加 --max-sheets N 或 --sheet \"某表\" 只导需要的部分。")
+
+    # --- 超精简 index，优先 ---
+    if args.index is not None:
+        emit({
+            "file": os.path.basename(args.path),
+            "n_sheets": len(wb.sheetnames),
+            "sheet_names": wb.sheetnames,
+            "sheets": [build_index(wb[n]) for n in valid],
+        }, args.index, "Sheet 索引")
+        return
+
+    # --- 结构骨架 ---
+    if args.schema is not None:
+        emit({
+            "file": os.path.basename(args.path),
+            "n_sheets": len(wb.sheetnames),
+            "sheet_names": wb.sheetnames,
+            "sheets": [build_schema(wb[n]) for n in valid],
+        }, args.schema, "结构骨架")
         return
 
     # --- 人读预览 / 完整导出 ---
