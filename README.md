@@ -13,6 +13,12 @@
 
 > 真实的寄存器表 / netlist 属机密，默认被 `.gitignore` 挡在仓库外。
 
+## 安装
+
+```powershell
+pip install -r requirements.txt
+```
+
 ## 工具
 
 ### `explore_excel.py` —— 探查 Excel 结构

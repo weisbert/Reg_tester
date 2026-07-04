@@ -1,0 +1,5 @@
+# Reg_tester 依赖
+# 安装： pip install -r requirements.txt
+
+# 读写 .xlsx / .xlsm（含合并单元格、公式缓存值）
+openpyxl>=3.1,<4
