@@ -66,6 +66,16 @@ python extract_ports.py "路径\netlist.vh" --modules A,B,C    # 指定模块
 默认目标模块：`CHAIN_TOP_A`、`CHAIN_TOP_B`、`CLK_MUX_C`。
 输出把端口分成 控制输入 / 输出 / 模拟 inout / 电源地 四类，控制输入即候选控制信号。
 
+**连接模式 `--connections`**（命名多轮迭代后不可信，靠连接定 ground truth）：抽出
+端口 + wire + instance(例化) + 连线，并建 `net_index`（每根网络接到哪些顶层端口/实例引脚），
+用于追踪 `EN → buffer实例 → 输出` 的真实通路。带自诊断：模块体里没被识别为
+端口/wire/assign/instance 的残留会进 `unparsed`——**`✓ 无残留` 才算可信**。
+
+```powershell
+python extract_ports.py "netlist.vh" --connections --json conn.json   # 抽连接
+python extract_ports.py "netlist.vh" --body <MODULE> --head 80         # 打印模块体原文(核对语法)
+```
+
 ## 状态
 
 需求对齐 + 收集文件中。
