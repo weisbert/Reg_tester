@@ -93,6 +93,69 @@ def preview_value(v, width=18):
     return s.ljust(width)
 
 
+def build_schema(ws, sample_rows=6, examples_per_col=6, max_merged=40, cell_maxlen=40):
+    """只提取"理解结构所需的最小信息"，体积小、可直接发出去。
+
+    包含：尺寸、合并单元格(截断)、表头猜测、每列(类型 + 去重样例值)、
+    以及头几行完整样本行。不含全部数据。
+    """
+    def norm(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float, bool)):
+            return v
+        s = str(v)
+        return s if len(s) <= cell_maxlen else s[: cell_maxlen - 1] + "…"
+
+    all_rows = list(ws.iter_rows(values_only=True))
+    ncols = ws.max_column
+    merged = [str(r) for r in ws.merged_cells.ranges]
+
+    # 表头猜测：前 10 行里非空单元格最多的那一行
+    header_row_idx, header_vals = None, None
+    best = -1
+    for i, row in enumerate(all_rows[:10]):
+        cnt = sum(1 for v in row if v is not None and str(v).strip() != "")
+        if cnt > best:
+            best, header_row_idx, header_vals = cnt, i, row
+
+    # 每列：类型 + 去重样例（采样前 500 行）
+    sample = all_rows[:500]
+    columns = []
+    for c in range(ncols):
+        col_vals = [r[c] if c < len(r) else None for r in sample]
+        distinct, seen = [], set()
+        for v in col_vals:
+            if v is None or str(v).strip() == "":
+                continue
+            s = str(v)
+            if s in seen:
+                continue
+            seen.add(s)
+            distinct.append(norm(v))
+            if len(distinct) >= examples_per_col:
+                break
+        columns.append({
+            "col": col_letter(c + 1),
+            "type": guess_type(col_vals),
+            "header": norm(header_vals[c]) if header_vals and c < len(header_vals) else None,
+            "examples": distinct,
+        })
+
+    return {
+        "title": ws.title,
+        "dimensions": ws.dimensions,
+        "n_rows": ws.max_row,
+        "n_cols": ws.max_column,
+        "freeze_panes": ws.freeze_panes,
+        "merged_cells_count": len(merged),
+        "merged_cells": merged[:max_merged] + (["...(截断)"] if len(merged) > max_merged else []),
+        "header_row_index_0based": header_row_idx,
+        "columns": columns,
+        "sample_rows": [[norm(v) for v in row] for row in all_rows[:sample_rows]],
+    }
+
+
 def explore_sheet(ws, max_preview_rows, dump_full):
     print("=" * 100)
     print(f"[SHEET] {ws.title!r}")
@@ -165,7 +228,10 @@ def main():
     ap.add_argument("path", help="xlsx / xlsm 文件路径")
     ap.add_argument("--rows", type=int, default=20, help="每个 sheet 预览多少行 (默认 20)")
     ap.add_argument("--sheet", default=None, help="只看指定名字的 sheet")
-    ap.add_argument("--dump", default=None, help="把完整内容导出到该 JSON 文件")
+    ap.add_argument("--dump", default=None, help="把【完整】内容导出到该 JSON 文件（会很大）")
+    ap.add_argument("--schema", nargs="?", const="-", default=None,
+                    help="只导出【结构骨架】的最小 JSON（体积小，可直接发出）；"
+                         "给路径写文件，不给则打印到控制台")
     ap.add_argument("--formulas", action="store_true",
                     help="读公式原文而非缓存计算值（宏/公式算出的值读成空时用）")
     args = ap.parse_args()
@@ -188,12 +254,34 @@ def main():
                                 data_only=not args.formulas)
     print(f"共 {len(wb.sheetnames)} 个 sheet: {wb.sheetnames}\n")
 
-    dump = {"file": os.path.abspath(args.path), "sheets": []}
     targets = [args.sheet] if args.sheet else wb.sheetnames
+    valid = [n for n in targets if n in wb.sheetnames]
     for name in targets:
         if name not in wb.sheetnames:
             print(f"!! 没有名为 {name!r} 的 sheet，跳过")
-            continue
+
+    # --- 结构骨架（最小集合），优先处理 ---
+    if args.schema is not None:
+        schema = {
+            "file": os.path.basename(args.path),
+            "sheet_names": wb.sheetnames,
+            "sheets": [build_schema(wb[n]) for n in valid],
+        }
+        text = json.dumps(schema, ensure_ascii=False, indent=2)
+        if args.schema == "-":
+            print("\n" + "=" * 100)
+            print("结构骨架（可直接复制发出）：\n")
+            print(text)
+        else:
+            with open(args.schema, "w", encoding="utf-8") as f:
+                f.write(text)
+            print("\n" + "=" * 100)
+            print(f"结构骨架已导出到: {args.schema}  (体积小，可直接发出)")
+        return
+
+    # --- 人读预览 / 完整导出 ---
+    dump = {"file": os.path.abspath(args.path), "sheets": []}
+    for name in valid:
         ws = wb[name]
         dump["sheets"].append(
             explore_sheet(ws, args.rows, dump_full=bool(args.dump))

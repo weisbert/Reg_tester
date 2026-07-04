@@ -31,10 +31,16 @@ pip install -r requirements.txt
 # 控制台切 UTF-8，避免中文乱码（每个窗口执行一次）
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-python explore_excel.py "寄存器表.xlsm"                 # 只看结构
-python explore_excel.py "寄存器表.xlsm" --dump reg_dump.json  # 结构 + 完整内容导出
-python explore_excel.py "寄存器表.xlsm" --formulas      # 值是宏/公式算的、读成空时改看公式
+python explore_excel.py "寄存器表.xlsm"                    # 控制台看结构预览
+python explore_excel.py "寄存器表.xlsm" --schema schema.json  # 只导结构骨架（体积小，可发出）
+python explore_excel.py "寄存器表.xlsm" --schema             # 结构骨架直接打印到控制台
+python explore_excel.py "寄存器表.xlsm" --dump reg_dump.json  # 完整内容导出（会很大）
+python explore_excel.py "寄存器表.xlsm" --formulas          # 值是宏/公式算的、读成空时改看公式
 ```
+
+- `--schema`：**理解结构的最小集合**（尺寸、合并单元格、表头、每列类型+去重样例、头几行样本），
+  样例数与样本行都有上限，再大的表导出也很小，适合发出来对齐需求。
+- `--dump`：把每个格子都导出，文件会很大。
 
 ## 状态
 
