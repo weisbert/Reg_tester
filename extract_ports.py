@@ -406,7 +406,16 @@ def ports_via_assign(module, net, assign_adj, pset):
     return hits
 
 
-def trace_up(module, port, uses, porder, pset, assign_adj, depth=0, max_depth=14):
+def get_netindex(module, mods, cache):
+    """惰性计算并缓存某模块的 net_index（网络 -> 触点列表）。"""
+    if module not in cache:
+        hdr, body = mods[module]
+        cache[module] = parse_connectivity(module, hdr, body)["net_index"]
+    return cache[module]
+
+
+def trace_up(module, port, uses, porder, pset, assign_adj, mods, netcache,
+             depth=0, max_depth=14):
     """从 module.port 向上追：连线若是父端口就继续爬；若是内部网络则试 assign 别名到父端口；
     直到文件顶(根)或在某层被真正内部消耗。"""
     if depth > max_depth:
@@ -433,14 +442,21 @@ def trace_up(module, port, uses, porder, pset, assign_adj, depth=0, max_depth=14
             step = {"parent": p, "inst": inst, "net": net,
                     "net_is_parent_port": net in pset.get(p, set())}
             if step["net_is_parent_port"]:
-                step["up"] = trace_up(p, net, uses, porder, pset, assign_adj, depth + 1, max_depth)
+                step["up"] = trace_up(p, net, uses, porder, pset, assign_adj, mods, netcache,
+                                      depth + 1, max_depth)
             else:
                 via = ports_via_assign(p, net, assign_adj, pset)
                 if via:
                     step["via_assign_to"] = via
                     step["up"] = []
                     for pv in via:
-                        step["up"] += trace_up(p, pv, uses, porder, pset, assign_adj, depth + 1, max_depth)
+                        step["up"] += trace_up(p, pv, uses, porder, pset, assign_adj, mods,
+                                               netcache, depth + 1, max_depth)
+                else:
+                    # 终点内部网络：列出这根网上的兄弟触点（真正驱动/负载它的 cell 实例）
+                    ni = get_netindex(p, mods, netcache)
+                    own = f"{module}/{inst}."
+                    step["siblings"] = [t for t in ni.get(net, []) if not t.startswith(own)][:12]
             out.append(step)
     return out
 
@@ -461,7 +477,11 @@ def flatten_trace(steps, prefix):
                 here += f" [assign→ {', '.join(s['via_assign_to'])}]"
                 lines += flatten_trace(s["up"], here)
             else:
-                lines.append(here + "  [内部网络, 在此层被使用/驱动]")
+                tail = "  [内部网络"
+                if s.get("siblings"):
+                    tail += "; 相邻: " + ", ".join(s["siblings"])
+                tail += "]"
+                lines.append(here + tail)
     return lines
 
 
@@ -602,6 +622,7 @@ def main():
                             adj.setdefault(a, set()).add(c)
                             adj.setdefault(c, set()).add(a)
             assign_adj[nm] = adj
+        netcache = {}
         print(f"文件顶层(根)模块: {', '.join(roots) if roots else '(未识别)'}")
         print(f"叶子/外部(被例化但本文件未定义)约 {len(externals)} 种\n")
 
@@ -633,7 +654,7 @@ def main():
                 for p in tports:
                     if POWER_RE.match(p["name"]):
                         continue
-                    steps = trace_up(nm, p["name"], uses, porder, pset, assign_adj)
+                    steps = trace_up(nm, p["name"], uses, porder, pset, assign_adj, mods, netcache)
                     lines = flatten_trace(steps, f"    {p['name']}({p['dir']})")
                     per_port.append({"port": p["name"], "dir": p["dir"], "steps": steps})
                     for ln in lines:
