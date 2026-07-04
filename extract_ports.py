@@ -346,6 +346,125 @@ def parse_connectivity(name, hdr, body):
     }
 
 
+# ----------------------------- 层级/向上追踪 -----------------------------
+
+def module_instances(body):
+    work = blank(body, DECL_RE)
+    work = blank(work, WIRE_RE)
+    work = blank(work, ASSIGN_RE)
+    insts, _ = scan_instances(work)
+    return insts
+
+
+def build_graph(mods, order):
+    """返回 uses(child_type -> [(parent, inst, conns)]), roots, externals(叶子/未定义)。"""
+    uses = {}
+    for pname in order:
+        hdr, body = mods[pname]
+        for it in module_instances(body):
+            uses.setdefault(it["type"], []).append((pname, it["name"], it["connections"]))
+    defined = set(mods)
+    used = set(uses)
+    roots = [m for m in order if m not in used]        # 定义了但没被谁例化 = 顶
+    externals = sorted(used - defined)                  # 被例化但没定义 = 叶子(.va)/外部
+    return uses, roots, externals
+
+
+def paths_to_root(target, uses, max_paths=30):
+    """target 到根的所有层级路径。每条 = [(childtype, instname) ...] 顶->下, 末尾是 target。"""
+    out = []
+
+    def rec(node, below, seen):
+        parents = uses.get(node)
+        if not parents:
+            out.append((node, below))                   # node 是根
+            return
+        for (p, inst, _) in parents:
+            if p in seen or len(out) >= max_paths:
+                out.append((f"<cycle {p}>", below))
+                continue
+            rec(p, [(node, inst)] + below, seen | {p})
+
+    rec(target, [], {target})
+    return out
+
+
+def ports_via_assign(module, net, assign_adj, pset):
+    """在 module 内，net 通过 assign 别名能到达哪些本模块端口（BFS 传递闭包）。"""
+    adj = assign_adj.get(module, {})
+    ports = pset.get(module, set())
+    seen, stack, hits = {net}, [net], []
+    while stack:
+        x = stack.pop()
+        for y in adj.get(x, ()):
+            if y in seen:
+                continue
+            seen.add(y)
+            if y in ports:
+                hits.append(y)
+            stack.append(y)
+    return hits
+
+
+def trace_up(module, port, uses, porder, pset, assign_adj, depth=0, max_depth=14):
+    """从 module.port 向上追：连线若是父端口就继续爬；若是内部网络则试 assign 别名到父端口；
+    直到文件顶(根)或在某层被真正内部消耗。"""
+    if depth > max_depth:
+        return [{"note": "达到最大深度"}]
+    parents = uses.get(module)
+    if not parents:
+        return [{"top_pin": port, "in": module}]        # 根：port 就是文件顶层引脚
+    out = []
+    for (p, inst, conns) in parents:
+        found = None
+        for c in conns:
+            if c["pin"] == port:
+                found = c
+                break
+            if c["pin"] is None:                        # 位置连接：按目标端口顺序匹配
+                order = porder.get(module, [])
+                if 0 <= c["pos"] < len(order) and order[c["pos"]] == port:
+                    found = c
+                    break
+        if not found:
+            out.append({"parent": p, "inst": inst, "note": "此例化未连该端口"})
+            continue
+        for net in found["nets"]:
+            step = {"parent": p, "inst": inst, "net": net,
+                    "net_is_parent_port": net in pset.get(p, set())}
+            if step["net_is_parent_port"]:
+                step["up"] = trace_up(p, net, uses, porder, pset, assign_adj, depth + 1, max_depth)
+            else:
+                via = ports_via_assign(p, net, assign_adj, pset)
+                if via:
+                    step["via_assign_to"] = via
+                    step["up"] = []
+                    for pv in via:
+                        step["up"] += trace_up(p, pv, uses, porder, pset, assign_adj, depth + 1, max_depth)
+            out.append(step)
+    return out
+
+
+def flatten_trace(steps, prefix):
+    """把 trace_up 的树压成可读的链字符串列表。"""
+    lines = []
+    for s in steps:
+        if "top_pin" in s:
+            lines.append(f"{prefix}  ==> 顶层引脚 {s['top_pin']} @ {s['in']}")
+        elif "note" in s:
+            lines.append(f"{prefix}  [{s['note']}]" + (f" @ {s.get('parent','')}" if s.get('parent') else ""))
+        else:
+            here = f"{prefix} ⟵ {s['parent']}.{s['inst']} (net {s['net']})"
+            if s.get("net_is_parent_port") and s.get("up"):
+                lines += flatten_trace(s["up"], here)
+            elif s.get("via_assign_to"):
+                here += f" [assign→ {', '.join(s['via_assign_to'])}]"
+                lines += flatten_trace(s["up"], here)
+            else:
+                lines.append(here + "  [内部网络, 在此层被使用/驱动]")
+    return lines
+
+
 # ----------------------------- 端口模式输出 -----------------------------
 
 def summarize_ports(name, ports):
@@ -429,6 +548,10 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出文件里所有模块名")
     ap.add_argument("--connections", action="store_true",
                     help="连接模式：抽 端口+wire+instance+连线 并建 net_index")
+    ap.add_argument("--tree", action="store_true",
+                    help="层级树：目标模块怎么从根(文件顶)一层层例化下来")
+    ap.add_argument("--uptrace", action="store_true",
+                    help="向上追踪：目标模块每个端口连到父层哪根网络、一直追到文件顶层引脚")
     ap.add_argument("--body", default=None, help="打印指定模块体的原文（核对语法用）")
     ap.add_argument("--head", type=int, default=80, help="配 --body：打印前 N 行")
     args = ap.parse_args()
@@ -460,6 +583,76 @@ def main():
 
     targets = ([m.strip() for m in args.modules.split(",") if m.strip()]
                if args.modules else DEFAULT_MODULES)
+
+    # ---- 层级树 / 向上追踪：需要全局例化关系 ----
+    if args.tree or args.uptrace:
+        not_found = []
+        uses, roots, externals = build_graph(mods, order)
+        porder = {nm: [p["name"] for p in parse_ports(h, b)] for nm, (h, b) in mods.items()}
+        pset = {nm: set(v) for nm, v in porder.items()}
+        assign_adj = {}
+        for nm, (h, b) in mods.items():
+            adj = {}
+            for mm in ASSIGN_RE.finditer(b):
+                s = mm.group(1)
+                if "=" in s:
+                    L, R = s.split("=", 1)
+                    for a in extract_nets(L):
+                        for c in extract_nets(R):
+                            adj.setdefault(a, set()).add(c)
+                            adj.setdefault(c, set()).add(a)
+            assign_adj[nm] = adj
+        print(f"文件顶层(根)模块: {', '.join(roots) if roots else '(未识别)'}")
+        print(f"叶子/外部(被例化但本文件未定义)约 {len(externals)} 种\n")
+
+        tree_out, up_out = [], []
+        for nm in targets:
+            if nm not in mods:
+                not_found.append(nm)
+                continue
+            print("=" * 90)
+            print(f"[目标] {nm}")
+            paths = paths_to_root(nm, uses)
+            tree_out.append({"module": nm, "paths": [
+                {"root": root, "chain": [{"type": t, "inst": i} for (t, i) in below]}
+                for (root, below) in paths]})
+            if not paths:
+                print("  (没找到父模块——它可能就是根)")
+            for (root, below) in paths:
+                print(f"  {root}")
+                indent = "  "
+                for (t, inst) in below:
+                    indent += "  "
+                    print(f"{indent}└ {inst} : {t}")
+
+            if args.uptrace:
+                hdr, body = mods[nm]
+                tports = parse_ports(hdr, body)
+                print(f"\n  ── 端口向上追踪（到文件顶层引脚）──")
+                per_port = []
+                for p in tports:
+                    if POWER_RE.match(p["name"]):
+                        continue
+                    steps = trace_up(nm, p["name"], uses, porder, pset, assign_adj)
+                    lines = flatten_trace(steps, f"    {p['name']}({p['dir']})")
+                    per_port.append({"port": p["name"], "dir": p["dir"], "steps": steps})
+                    for ln in lines:
+                        print(ln)
+                up_out.append({"module": nm, "ports": per_port})
+
+        if not_found:
+            print("\n" + "!" * 90)
+            print("以下模块名没找到（确认拼写，或用 --list）：")
+            for nm in not_found:
+                print("  " + nm)
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as f:
+                json.dump({"file": os.path.basename(args.path),
+                           "roots": roots, "n_externals": len(externals),
+                           "tree": tree_out, "uptrace": up_out,
+                           "not_found": not_found}, f, ensure_ascii=False, indent=2)
+            print(f"\n已导出 JSON: {args.json}")
+        return
 
     results, not_found = [], []
     for nm in targets:
