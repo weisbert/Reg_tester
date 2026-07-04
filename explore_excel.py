@@ -289,6 +289,8 @@ def main():
     ap.add_argument("--schema", nargs="?", const="-", default=None,
                     help="【结构骨架】每个 sheet 出 类型+样例+样本行；配 --sheet/--max-sheets 控体积；"
                          "给路径写文件，不给则打印到控制台")
+    ap.add_argument("--schema-dir", default=None,
+                    help="【批量】把每个 sheet 各导成一个小 json 到该文件夹（一条命令收齐所有 sheet）")
     ap.add_argument("--max-sheets", type=int, default=None,
                     help="只处理前 N 个 sheet（配 --index/--schema 压体积）")
     ap.add_argument("--formulas", action="store_true",
@@ -335,6 +337,25 @@ def main():
             print(f"{label}已导出到: {dest}  ({nbytes} bytes = {nbytes/1024:.1f} KB)")
             if nbytes > 60 * 1024:
                 print("  ⚠ 还是偏大：可加 --max-sheets N 或 --sheet \"某表\" 只导需要的部分。")
+
+    # --- 批量：每个 sheet 各一个小文件 ---
+    if args.schema_dir is not None:
+        os.makedirs(args.schema_dir, exist_ok=True)
+        total = 0
+        print("\n" + "=" * 100)
+        for i, name in enumerate(valid, 1):
+            obj = {"file": os.path.basename(args.path), "sheet": build_schema(wb[name])}
+            text = json.dumps(obj, ensure_ascii=False, indent=2)
+            nbytes = len(text.encode("utf-8"))
+            total += nbytes
+            safe = "".join(c if c not in '\\/:*?"<>|' else "_" for c in name)
+            path = os.path.join(args.schema_dir, f"{i:02d}_{safe}.schema.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            print(f"  {os.path.basename(path):<40} {nbytes/1024:6.1f} KB")
+        print("-" * 100)
+        print(f"共 {len(valid)} 个文件，合计 {total/1024:.1f} KB，位于: {args.schema_dir}")
+        return
 
     # --- 超精简 index，优先 ---
     if args.index is not None:
