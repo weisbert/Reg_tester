@@ -36,6 +36,7 @@ python explore_excel.py "寄存器表.xlsm" --index idx.json        # ① 超精
 python explore_excel.py "寄存器表.xlsm" --schema s.json --sheet "某表"  # ② 单个 sheet 详细结构
 python explore_excel.py "寄存器表.xlsm" --schema s.json --max-sheets 3  # 前 3 个 sheet 详细结构
 python explore_excel.py "寄存器表.xlsm" --schema-dir schemas            # ③ 每个 sheet 各一个小文件（一次收齐）
+python explore_excel.py "寄存器表.xlsm" --sheet REG_SHEET --rowdump 100:235 --dump rows.json  # 抓某表某段完整内容(紧凑,裁空列)
 python explore_excel.py "寄存器表.xlsm" --dump reg_dump.json    # 完整内容导出（会很大）
 python explore_excel.py "寄存器表.xlsm" --formulas             # 值是宏/公式算的、读成空时改看公式
 ```

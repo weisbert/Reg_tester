@@ -291,6 +291,9 @@ def main():
                          "给路径写文件，不给则打印到控制台")
     ap.add_argument("--schema-dir", default=None,
                     help="【批量】把每个 sheet 各导成一个小 json 到该文件夹（一条命令收齐所有 sheet）")
+    ap.add_argument("--rowdump", default=None, metavar="START:END",
+                    help="配 --sheet：紧凑导出该 sheet 指定行区间(1基,含端点)的全部单元格(裁尾部空列)；"
+                         "配 --dump 写文件, 否则打印。用于抓某表某段的完整内容。")
     ap.add_argument("--max-sheets", type=int, default=None,
                     help="只处理前 N 个 sheet（配 --index/--schema 压体积）")
     ap.add_argument("--formulas", action="store_true",
@@ -337,6 +340,46 @@ def main():
             print(f"{label}已导出到: {dest}  ({nbytes} bytes = {nbytes/1024:.1f} KB)")
             if nbytes > 60 * 1024:
                 print("  ⚠ 还是偏大：可加 --max-sheets N 或 --sheet \"某表\" 只导需要的部分。")
+
+    # --- 行区间紧凑导出（抓某表某段完整内容）---
+    if args.rowdump is not None:
+        if not args.sheet:
+            sys.exit("--rowdump 需配 --sheet <名>")
+        if args.sheet not in wb.sheetnames:
+            sys.exit(f"没有 sheet {args.sheet!r}")
+        try:
+            a, b = (int(x) for x in args.rowdump.split(":"))
+        except Exception:
+            sys.exit("--rowdump 格式为 START:END, 如 100:230")
+        ws = wb[args.sheet]
+        rows = list(ws.iter_rows(min_row=a, max_row=b, values_only=True))
+
+        def norm(v, maxlen=44):
+            if v is None:
+                return None
+            if isinstance(v, (int, float, bool)):
+                return v
+            s = str(v).replace("\n", "\\n")
+            return s if len(s) <= maxlen else s[: maxlen - 1] + "…"
+
+        width = 0
+        for r in rows:
+            for c in range(len(r) - 1, -1, -1):
+                if r[c] is not None and str(r[c]).strip() != "":
+                    width = max(width, c + 1)
+                    break
+        out = [[norm(v) for v in r[:width]] for r in rows]
+        obj = {"file": os.path.basename(args.path), "sheet": args.sheet,
+               "row_start": a, "row_end": b, "n_cols": width, "rows": out}
+        text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        nbytes = len(text.encode("utf-8"))
+        if args.dump:
+            with open(args.dump, "w", encoding="utf-8") as f:
+                f.write(text)
+            print(f"行区间 {a}:{b} 已导出到: {args.dump}  ({nbytes/1024:.1f} KB, {len(rows)} 行 x {width} 列)")
+        else:
+            print(text)
+        return
 
     # --- 批量：每个 sheet 各一个小文件 ---
     if args.schema_dir is not None:
