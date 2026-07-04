@@ -18,14 +18,16 @@
 ### `explore_excel.py` —— 探查 Excel 结构
 
 在不知道寄存器表长什么样时，先摸清结构（sheet、表头行、合并单元格、各列类型），
-便于本地复刻一份等价表来开发。只依赖 `openpyxl`。
+便于本地复刻一份等价表来开发。只依赖 `openpyxl`。支持 `.xlsx` 和 `.xlsm`
+（macro-enabled，宏不影响读数据）。
 
 ```powershell
 # 控制台切 UTF-8，避免中文乱码（每个窗口执行一次）
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-python explore_excel.py "寄存器表.xlsx"                 # 只看结构
-python explore_excel.py "寄存器表.xlsx" --dump reg_dump.json  # 结构 + 完整内容导出
+python explore_excel.py "寄存器表.xlsm"                 # 只看结构
+python explore_excel.py "寄存器表.xlsm" --dump reg_dump.json  # 结构 + 完整内容导出
+python explore_excel.py "寄存器表.xlsm" --formulas      # 值是宏/公式算的、读成空时改看公式
 ```
 
 ## 状态

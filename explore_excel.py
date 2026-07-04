@@ -20,8 +20,12 @@ explore_excel.py — 探查一个 Excel 文件的结构
     python explore_excel.py <path-to-xlsx> --sheet "Reg Map"   # 只看某一个 sheet
 
 注意：
-    .xlsx / .xlsm 用 openpyxl 直接读；老的 .xls（BIFF）openpyxl 读不了，
-    脚本会提示你先另存为 .xlsx。
+    .xlsx / .xlsm 用 openpyxl 直接读（.xlsm 的宏不影响读数据）；
+    老的 .xls（BIFF）openpyxl 读不了，脚本会提示你先另存为 .xlsx / .xlsm。
+
+    .xlsm 常见坑：若某些值是宏/公式算出来的，默认读的是 Excel 缓存的计算结果；
+    如果该文件从没被 Excel 打开保存过，这些格子会读成空。这时加 --formulas
+    改看公式原文（如 =A1+1），先弄清结构。
 """
 
 import argparse
@@ -162,13 +166,15 @@ def main():
     ap.add_argument("--rows", type=int, default=20, help="每个 sheet 预览多少行 (默认 20)")
     ap.add_argument("--sheet", default=None, help="只看指定名字的 sheet")
     ap.add_argument("--dump", default=None, help="把完整内容导出到该 JSON 文件")
+    ap.add_argument("--formulas", action="store_true",
+                    help="读公式原文而非缓存计算值（宏/公式算出的值读成空时用）")
     args = ap.parse_args()
 
     if not os.path.isfile(args.path):
         sys.exit(f"找不到文件: {args.path}")
 
     if args.path.lower().endswith(".xls"):
-        sys.exit("openpyxl 读不了老的 .xls 格式，请先在 Excel 里另存为 .xlsx 再试。")
+        sys.exit("openpyxl 读不了老的 .xls 格式，请先在 Excel 里另存为 .xlsx / .xlsm 再试。")
 
     try:
         import openpyxl
@@ -176,8 +182,10 @@ def main():
         sys.exit("缺少 openpyxl，请先: pip install openpyxl")
 
     print(f"打开: {args.path}")
-    # data_only=True -> 读公式计算后的值（如果 Excel 存过缓存值的话）
-    wb = openpyxl.load_workbook(args.path, read_only=False, data_only=True)
+    # data_only=True -> 读公式计算后的缓存值；--formulas 时读公式原文。
+    # .xlsm 直接这样读即可，宏(VBA)不影响取数据。
+    wb = openpyxl.load_workbook(args.path, read_only=False,
+                                data_only=not args.formulas)
     print(f"共 {len(wb.sheetnames)} 个 sheet: {wb.sheetnames}\n")
 
     dump = {"file": os.path.abspath(args.path), "sheets": []}
