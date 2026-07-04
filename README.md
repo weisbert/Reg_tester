@@ -72,9 +72,14 @@ python extract_ports.py "路径\netlist.vh" --modules A,B,C    # 指定模块
 端口/wire/assign/instance 的残留会进 `unparsed`——**`✓ 无残留` 才算可信**。
 
 ```powershell
-python extract_ports.py "netlist.vh" --connections --json conn.json   # 抽连接
-python extract_ports.py "netlist.vh" --body <MODULE> --head 80         # 打印模块体原文(核对语法)
+python extract_ports.py "netlist.vh" --connections --json conn.json            # 抽连接(完整,带缩进,较大)
+python extract_ports.py "netlist.vh" --connections --compact --json conn.json  # 紧凑无损(约 1/5 体积)
+python extract_ports.py "netlist.vh" --body <MODULE> --head 80                 # 打印模块体原文(核对语法)
 ```
+
+- `--compact`：无损压缩。去掉 `net_index`（可由 instances+ports+assigns 重建）、每连接的 `pos`/`nets`
+  （`pos`=数组顺序、`nets`=从 `expr` 解析，均可重建），连接表示为 `[pin, expr]`，紧凑排版。约 5× 减小。
+  太大还可加 `--modules <单个模块>` 分模块导出。
 
 **层级/向上追踪**（目标模块怎么延到文件顶层）：
 

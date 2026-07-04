@@ -527,6 +527,25 @@ def print_ports(s):
         print(f"\n  电源/地 ({len(s['supply'])}): " + ", ".join(s["supply"]))
 
 
+def compact_conn(r):
+    """把 parse_connectivity 结果压成紧凑无损结构：
+    去掉 net_index(可由 instances+ports+assigns 重建)、每连接的 pos(=顺序)/nets(=从 expr 解析)。
+    连接表示为 [pin, expr]，pin=null 为位置连接。expr 保留(含位选/拼接)故无损。"""
+    return {
+        "name": r["name"],
+        "stats": {"ports": r["n_ports"], "wires": r["n_wires"],
+                  "instances": r["n_instances"], "connections": r["n_connections"],
+                  "unparsed": r["n_unparsed"]},
+        "ports": [[p["name"], p["dir"], p["bits"]] for p in r["ports"]],
+        "wires": [[w["name"], w["bits"]] for w in r["wires"]],
+        "assigns": [[a["lhs"], a["rhs"]] for a in r["assigns"]],
+        "instances": [{"t": i["type"], "n": i["name"], "a": i["array"],
+                       "c": [[c["pin"], c["expr"]] for c in i["connections"]]}
+                      for i in r["instances"]],
+        "unparsed": r["unparsed"],
+    }
+
+
 def print_connectivity(r):
     print("=" * 90)
     print(f"[MODULE] {r['name']}   端口 {r['n_ports']}, wire {r['n_wires']}, "
@@ -568,6 +587,8 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出文件里所有模块名")
     ap.add_argument("--connections", action="store_true",
                     help="连接模式：抽 端口+wire+instance+连线 并建 net_index")
+    ap.add_argument("--compact", action="store_true",
+                    help="配 --connections：输出紧凑无损 JSON（去 net_index/pos/nets，紧凑排版），大幅减小体积")
     ap.add_argument("--tree", action="store_true",
                     help="层级树：目标模块怎么从根(文件顶)一层层例化下来")
     ap.add_argument("--uptrace", action="store_true",
@@ -697,12 +718,21 @@ def main():
             print("  " + nm)
 
     if args.json:
+        if args.connections and args.compact:
+            payload = {"file": os.path.basename(args.path), "mode": "connections-compact",
+                       "note": ("省略 net_index(可由 instances+ports+assigns 重建); "
+                                "连接=[pin,expr](pin=null为位置连接); pos=数组顺序、nets=从expr解析，均可重建。无损。"),
+                       "modules": [compact_conn(r) for r in results], "not_found": not_found}
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = json.dumps({"file": os.path.basename(args.path),
+                               "mode": "connections" if args.connections else "ports",
+                               "modules": results, "not_found": not_found},
+                              ensure_ascii=False, indent=2)
         with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({"file": os.path.basename(args.path),
-                       "mode": "connections" if args.connections else "ports",
-                       "modules": results, "not_found": not_found},
-                      f, ensure_ascii=False, indent=2)
-        print(f"\n已导出 JSON: {args.json}")
+            f.write(text)
+        nb = len(text.encode("utf-8"))
+        print(f"\n已导出 JSON: {args.json}  ({nb/1024:.1f} KB)")
 
 
 if __name__ == "__main__":
