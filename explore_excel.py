@@ -119,6 +119,9 @@ def build_index(ws):
     n = ws.max_column
     headers = [_norm(header_vals[c]) if header_vals and c < len(header_vals) else None
                for c in range(n)] if header_vals else []
+    # 裁掉尾部连续的空表头（宽表常有大量空列）
+    while headers and headers[-1] in (None, ""):
+        headers.pop()
     return {
         "title": ws.title,
         "dimensions": ws.dimensions,
@@ -156,11 +159,15 @@ def build_schema(ws, sample_rows=6, examples_per_col=6, max_merged=40, cell_maxl
         if cnt > best:
             best, header_row_idx, header_vals = cnt, i, row
 
-    # 每列：类型 + 去重样例（采样前 500 行）
+    # 每列：类型 + 去重样例（采样前 500 行）。全空且无表头的列直接跳过（宽表大量空列）。
     sample = all_rows[:500]
     columns = []
+    omitted_empty = 0
+    last_meaningful = -1
     for c in range(ncols):
         col_vals = [r[c] if c < len(r) else None for r in sample]
+        header_c = header_vals[c] if header_vals and c < len(header_vals) else None
+        has_header = header_c is not None and str(header_c).strip() != ""
         distinct, seen = [], set()
         for v in col_vals:
             if v is None or str(v).strip() == "":
@@ -172,12 +179,21 @@ def build_schema(ws, sample_rows=6, examples_per_col=6, max_merged=40, cell_maxl
             distinct.append(norm(v))
             if len(distinct) >= examples_per_col:
                 break
+        if not has_header and not distinct:
+            omitted_empty += 1
+            continue  # 全空列，跳过
+        last_meaningful = c
         columns.append({
             "col": col_letter(c + 1),
             "type": guess_type(col_vals),
-            "header": norm(header_vals[c]) if header_vals and c < len(header_vals) else None,
+            "header": norm(header_c),
             "examples": distinct,
         })
+
+    # 样本行裁到最后一个有意义的列，避免尾部一长串 null
+    width = last_meaningful + 1 if last_meaningful >= 0 else ncols
+    sample_out = [[norm(v) for v in (row[:width] if len(row) >= width else row)]
+                  for row in all_rows[:sample_rows]]
 
     return {
         "title": ws.title,
@@ -187,9 +203,10 @@ def build_schema(ws, sample_rows=6, examples_per_col=6, max_merged=40, cell_maxl
         "freeze_panes": ws.freeze_panes,
         "merged_cells_count": len(merged),
         "merged_cells": merged[:max_merged] + (["...(截断)"] if len(merged) > max_merged else []),
+        "empty_cols_omitted": omitted_empty,
         "header_row_index_0based": header_row_idx,
         "columns": columns,
-        "sample_rows": [[norm(v) for v in row] for row in all_rows[:sample_rows]],
+        "sample_rows": sample_out,
     }
 
 
