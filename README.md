@@ -108,6 +108,19 @@ python excel_lookup.py "寄存器.xlsm" --signals a,b,c --sheets RegMapDesign,re
 
 自动去掉信号名的位宽后缀 `[3:0]`；`--formulas` 读公式原文；`--max-hits` 限每信号命中行数。
 
+### `make_mock_regmap.py` —— 解析控制信号→寄存器 + 本地复刻寄存器 Excel
+
+用抓回的 REG_SHEET 行(`--rowdump` 结果) + 控制信号 list + 变体映射(alias)，把每个控制信号
+解析到 寄存器/绝对地址(base+offset)/bit/默认值/关断值，并生成一个**结构一模一样**的
+nManager 布局 `.xlsx`（本地开发用，不再依赖真文件）。脚本本身不含真实信号名，只读 private/ 输入。
+
+```powershell
+python make_mock_regmap.py --rows pll_rows.json --signals control_signals.json ^
+  --aliases aliases.json --schema REG_SHEET.schema.json ^
+  --out-xlsx REG_SHEET_mock.xlsx --out-map signal_reg_map.json
+```
+
 ## 状态
 
-需求对齐 + 收集文件中。已确定 PLL/LO 控制信号 list，下一步反查 Excel + 本地复刻结构。
+需求对齐 + 收集文件基本完成。PLL/LO 控制信号已反查到 REG_SHEET 并解析出 地址/bit/默认值；
+本地已复刻结构一致的寄存器 Excel，后续开发不依赖黄区真文件。
