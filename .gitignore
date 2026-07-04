@@ -1,0 +1,36 @@
+# ---- 机密数据：默认不进公开仓库（需要时用 git add -f 单独加）----
+# 真实寄存器表 / 控制信号表
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+# netlist / veriloga / struct 导出
+*.va
+*.veriloga
+*.scs
+*.sp
+*.cdl
+*.net
+*.netlist
+reg_dump*.json
+# 本地收集输入的目录
+inputs/
+data/
+private/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
