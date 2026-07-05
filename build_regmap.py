@@ -6,9 +6,10 @@
 供 GUI(inspector) 与序列生成器(RMW) 消费。核心增量：给每个控制信号补 **WL / WLT
 平行寄存器字段**（BT/WL 两套并行寄存器组都要测，见 PLAN 阶段二决策 5）。
 
-匹配策略（抗命名漂移）：寄存器按“基名”分组——去掉 `BT_/WL_/WL1_` 前缀后同基名的
-寄存器互为孪生（BT=主, WL=并行, WL1=第三份 WLT）。信号字段 → 孪生寄存器里**同 bit 位**
-的字段 = 平行字段。bit 位是主键，名字变换（sig_x→sig_x/sig_x）只做校验。
+匹配策略（抗命名漂移）：寄存器按“基名”分组——去掉各 reg_group 前缀后同基名的寄存器互为孪生
+（主组 / 并行组 / 第三份）。信号字段 → 孪生寄存器里**同 bit 位**的字段 = 平行字段。
+bit 位是主键，信号名前缀变换只做校验。项目专属的真实前缀规则放 gitignore 的
+private/tool_config/build_regmap.json（启动自动加载）；代码里的 DEFAULT_RULES 只留通用占位。
 
 只读 private/ 输入、写 private/ 输出；脚本本身不含真实信号名/地址。stdlib only。
 
@@ -38,11 +39,10 @@ DEFAULT_RULES = {
     "primary_group": "BT",       # 无前缀 / 主寄存器所属组
     # 视为“单副本、对所有组通用”的 reg_group（无孪生的寄存器都归到它）
     "common_group": "COMMON",
-    # 名字变换校验：primary 字段名 -> 各组期望前缀替换（仅告警，不作为匹配依据）
-    "name_xform": {
-        "WL": [["sig_x", "sig_x"], ["sig_x", "sig_x"], ["sig_x", "sig_x"]],
-        "WLT": [["sig_x", "sig_x"], ["sig_x", "sig_x"], ["sig_x", "sig_x"]],
-    },
+    # 名字变换校验：primary 字段名 -> 各组期望前缀替换（仅告警，不作为匹配依据）。
+    # 项目专属的真实前缀放 gitignore 的 private/tool_config/build_regmap.json（启动自动加载）；
+    # 代码里默认空 = 跳过名字校验，不影响 bit 位主键匹配与输出。
+    "name_xform": {},
 }
 
 
@@ -278,6 +278,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     rules = json.loads(json.dumps(DEFAULT_RULES))
+    local_cfg = os.path.join(here, "private", "tool_config", "build_regmap.json")
+    if os.path.exists(local_cfg):
+        rules.update(load_json(local_cfg))
     if args.config:
         rules.update(load_json(args.config))
 

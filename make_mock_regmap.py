@@ -1,21 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-make_mock_regmap.py — 用抓回的 REG_SHEET 行 + 控制信号 list，
+make_mock_regmap.py — 用抓回的 目标寄存器 sheet 行 + 控制信号 list，
                       (1) 解析寄存器模型、把每个控制信号解析到 寄存器/地址/bit/默认值，
                       (2) 本地生成一个结构一模一样的寄存器 .xlsx（nManager 布局）供开发。
 
 输入(都在 private/，含 IP，不入库)：
-    --rows      pll_rows.json         explore_excel --rowdump 抓的 REG_SHEET 行区间
+    --rows      pll_rows.json         explore_excel --rowdump 抓的寄存器 sheet 行区间
     --signals   control_signals.json  控制信号 list(取 reg_net)
     --aliases   aliases.json          reg_net -> 实际字段名 的变体映射(可选)
-    --schema    REG_SHEET.schema.json   取 sheet 头几行元信息(Base Address 等)重建结构(可选)
+    --schema    <REG>.schema.json     取 sheet 头几行元信息(Base Address 等)重建结构(可选)
 
 输出：
-    --out-xlsx  REG_SHEET_mock.xlsx     本地复刻的寄存器表(结构一致)
+    --out-xlsx  <REG>_mock.xlsx       本地复刻的寄存器表(结构一致)
     --out-map   signal_reg_map.json   控制信号 -> 寄存器/地址/bit/默认/off值 解析结果
 
-本脚本本身不含任何真实信号名，只读 private/ 输入，故可入库。
+块基址 / sheet 名等项目专属值：优先读 gitignore 的 private/tool_config/make_mock_regmap.json，
+或用 --base 显式传。本脚本本身不含任何真实信号名/地址，只读 private/ 输入，故可入库。
 """
 import argparse
 import json
@@ -28,7 +29,20 @@ try:
 except Exception:
     pass
 
-# REG_SHEET (nManager) 列布局（0 基）
+
+def _local_cfg():
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "private", "tool_config", "make_mock_regmap.json")
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+# nManager 列布局（0 基）
 A, B, D, E, H, J, K, L, M, O = 0, 1, 3, 4, 7, 9, 10, 11, 12, 14
 
 
@@ -92,12 +106,15 @@ def main():
     ap.add_argument("--signals", required=True)
     ap.add_argument("--aliases", default=None)
     ap.add_argument("--schema", default=None)
-    ap.add_argument("--base", default="0xBASE_ADDR", help="块基址(默认 REG_SHEET 0xBASE_ADDR)")
+    ap.add_argument("--base", default=None, help="块基址(默认读本地 config，无则 0x0)")
+    ap.add_argument("--sheet-name", default=None, help="生成表的 sheet 名(默认读本地 config，无则 REGS)")
     ap.add_argument("--out-xlsx", default=None)
     ap.add_argument("--out-map", default=None)
     args = ap.parse_args()
 
-    base = int(args.base, 16)
+    cfg = _local_cfg()
+    base = int(args.base or cfg.get("base", "0x0"), 16)
+    sheet_name = args.sheet_name or cfg.get("sheet_name", "REGS")
     rows_doc = json.load(open(args.rows, encoding="utf-8"))
     rows = rows_doc["rows"]
     regs = parse_registers(rows, base)
@@ -168,7 +185,7 @@ def main():
         import openpyxl
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "REG_SHEET"
+        ws.title = sheet_name
         # 元信息头几行：优先用 schema 的 sample_rows(前6行)，否则最简重建
         meta_rows = None
         if args.schema and os.path.isfile(args.schema):
@@ -176,7 +193,7 @@ def main():
             meta_rows = sd.get("sheet", {}).get("sample_rows")
         if not meta_rows:
             meta_rows = [
-                ["Module Name", "REG_SHEET"], ["CPU Data Width", 16],
+                ["Module Name", sheet_name], ["CPU Data Width", 16],
                 ["Base Address", args.base], ["Memory Name", "Memory"],
                 ["Table/Register Information(Item has * mean must)"],
                 ["*Reg Name", "Description", "C_Reserved", "*Offset Addr", "*Width",

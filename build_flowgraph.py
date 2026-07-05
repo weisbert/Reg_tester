@@ -5,25 +5,26 @@
 把 extract_ports.py --connections 抽出的 sub-top 连接（conn.json）转成中间层
 `flowgraph.json`（带版本号），供 GUI(信号流图 + inspector) 与序列生成器(RMW) 消费。
 
-设计要点（M1，设计已定稿，见 PLAN + 本轮 schema 评审）:
-  * 节点分层：module 分组框 -> composite 黑盒(BUFBANK) -> **推断子节点**(channel synth)。
-    DIVCHAIN/ROUTE = 不透明 primitive（内部无数据，不合成）；Logic = 控制域(默认折叠)。
-  * 控制脚挂寄存器：控制脚的**驱动网**(ls_ 网)经 Logic 追回 sub-top 原始端口 -> 经 drives
+设计要点:
+  * 节点分层：module 分组框 -> composite 黑盒(buffer bank) -> **推断子节点**(channel synth)。
+    不透明 divider/route primitive（内部无数据，不合成）；logic = 控制域(默认折叠)。
+  * 控制脚挂寄存器：控制脚的**驱动网**(level-shift ls_ 网)经 logic 追回 sub-top 原始端口 -> 经 drives
     反查信号。**只信连接不信名字**：寄存器位由驱动网决定，不由引脚名决定。
-    实证: net_rxen <= ls_net_b；BIAS_EN <= ls_net_a(原始 dco_bias_en)。
+    例：sig_bufA_en <= ls_sigB（level-shift 后的原始网）。
   * off_controls：类别属“电流门”(master/buf/div/clk/mux/ckdiv/adc/bias_en...)的 enable 脚，
     active_high 缺失时按“高有效/关=0”兜底并标 polarity_inferred，供序列生成器逐级关。
-  * 差分合并：仅当 p/n 两相**同一驱动节点**才合成一条边（ADC 的反相器 loout/loout_n、
-    两个 buf 出 OUT_P/OUT_N 必须各自保留）。
-  * signals 表内嵌 flowgraph（引用式 signal_ref + banks[BT|WL|WLT|COMMON]）：inspector 单文件一跳到位。
-  * 规则全配置化(--config)：换项目=改配置(module_tags/前缀/后缀/asserted_edges)不改代码。
+  * 差分合并：仅当 p/n 两相**同一驱动节点**才合成一条边（真实反相器、两个 buf 各出必须各自保留）。
+  * signals 表内嵌 flowgraph（引用式 signal_ref + banks）：inspector 单文件一跳到位。
+  * 规则全配置化：换项目=改配置(型名正则/前缀/后缀/跨模块边)不改代码。
+    **项目专属真实值放 gitignore 的 private/tool_config/build_flowgraph.json（启动自动加载）**，
+    代码里的 DEFAULT_RULES 只留通用占位——保证本脚本零真实模块名/网名/信号名。
 
 只读 private/ 输入、写 private|projects 输出；脚本本身不含真实信号名/地址。stdlib only。
 
 用法:
-  python build_flowgraph.py                         # 默认 in/out
+  python build_flowgraph.py                         # 默认 in/out（本地 config 若存在则自动加载）
   python build_flowgraph.py --conn conn.json --regmap regmap.json --out flowgraph.json
-  python build_flowgraph.py --config flowgraph_rules.json   # 规则覆盖
+  python build_flowgraph.py --config rules.json     # 额外规则覆盖
   python build_flowgraph.py --print                 # 打印节点/边核对清单
 """
 import argparse
@@ -42,26 +43,27 @@ DEFAULT_RULES = {
     "internal_net_regex": r"^net\d+$",
     # 实例分类（first-match-wins）。role 决定处理方式：
     # bufbank(合成子节点) / dco / logic(控制域) / route(直通) / opaquediv(不透明,带控制脚) / prim
+    # 通用占位分类规则；项目专属的 composite/route/opaquediv/dco 型名由本地 config 覆盖（见文件头说明）。
     "type_rules": [
-        [r"(?i)BUFBANK",                 "composite", "blackbox", "bufbank"],
-        [r"(?i)_Logic_",                 "primitive", "logic",    "logic"],
-        [r"(?i)ROUTE",                "primitive", "route",    "route"],
-        [r"(?i)DIVCHAIN|divchain",       "primitive", "div",      "opaquediv"],
-        [r"(?i)DCO.*wi_IND",             "primitive", "dco",      "dco"],
+        [r"(?i)bufbank|buf_group",       "composite", "blackbox", "bufbank"],
+        [r"(?i)_logic_|_ctrl",           "primitive", "logic",    "logic"],
+        [r"(?i)trace|route",             "primitive", "route",    "route"],
+        [r"(?i)div_chain|divchain",      "primitive", "div",      "opaquediv"],
+        [r"(?i)osc|_dco",                "primitive", "dco",      "dco"],
         [r"(?i)mux",                     "primitive", "mux",      "prim"],
-        [r"(?i)^INV",                    "primitive", "inv",      "prim"],
-        [r"(?i)BUF|_buf",                "primitive", "buf",      "prim"],
+        [r"(?i)^inv",                    "primitive", "inv",      "prim"],
+        [r"(?i)buf|_buf",                "primitive", "buf",      "prim"],
         [r"(?i)div",                     "primitive", "div",      "prim"],
     ],
     "default_prim_device": "unknown",
     "symbols": {"dco": "oscillator", "buf": "triangle", "inv": "triangle_bubble",
                 "mux": "trapezoid", "div": "box_divN", "route": "pass", "logic": "ctrl_block",
                 "blackbox": "group", "unknown": "box", "group": "group"},
-    "module_bands": {"H3": "2G", "H4": "5G", "ADC": None},
-    "module_reg_group_default": {"H3": "BT", "H4": "BT", "ADC": "COMMON"},
+    "module_bands": {},                 # tag -> band 标签（项目专属，本地 config 覆盖）
+    "module_reg_group_default": {},     # tag -> 默认 reg_group（项目专属，本地 config 覆盖）
 
     # channel synthesis
-    "strip_prefix": ["dcoblk_", "dcoblk_", "dco_"],   # 实例内命名域前缀（不含 ls_，ls_ 只在网上）
+    "strip_prefix": [],   # 实例内命名域前缀（项目专属，本地 config 覆盖；不含 ls_，ls_ 只在网上）
     "ctrl_suffixes": [["_N_ictrl", "ictrl_n"], ["_P_ictrl", "ictrl_p"], ["_ictrl", "ictrl"],
                       ["_enout", "enout"], ["_enb", "enable_b"], ["_en", "enable"],
                       ["_sel", "sel"], ["_rstn", "reset"]],
@@ -69,7 +71,7 @@ DEFAULT_RULES = {
     "in_suffixes": ["_inn_in", "_inp_in", "_inn", "_inp"],
     # 标准单元/黑盒无引脚方向：按引脚名判驱动脚（输出）。ADC 的 out/ZN/clk_ref_buf 属此。
     "output_pin_regex": r"^(out|ZN|ZO|Z|Q|QN|clk_ref_buf|clk_ref|clkout)$",
-    # ROUTE 这类 route 节点：*_loout 是送出(输出)，*_out/*_outp 等是收进(输入)——名字带 out 但方向是入。
+    # route 节点：*_loout 是送出(输出)，*_out/*_outp 等是收进(输入)——名字带 out 但方向是入。
     "route_output_regex": r"loout",
     "lane_suffixes": ["_core", "_IB", "_QB", "_I", "_Q"],
     "diff_pairs": [["_outp", "_outn"], ["_p_lp", "_n_lp"], ["_I_lc", "_IB_lc"], ["_Q_lc", "_QB_lc"]],
@@ -88,16 +90,13 @@ DEFAULT_RULES = {
     },
     "ctrl_roles": ["enable", "enable_b", "enout", "ictrl_n", "ictrl_p", "ictrl", "sel", "reset"],
     "levelshift_prefix": "ls_",
-    # 确认的跨模块边（netlist 顶层才连得上，PLAN item 9 实锤）
-    "known_cross_edges": [
-        {"from_tag": "H4", "from_net": "net_i", "to_tag": "H3", "to_net": "net_txp", "polarity": "p"},
-        {"from_tag": "H4", "from_net": "net_ib", "to_tag": "H3", "to_net": "net_txn", "polarity": "n"},
-        {"from_tag": "H3", "from_net": "net_adcclk", "to_tag": "ADC", "to_net": "net_adcclk", "polarity": None},
-    ],
-    # 同名网自动连跨模块边：默认关（tank/buf/lobuf 等同名多为各 sub-top 各一份，会造假边）。
+    # 确认的跨模块边（netlist 顶层才连得上）——项目专属实锤，从本地 config 覆盖。
+    # 结构：[{"from_tag","from_net","to_tag","to_net","polarity"}]。
+    "known_cross_edges": [],
+    # 同名网自动连跨模块边：默认关（同名多为各 sub-top 各一份，会造假边）。
     # 换项目若同名确可信可开；开时同名边标 provenance=name + warn，且跳过 blocklist。
     "crossmodule_by_netname": False,
-    "crossmodule_net_blocklist": ["tankn", "tankp", "gmn", "gmp", "bufn", "bufp"],
+    "crossmodule_net_blocklist": [],    # 项目专属，本地 config 覆盖
     # 已知的 unresolved / logic-derived 集合大小，用于回归自检
     "expected_unresolved_signals": 10,
     "expected_logic_derived_signals": 2,
@@ -142,7 +141,7 @@ class Rules:
 
     def pin_dir(self, pin, role, route=False):
         """数据脚方向：out 后缀/输出脚名 -> output；否则 input（做 sink）。
-        route 节点(ROUTE)：只有匹配 route_output_regex(loout) 的才是输出，其余名字带 out 也是入。"""
+        route 节点：只有匹配 route_output_regex(loout) 的才是输出，其余名字带 out 也是入。"""
         if route:
             return "output" if self.route_out_re.search(pin) else "input"
         if role == "out" or self.out_pin_re.match(pin):
@@ -516,7 +515,7 @@ def annotate_io_only(node, inst, tag, rules, net_ep):
 
 
 def synth_channels(inst, parent_id, tag, rules, port_to_signal, ls_alias, sig_by_id, sigtab, net_ep, diag):
-    """BUFBANK -> 推断子节点。lane 合并(divA_I/Q/core -> 一个 divA 三 lane 脚)。"""
+    """buffer bank(composite) -> 推断子节点。lane 合并(如某 divider 的 I/Q/core -> 一个三 lane 脚)。"""
     chans = {}   # token -> {ctrl:[], out:[], in:[], tokens:set}
     for pin, expr in inst["c"]:
         if rules.is_power(pin) or rules.is_power(first_net(expr) or ""):
@@ -626,8 +625,8 @@ def fixup_enb_and_off(nodes, sigtab, sig_by_id):
 
 
 def compute_uncovered_gates(nodes, sig_by_id, rules):
-    """已解析、类别属电流门、却没被任何节点 off_controls 覆盖的信号（如 div4_q_en：其端口进 Logic
-    非 BUFBANK，无可挂节点）。列出来供人工核对——避免序列生成器漏关。"""
+    """已解析、类别属电流门、却没被任何节点 off_controls 覆盖的信号（例：某端口进了 logic 控制域
+    而非 buffer bank，无可挂节点）。列出来供人工核对——避免序列生成器漏关。"""
     off_cats = set(rules.d["off_gate_categories"])
     covered = set(o["signal_ref"] for n in nodes for o in n["off_controls"])
     out = []
@@ -821,6 +820,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     rd = json.loads(json.dumps(DEFAULT_RULES))
+    # 项目专属真实规则（模块名/网名/前缀/跨模块边）放 gitignore 的本地 config，代码里只留通用占位。
+    local_cfg = os.path.join(here, "private", "tool_config", "build_flowgraph.json")
+    if os.path.exists(local_cfg):
+        rd.update(load_json(local_cfg))
     if args.config:
         rd.update(load_json(args.config))
     rules = Rules(rd)
