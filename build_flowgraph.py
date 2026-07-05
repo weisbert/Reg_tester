@@ -77,7 +77,7 @@ DEFAULT_RULES = {
     "diff_pairs": [["_outp", "_outn"], ["_p_lp", "_n_lp"], ["_I_lc", "_IB_lc"], ["_Q_lc", "_QB_lc"]],
     "diff_bare_pn": [["tankp", "tankn"], ["gmp", "gmn"], ["bufp", "bufn"]],
     "device_of": {"endswith": {"buf": "buf", "mux": "mux"},
-                  "contains": {"div2": "div", "divA": "div", "divB": "div", "div": "div"}},
+                  "contains": {"div2": "div", "div": "div"}},
     "off_gate_categories": ["master_en", "buf_en", "div_en", "clk_en", "mux_en",
                             "ckdiv_en", "adc_en", "mixed_en", "bias_en"],
     # 网解析出信号但引脚名无 ctrl 后缀时（如 ADC EN、DCO_EN），按信号类别定角色
@@ -276,7 +276,7 @@ def _stem_token(stem, rules):
 
 def _stems(token):
     """token 的别名：去掉尾部器件词(mux/buf/div)得到语义 stem，便于输出脚按 stem 归并
-    (ckgate_mux <-> ckgate_out)。返回一个 set（可能为空）。"""
+    (如 <stem>_mux <-> <stem>_out)。返回一个 set（可能为空）。"""
     out = set()
     m = re.sub(r"_?(mux|buf|div)$", "", token)
     if m and m != token:
@@ -524,7 +524,7 @@ def synth_channels(inst, parent_id, tag, rules, port_to_signal, ls_alias, sig_by
         if token is None:
             continue
         ch = chans.setdefault(token, {"ctrl": [], "out": [], "in": [], "tokens": set([token]) | _stems(token)})
-        # 网 token（去 ls_ 后按同规则分词）也纳入 tokens，抗名字漂移（divA 的网是 div2）
+        # 网 token（去 ls_ 后按同规则分词）也纳入 tokens，抗名字漂移（引脚名与其驱动网名可能不同）
         net = first_net(expr)
         if net:
             nb = net[len(rules.ls):] if net.startswith(rules.ls) else net
