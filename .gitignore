@@ -34,6 +34,12 @@ env/
 .pytest_cache/
 .mypy_cache/
 
+# ---- Node（仅本地测试用 jsdom；工具运行时零 npm 依赖）----
+node_modules/
+package-lock.json
+# bundle 输出（含真实数据，勿外传）
+dist/
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/

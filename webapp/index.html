@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reg_tester — 信号流 / 电流逐级关闭</title>
+<link rel="stylesheet" href="app.css">
+<!--BUNDLE_DATA-->
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div class="brand">Reg_tester<span id="proj-name"></span></div>
+    <div class="tb-group">
+      <label>模式</label>
+      <select id="mode-select" title="载入已存模式"></select>
+      <button id="btn-new-mode" title="新建模式">＋</button>
+      <button id="btn-del-mode" title="删除当前模式">🗑</button>
+    </div>
+    <div class="tb-group">
+      <label>寄存器组</label>
+      <select id="group-select" title="BT / WL / WLT 并行寄存器组"></select>
+    </div>
+    <div class="tb-group">
+      <label>关闭顺序</label>
+      <select id="order-select" title="auto=反向拓扑 / manual=录制顺序">
+        <option value="auto">auto（反向拓扑）</option>
+        <option value="manual">manual（录制）</option>
+      </select>
+      <button id="btn-record" title="录制关闭顺序：依次点节点">● 录制</button>
+    </div>
+    <div class="tb-group grow">
+      <input id="search" type="search" placeholder="搜索节点 / 信号…" autocomplete="off">
+    </div>
+    <div class="tb-group">
+      <button id="btn-save" class="primary" title="保存模式+版面">保存</button>
+      <button id="btn-gen" class="primary" title="生成测试序列">生成序列 ▸</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="canvas-wrap">
+      <div id="canvas-toolbar">
+        <button data-act="fit" title="适配窗口">⤢</button>
+        <button data-act="zoom-in" title="放大">＋</button>
+        <button data-act="zoom-out" title="缩小">－</button>
+        <span class="sep"></span>
+        <button data-act="relayout" title="自动重排">↻ 重排</button>
+        <button data-act="toggle-logic" title="显示/隐藏 logic 控制块">logic</button>
+        <span class="sep"></span>
+        <button data-act="undo" title="撤销">↶</button>
+        <button data-act="redo" title="重做">↷</button>
+        <span class="sep"></span>
+        <button data-act="export-svg" title="导出 SVG">SVG</button>
+        <span id="zoom-label"></span>
+      </div>
+      <svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="minimap"></div>
+      <div id="ctx-menu" class="ctx-menu"></div>
+    </section>
+
+    <aside id="side">
+      <nav id="side-tabs">
+        <button data-tab="inspector" class="active">Inspector</button>
+        <button data-tab="mode">模式</button>
+        <button data-tab="seq">序列</button>
+      </nav>
+      <div id="tab-inspector" class="tab-body active"></div>
+      <div id="tab-mode" class="tab-body"></div>
+      <div id="tab-seq" class="tab-body"></div>
+    </aside>
+  </main>
+
+  <div id="toast"></div>
+</div>
+
+<script src="layout.js"></script>
+<script src="generator.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
