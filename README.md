@@ -120,7 +120,51 @@ python make_mock_regmap.py --rows pll_rows.json --signals control_signals.json ^
   --out-xlsx REG_SHEET_mock.xlsx --out-map signal_reg_map.json
 ```
 
+### `build_regmap.py` —— 寄存器侧 adapter：signal_reg_map.json → 规范 regmap.json
+
+把阶段一的 `signal_reg_map.json` 规范化成带版本号的中间层 `regmap.json`（GUI inspector +
+序列生成器 RMW 都读它）。核心增量：给每个控制信号补 **WL / WLT 平行寄存器字段**（BT/WL
+两套并行寄存器组都要测）。孪生匹配抗命名漂移：寄存器按基名分组（去 `BT_/WL_/WL1_` 前缀），
+信号字段 → 孪生寄存器里**同 bit 位**的字段 = 平行字段（bit 位是主键，名字变换只做校验）。
+只依赖标准库；脚本不含真实信号名/地址，只读 `private/`、写 `private/`。
+
+```powershell
+python build_regmap.py                         # 默认 private/adpll/signal_reg_map.json → regmap.json
+python build_regmap.py --print                 # 额外打印 reg_net → BT/WL/WLT addr@bit 核对表
+python build_regmap.py --config regmap_rules.json   # 覆盖默认分组/前缀规则（换项目）
+```
+
+输出 `regmap.json`：`signals[]` 每条含 `id`(=reg_net，即 flowgraph 控制脚的引用键)、`match`、
+`category`、`shared`、`warn`、`active_high`、`off_value`、`variants{BT|WL|WLT|COMMON}`
+（每 variant 带 `addr/offset/bit/default/reset`）。`single_copy` 信号只有 `COMMON`。
+
+### `build_flowgraph.py` —— 网表侧 adapter：conn.json → 规范 flowgraph.json
+
+把 `extract_ports.py --connections` 抽出的 sub-top 连接转成带版本号的 `flowgraph.json`
+（GUI 信号流图 + inspector + 序列生成器都读它）。要点：
+
+- **节点分层**：module 分组框 → composite 黑盒(BUFBANK) → **推断子节点**(channel synthesis)。
+  DIVCHAIN/ROUTE = 不透明 primitive（内部无数据，不合成）；Logic = 控制域(默认折叠)。
+- **控制脚挂寄存器**：控制脚的**驱动网**(`ls_` 网)经 Logic 追回 sub-top 原始端口，再经
+  `regmap.drives` 反查信号。**只信连接不信名字**——寄存器位由驱动网决定，不由引脚名决定。
+- **off_controls**：类别属“电流门”的 enable 脚，`active_high` 缺失时按“高有效/关=0”兜底并标
+  `polarity_inferred`，供序列生成器逐级关。
+- **差分合并**：仅当 p/n 两相同一驱动节点才合成一条边（ADC 真实反相器/两个 buf 出各自保留）。
+- **规则全配置化**(`--config`)：换项目=改配置(前缀/后缀/asserted_edges)不改代码。
+
+```powershell
+python build_regmap.py            # 先出 regmap.json（flowgraph 要读它做 drives 反查）
+python build_flowgraph.py         # 默认 conn.json + regmap.json → flowgraph.json
+python build_flowgraph.py --print # 打印节点树 + off_controls + 未解析诊断
+```
+
+`flowgraph.json`：`nodes[]`（含 `pins/controls/off_controls/reg_touch`）、`edges[]`（差分合并 +
+方向 + 跨模块）、内嵌 `signals{}`（引用式，inspector 单文件一跳）、`stats` + `diagnostics`
+（未解析控制脚 / 未配对输出 / 隐藏计数，供人工核对）。**bufbank 子节点为推断态
+(`inferred/provisional`)**：日后补抓真连接后同名替换，用户 layout/modes 不作废。
+
 ## 状态
 
-需求对齐 + 收集文件基本完成。PLL/LO 控制信号已反查到 REG_SHEET 并解析出 地址/bit/默认值；
-本地已复刻结构一致的寄存器 Excel，后续开发不依赖黄区真文件。
+阶段一（需求对齐 + 收集 + 本地复刻）完成。阶段二 M1 完成：`build_regmap.py`（补 WL/WLT 平行
+字段）+ `build_flowgraph.py`（conn.json → 分层信号流图，控制脚挂寄存器，黑盒推断子节点）。
+下一步 M2：GUI 骨架（serve/bundle + dagre 布局 + 图编辑 + project 读写）。
