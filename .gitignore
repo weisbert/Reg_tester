@@ -19,6 +19,10 @@ reg_dump*.json
 inputs/
 data/
 private/
+# 项目计划：阶段二起含真实模块名/地址前缀，只留本地（本机开发，不外传）
+PLAN.md
+# GUI project 数据（模式/版面/测试序列，含真实信号名与地址）
+projects/
 
 # ---- Python ----
 __pycache__/
