@@ -159,6 +159,8 @@ class Rules:
         self.out_pin_re = re.compile(d["output_pin_regex"])
         self.route_out_re = re.compile(d["route_output_regex"])
         self.expand_out_re = re.compile(d["expand_output_pin_regex"])
+        # DCO 核的裸差分输出网（tank/gm/buf ...）：振荡源由它驱动。取自 diff_bare_pn。
+        self.dco_bare_nets = set(x for pair in d.get("diff_bare_pn", []) for x in pair)
 
     def pin_dir(self, pin, role, route=False):
         """数据脚方向：out 后缀/输出脚名 -> output；否则 input（做 sink）。
@@ -531,6 +533,8 @@ def annotate_full(node, inst, tag, rules, port_to_signal, ls_alias, sig_by_id, s
         if not base or rules.is_power(base):
             continue
         pdir = "input" if role == "in" else rules.pin_dir(pin, role)
+        if node.get("device") == "dco" and base in rules.dco_bare_nets:
+            pdir = "output"   # DCO 核是振荡源：tank/gm/buf 差分网由它驱动（否则多端点无驱动被丢）
         node["pins"].append({"id": "%s.%s" % (node["id"], pin), "name": pin, "dir": pdir, "net": base, "role": "data_" + ("out" if pdir == "output" else "in")})
         net_ep[(tag, base)].append((node["id"], pin, pdir))
 
@@ -545,6 +549,8 @@ def annotate_io_only(node, inst, tag, rules, net_ep):
             continue  # 控制脚不在此处登记
         base = rules.primary_net(expr)
         pdir = "input" if role == "in" else rules.pin_dir(pin, role, route=route)
+        if node.get("device") == "dco" and base in rules.dco_bare_nets:
+            pdir = "output"   # DCO 核振荡源：tank/gm/buf 差分网由它驱动
         node["pins"].append({"id": "%s.%s" % (node["id"], pin), "name": pin, "dir": pdir, "net": base, "role": "data_" + ("out" if pdir == "output" else "in")})
         if base:
             net_ep[(tag, base)].append((node["id"], pin, pdir))
