@@ -331,17 +331,38 @@ def pick_path(kind):
         return None
 
 
+def _uptrace_top_pin(steps):
+    """从 extract_ports `trace_up` 的原始嵌套 steps 里递归找该端口到达的顶层引脚名；
+    到不了文件顶层（在某层被内部消耗）返回 None。"""
+    for s in (steps or []):
+        if not isinstance(s, dict):
+            continue
+        if s.get("top_pin"):
+            return s["top_pin"]
+        r = _uptrace_top_pin(s.get("up"))
+        if r:
+            return r
+    return None
+
+
 def seed_control_signals(uptrace_doc, proj):
     """从 extract_ports 的 uptrace（目标模块控制脚→顶层引脚）生成 control_signals 候选。
-    只抓 dir=input & dest=top_pin 的控制脚（经内部逻辑的漏网脚需人工补）。category/desc 交人工确认。"""
+    只抓能追到文件顶层引脚的 dir=input 控制脚（经内部逻辑的漏网脚需人工补）。category/desc 交人工确认。
+    兼容两种 uptrace 形态：extract_ports 原始版 `{port,dir,steps}` 与展平版 `{port,dir,net,dest}`。"""
     bands = list(((proj.get("flowgraph_rules") or {}).get("module_bands") or {}).keys())
     prim, sec = {}, {}
     for entry in (uptrace_doc.get("uptrace") or []):
         tag = _module_tag(entry.get("module", ""), bands)
         for p in (entry.get("ports") or []):
-            if p.get("dir") != "input" or p.get("dest") != "top_pin":
+            if p.get("dir") != "input":
                 continue
-            net, port = p.get("net"), p.get("port")
+            if "steps" in p:                       # extract_ports 原始输出
+                net = _uptrace_top_pin(p.get("steps"))
+            elif p.get("dest") == "top_pin":       # 展平版
+                net = p.get("net")
+            else:
+                net = None
+            port = p.get("port")
             if not net:
                 continue
             cat, bucket = _classify_pin(port)
