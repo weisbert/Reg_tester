@@ -78,6 +78,9 @@ textarea{width:100%;min-height:220px;background:var(--bg);color:var(--fg);border
 #tab-project textarea{min-height:0;margin:2px 0 4px}
 #tab-project input{width:100%}
 .wlab{display:block;margin:8px 0 2px;font-size:12px;color:var(--mut)}
+.wrow{display:flex;gap:6px;align-items:center}
+.wrow input{flex:1;min-width:0}
+.wrow button{white-space:nowrap}
 .wsum{cursor:pointer;font-size:12px;color:var(--mut);margin:6px 0}
 #tab-project details{margin:4px 0}
 

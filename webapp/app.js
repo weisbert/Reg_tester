@@ -72,6 +72,10 @@
     projectExport: function () {
       if (BUNDLE) return Promise.resolve({ project: BUNDLE.project, control_signals: {}, modes: BUNDLE.modes || {} });
       return fetch('/api/project/export').then(function (r) { return r.json(); });
+    },
+    pickFile: function (kind) {
+      if (BUNDLE) return Promise.resolve({ path: null });
+      return fetch('/api/pick-file?kind=' + encodeURIComponent(kind)).then(function (r) { return r.json(); });
     }
   };
 
@@ -491,6 +495,8 @@
       else if (act === 'match-logic') matchToggleLogic(id);
       else if (act === 'match-reload') loadMatching(true);
       else if (act === 'wiz-save-config') wizSaveConfig();
+      else if (act === 'wiz-pick-netlist') wizPick('netlist', 'netpath');
+      else if (act === 'wiz-pick-excel') wizPick('excel', 'xlsxpath');
       else if (act === 'wiz-import-netlist') wizImportNetlist();
       else if (act === 'wiz-import-excel') wizImportExcel();
       else if (act === 'wiz-save-cs') wizSaveCS();
@@ -997,12 +1003,14 @@
     h.push('<div class="row-actions"><button class="primary" data-act="wiz-save-config"' + (ro ? ' disabled' : '') + '>保存配置</button></div>');
 
     h.push('<h3 class="sec">② 导入 netlist</h3>');
-    h.push('<label class="wlab">netlist 文件路径</label><input id="w-netpath" value="' + esc(w.netpath) + '" placeholder="C:\\...\\netlist.vh">');
+    h.push('<label class="wlab">netlist 文件路径</label><div class="wrow"><input id="w-netpath" value="' + esc(w.netpath) + '" placeholder="点「浏览…」选，或手动填绝对路径">'
+      + '<button data-act="wiz-pick-netlist"' + (ro ? ' disabled' : '') + ' title="打开系统文件对话框">浏览…</button></div>');
     h.push('<div class="row-actions"><button data-act="wiz-import-netlist"' + (ro ? ' disabled' : '') + '>抽取连接 + 生成控制信号候选</button></div>');
     if (w.st.netlist) h.push('<div class="card ' + (/失败/.test(w.st.netlist) ? 'warn' : '') + '">' + esc(w.st.netlist) + '</div>');
 
     h.push('<h3 class="sec">③ 导入 Excel 寄存器簿</h3>');
-    h.push('<label class="wlab">.xlsm 路径</label><input id="w-xlsxpath" value="' + esc(w.xlsxpath) + '" placeholder="C:\\...\\regbook.xlsm">');
+    h.push('<label class="wlab">.xlsm 路径</label><div class="wrow"><input id="w-xlsxpath" value="' + esc(w.xlsxpath) + '" placeholder="点「浏览…」选，或手动填绝对路径">'
+      + '<button data-act="wiz-pick-excel"' + (ro ? ' disabled' : '') + ' title="打开系统文件对话框">浏览…</button></div>');
     h.push('<div class="kv"><div class="k">sheet</div><div class="v"><input id="w-xsheet" value="' + esc(w.sheet) + '" placeholder="默认取配置 sheet_name"></div>');
     h.push('<div class="k">行区间</div><div class="v"><input id="w-rowdump" value="' + esc(w.rowdump) + '" placeholder="START:END（先 --index/--schema 看结构）"></div></div>');
     h.push('<div class="row-actions"><button data-act="wiz-import-excel"' + (ro ? ' disabled' : '') + '>抽取寄存器行</button></div>');
@@ -1043,6 +1051,15 @@
       if (!r || !r.ok) { toast('保存失败'); return; }
       S.project = r.project; toast('配置已保存');
     }).catch(function (e) { toast('保存失败: ' + e); });
+  }
+  function wizPick(kind, field) {
+    if (Backend.bundle) { toast('bundle 只读，手动填路径'); return; }
+    wizReadForm();                       // 先存住其它已填字段，避免选完刷新丢失
+    toast('打开文件对话框…（在运行 --serve 的本机弹出）');
+    Backend.pickFile(kind).then(function (r) {
+      if (r && r.path) { S.wiz[field] = r.path; renderProjectTab(); toast('已选：' + r.path); }
+      else toast('未选（取消或对话框不可用，可手动填路径）');
+    }).catch(function (e) { toast('对话框失败，手动填路径：' + e); });
   }
   function wizImportNetlist() {
     if (Backend.bundle) { toast('bundle 只读'); return; }

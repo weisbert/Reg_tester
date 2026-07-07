@@ -21,7 +21,7 @@ import subprocess
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEBAPP = os.path.join(HERE, "webapp")
@@ -300,6 +300,37 @@ def _classify_pin(port):
     return None, None
 
 
+_PICK_CODE = r"""
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    r = tk.Tk(); r.withdraw()
+    try: r.attributes('-topmost', True)
+    except Exception: pass
+    ft = {'netlist': [('netlist', '*.vh *.v *.va *.vhd *.sp *.cdl *.net *.scs'), ('all', '*.*')],
+          'excel':   [('Excel', '*.xlsm *.xlsx *.xls'), ('all', '*.*')]}.get(sys.argv[2], [('all', '*.*')])
+    p = filedialog.askopenfilename(title=sys.argv[1], filetypes=ft)
+    r.destroy()
+    sys.stdout.write(p or '')
+except Exception as e:
+    sys.stderr.write(repr(e))
+"""
+
+
+def pick_path(kind):
+    """在独立子进程里弹**原生系统文件对话框**，返回选中的绝对路径。
+    取消/无显示/无 tkinter → None（前端回退手动填路径）。独立进程避免 tkinter 线程不安全；
+    对话框开在 `--serve` 所在本机（air-gap 工作流下即用户本机）。"""
+    title = {"netlist": "选择 netlist 文件", "excel": "选择 Excel 寄存器簿"}.get(kind, "选择文件")
+    try:
+        r = subprocess.run([sys.executable, "-c", _PICK_CODE, title, kind],
+                           capture_output=True, text=True, timeout=180)
+        return (r.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
 def seed_control_signals(uptrace_doc, proj):
     """从 extract_ports 的 uptrace（目标模块控制脚→顶层引脚）生成 control_signals 候选。
     只抓 dir=input & dest=top_pin 的控制脚（经内部逻辑的漏网脚需人工补）。category/desc 交人工确认。"""
@@ -390,6 +421,9 @@ def make_handler(project):
                     })
                 if p == "/api/project/export":
                     return self._send(200, project.export_bundle())
+                if p == "/api/pick-file":
+                    kind = (parse_qs(u.query).get("kind") or ["file"])[0]
+                    return self._send(200, {"path": pick_path(kind)})
                 if p == "/api/flowgraph":
                     return self._send(200, project.flowgraph())
                 if p == "/api/regmap":
