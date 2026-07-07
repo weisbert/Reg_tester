@@ -51,8 +51,8 @@ def valid_id(mid):
 class Project:
     def __init__(self, root):
         self.root = os.path.abspath(root)
-        if not os.path.isdir(self.root):
-            raise SystemExit("project 目录不存在：%s" % self.root)
+        # 目录不存在则**脚手架新建**（P2.2 建库向导：一个指令即可对着空工程起 GUI）
+        os.makedirs(self.root, exist_ok=True)
         self.modes_dir = os.path.join(self.root, "modes")
         self.tc_dir = os.path.join(self.root, "testcases")
         os.makedirs(self.modes_dir, exist_ok=True)
@@ -164,6 +164,168 @@ class Project:
             f.write(res["html"])
         return {"ok": True, "dir": self.tc_dir}
 
+    # -------------------------------------------------- P2.2 建库向导（新建工程 / 导入 / 导出）
+    ART_DEFAULTS = {
+        "control_signals": "control_signals.json", "pll_rows": "pll_rows.json",
+        "conn": "conn.json", "expand_conn": ["expand_conn.json"],
+        "signal_reg_map": "signal_reg_map.json", "regmap": "regmap.json",
+        "flowgraph": "flowgraph.json",
+    }
+    CONFIG_KEYS = ("name", "description", "netlist", "regbook", "flowgraph_rules")
+
+    def needs_setup(self):
+        """无 flowgraph 节点 = 还没建库，前端应引导到「工程」向导。"""
+        return not (self.flowgraph().get("nodes"))
+
+    def save_project_config(self, cfg):
+        """把 GUI 里填的芯片配置合并进 project.json（只收已知段；artifacts 补默认固定名）。"""
+        proj = self.project_json() or {}
+        proj["schema_version"] = proj.get("schema_version", "project/2")
+        for k in self.CONFIG_KEYS:
+            if k in cfg and cfg[k] is not None:
+                proj[k] = cfg[k]
+        proj.setdefault("name", os.path.basename(self.root))
+        proj.setdefault("matching", proj.get("matching", {}) or {})
+        art = dict(proj.get("artifacts") or {})
+        for k, v in self.ART_DEFAULTS.items():
+            art.setdefault(k, v)
+        proj["artifacts"] = art
+        self._write("project.json", proj)
+        return proj
+
+    def control_signals(self):
+        return self._read("control_signals.json", {})
+
+    def save_control_signals(self, obj):
+        self._write("control_signals.json", obj)
+
+    def _run(self, arglist):
+        r = subprocess.run([sys.executable] + arglist, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        return {"cmd": "python " + " ".join(os.path.basename(a) if a.endswith(".py") else a for a in arglist),
+                "code": r.returncode, "out": (r.stdout or "")[-1200:], "err": (r.stderr or "")[-1200:]}
+
+    def import_netlist(self, path):
+        """跑 extract_ports 抽 conn.json（+ expand_conn.json），再抽 uptrace 生成 control_signals 候选。
+        不覆盖已存在的 control_signals.json——候选交前端展示、由人确认后 save。"""
+        if not (path and os.path.isfile(path)):
+            return {"ok": False, "error": "netlist 文件不存在：%s" % path}
+        proj = self.project_json() or {}
+        nl = proj.get("netlist") or {}
+        targets = nl.get("target_modules") or []
+        if not targets:
+            return {"ok": False, "error": "netlist.target_modules 为空——先在配置里填目标模块并保存"}
+        ep = os.path.join(HERE, "extract_ports.py")
+        logs = []
+        logs.append(self._run([ep, path, "--project", self.root, "--connections", "--compact",
+                               "--json", os.path.join(self.root, "conn.json")]))
+        if logs[-1]["code"] != 0:
+            return {"ok": False, "error": "extract_ports conn 失败", "logs": logs}
+        if nl.get("expand_submodules"):
+            logs.append(self._run([ep, path, "--project", self.root, "--expand", "--connections",
+                                   "--compact", "--json", os.path.join(self.root, "expand_conn.json")]))
+            if logs[-1]["code"] != 0:
+                return {"ok": False, "error": "extract_ports expand 失败", "logs": logs}
+        candidate = {"primary_current_related": [], "config_secondary": []}
+        up_tmp = os.path.join(self.root, "_uptrace.json")
+        logs.append(self._run([ep, path, "--project", self.root, "--tree", "--uptrace", "--json", up_tmp]))
+        if logs[-1]["code"] == 0:
+            try:
+                candidate = seed_control_signals(self._read("_uptrace.json", {}), proj)
+            except Exception as e:
+                candidate = {"note": "候选生成失败：%s" % e,
+                             "primary_current_related": [], "config_secondary": []}
+        try:
+            os.remove(up_tmp)
+        except OSError:
+            pass
+        conn = self._read("conn.json", {})
+        return {"ok": True, "logs": logs,
+                "conn_modules": len(conn.get("modules") or []),
+                "candidate": candidate,
+                "has_control_signals": os.path.exists(os.path.join(self.root, "control_signals.json"))}
+
+    def import_excel(self, path, sheet, rowdump):
+        """跑 explore_excel --rowdump 把寄存器 sheet 的行区间抽成 pll_rows.json。"""
+        if not (path and os.path.isfile(path)):
+            return {"ok": False, "error": "Excel 文件不存在：%s" % path}
+        rb = (self.project_json() or {}).get("regbook") or {}
+        sheet = sheet or rb.get("sheet_name")
+        if not sheet:
+            return {"ok": False, "error": "缺 sheet 名（表单或 regbook.sheet_name）"}
+        if not rowdump or ":" not in str(rowdump):
+            return {"ok": False, "error": "缺行区间 START:END（先用 explore_excel --index/--schema 看结构）"}
+        ee = os.path.join(HERE, "explore_excel.py")
+        log = self._run([ee, path, "--sheet", str(sheet), "--rowdump", str(rowdump),
+                        "--dump", os.path.join(self.root, "pll_rows.json")])
+        if log["code"] != 0:
+            return {"ok": False, "error": "explore_excel 失败（openpyxl 装了吗？sheet 名/行区间对吗？）",
+                    "logs": [log]}
+        doc = self._read("pll_rows.json", {})
+        return {"ok": True, "logs": [log], "rows": len(doc.get("rows") or []),
+                "sheet": doc.get("sheet"), "cols": doc.get("n_cols")}
+
+    def export_bundle(self):
+        """工程配置 + control_signals + 全部模式，打成一段可复制文本（供 air-gap 贴回）。"""
+        return {"project": self.project_json(),
+                "control_signals": self.control_signals(),
+                "modes": {m["id"]: self.read_mode(m["id"]) for m in self.list_modes()}}
+
+
+# --------------------------------------------------------- control_signals 候选生成（best-effort）
+def _module_tag(module, bands):
+    for k in bands:
+        if k and k.lower() in (module or "").lower():
+            return k
+    return (module or "").split("_")[-1] or module
+
+
+def _classify_pin(port):
+    """按引脚后缀/词根启发式分类：返回 (category, bucket)。bucket='prim'|'sec'|None。"""
+    low = (port or "").lower()
+    if low.endswith("_sel") or "_sel_" in low or "_mode" in low or "_mux" in low or "div_sel" in low:
+        return "config", "sec"
+    if low.endswith("_en") or "_en_" in low:
+        return "en", "prim"
+    if "ictrl" in low:
+        return "ictrl", "prim"
+    if "bias" in low:
+        return "bias", "prim"
+    if "tune" in low or "itune" in low:
+        return "tune", "prim"
+    if "isource" in low:
+        return "isource", "prim"
+    if low.endswith("_ctrl") or "_ctrl_" in low:
+        return "current", "prim"
+    return None, None
+
+
+def seed_control_signals(uptrace_doc, proj):
+    """从 extract_ports 的 uptrace（目标模块控制脚→顶层引脚）生成 control_signals 候选。
+    只抓 dir=input & dest=top_pin 的控制脚（经内部逻辑的漏网脚需人工补）。category/desc 交人工确认。"""
+    bands = list(((proj.get("flowgraph_rules") or {}).get("module_bands") or {}).keys())
+    prim, sec = {}, {}
+    for entry in (uptrace_doc.get("uptrace") or []):
+        tag = _module_tag(entry.get("module", ""), bands)
+        for p in (entry.get("ports") or []):
+            if p.get("dir") != "input" or p.get("dest") != "top_pin":
+                continue
+            net, port = p.get("net"), p.get("port")
+            if not net:
+                continue
+            cat, bucket = _classify_pin(port)
+            if bucket is None:
+                continue
+            store = prim if bucket == "prim" else sec
+            it = store.setdefault(net, {"reg_net": net, "category": cat, "drives": [], "desc": ""})
+            d = "%s.%s" % (tag, port)
+            if d not in it["drives"]:
+                it["drives"].append(d)
+    return {"note": "候选：从 netlist uptrace 自动抓（top_pin 输入控制脚）。category/desc 需人工确认；"
+                    "经内部逻辑门控的控制脚（非 top_pin）不在此，需手工补。",
+            "primary_current_related": list(prim.values()),
+            "config_secondary": list(sec.values())}
+
 
 # ------------------------------------------------------------------ http server
 def make_handler(project):
@@ -223,8 +385,11 @@ def make_handler(project):
                         "regmap": project.regmap(),
                         "layout": project.layout(),
                         "modes": project.list_modes(),
+                        "needs_setup": project.needs_setup(),
                         "backend": "serve",
                     })
+                if p == "/api/project/export":
+                    return self._send(200, project.export_bundle())
                 if p == "/api/flowgraph":
                     return self._send(200, project.flowgraph())
                 if p == "/api/regmap":
@@ -288,6 +453,39 @@ def make_handler(project):
                         return self._send(404, {"error": "bad id"})
                     res = project.export(m.group(1))
                     return self._send(200 if res else 404, res or {"error": "no mode"})
+                # ---- P2.2 建库向导路由 ----
+                if p == "/api/project/config":
+                    body = self._read_body()
+                    if body is BAD_BODY or not isinstance(body, dict):
+                        return self._send(400, {"error": "malformed json body"})
+                    return self._send(200, {"ok": True, "project": project.save_project_config(body)})
+                if p == "/api/import/netlist":
+                    body = self._read_body()
+                    if body is BAD_BODY or not isinstance(body, dict):
+                        return self._send(400, {"error": "malformed json body"})
+                    res = project.import_netlist(body.get("path"))
+                    return self._send(200 if res.get("ok") else 400, res)
+                if p == "/api/import/excel":
+                    body = self._read_body()
+                    if body is BAD_BODY or not isinstance(body, dict):
+                        return self._send(400, {"error": "malformed json body"})
+                    res = project.import_excel(body.get("path"), body.get("sheet"), body.get("rowdump"))
+                    return self._send(200 if res.get("ok") else 400, res)
+                if p == "/api/control_signals":
+                    body = self._read_body()
+                    if body is BAD_BODY or not isinstance(body, dict):
+                        return self._send(400, {"error": "malformed json body"})
+                    project.save_control_signals(body)
+                    return self._send(200, {"ok": True})
+                if p == "/api/build":
+                    rb = project.rebuild()
+                    if not rb.get("ok"):
+                        return self._send(500, {"error": "build failed at " + rb.get("failed", "?"),
+                                                "logs": rb.get("logs")})
+                    return self._send(200, {"ok": True, "flowgraph": project.flowgraph(),
+                                            "regmap": project.regmap(),
+                                            "signal_reg_map": project.signal_reg_map(),
+                                            "needs_setup": project.needs_setup(), "logs": rb.get("logs")})
                 if p == "/api/matching":
                     body = self._read_body()
                     if body is BAD_BODY or not isinstance(body, dict):

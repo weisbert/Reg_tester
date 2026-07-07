@@ -229,8 +229,29 @@ inspector 侧栏（点节点看控制信号→寄存器/地址/bit/默认/关断
 按序重跑 `make_mock_regmap → build_regmap → build_flowgraph`（stdlib subprocess），刷新图与寄存器。
 **人工确认关卡**保留：对真硅写寄存器的模糊匹配必须人点头，不做自动猜。bundle 模式只读。
 
+**工程标签 / 建库向导（P2.2，serve 模式）**：从零建库不必手写 `project.json` 或先跑一串 CLI——
+`--project` 指向一个**不存在的目录**即自动脚手架空工程起 GUI，`bootstrap.needs_setup=true` 时前端自动切到
+"工程"标签，引导走 air-gap 建库六步：
+
+1. **芯片配置**：填 `name`/`root_module`/`base_address`/`sheet_name`、目标模块 `target_modules`、展开子模块
+   `expand_submodules`、`column_map`（字段名→Excel 列号）、可选高级 `flowgraph_rules`（留空用通用默认）
+   → `POST /api/project/config` 写 `project.json`（`artifacts` 补默认固定名）。
+2. **导入 netlist**（填本机绝对路径）→ `POST /api/import/netlist`：后端跑 `extract_ports --connections --compact`
+   出 `conn.json`（+ `--expand` 出 `expand_conn.json`），再抽 `--uptrace` **自动生成 `control_signals` 候选**
+   （top_pin 输入控制脚按后缀启发式分 primary/secondary；category/desc 需人工确认，经内部逻辑门控的漏网脚需手工补）。
+3. **导入 Excel**（路径 + sheet + 行区间）→ `POST /api/import/excel`：后端跑 `explore_excel --rowdump` 出 `pll_rows.json`。
+4. **控制信号**：候选填入文本框，人工确认/补全后 `POST /api/control_signals` 写 `control_signals.json`。
+5. **建库** → `POST /api/build`：跑 `make_mock_regmap → build_regmap → build_flowgraph`（stdlib subprocess），载入图。
+6. **导出工程配置** → `GET /api/project/export`：`project.json` + `control_signals` + 全部 `modes` 打成一段文本，
+   复制发回本地归档（air-gap 出口）。
+
+抽取脚本读 `.xlsm` 需 `openpyxl`（黄区可装；红区 stdlib-only 时用离线包）；`extract_ports`/建库三件套均 stdlib。
+路径参数只在本机（`--serve` 绑 `127.0.0.1`）读用户指定的本地文件，subprocess 以列表参数调用（无 shell 注入）。
+**人工确认关卡**同样保留：control_signals 候选与匹配都要人过目。bundle 模式只读（建库需 `--serve`）。
+
 > **工程数据在 `projects/<name>/`（gitignore）**：`project.json`/`flowgraph.json`/`regmap.json`/`layout.json`/
-> `modes/*.json`/`testcases/`。含真实信号名与地址，绝不进公开仓库。
+> `modes/*.json`/`testcases/` + 输入 `conn.json`/`expand_conn.json`/`control_signals.json`/`pll_rows.json`。
+> 含真实信号名与地址，绝不进公开仓库。
 
 ## 状态
 
@@ -240,3 +261,7 @@ inspector 侧栏（点节点看控制信号→寄存器/地址/bit/默认/关断
   序列生成）+ `gen_testcase.py`（无头生成器 + `ate.txt`/`debug.html` 渲染器）。
 - **M4**：多路对抗式验证——Python↔JS 生成器 24/24 组合逐字节一致、RMW 数值独立复算金标准（BT/WL/WLT）、
   关闭顺序端→源头、REST 路径穿越/坏输入加固、前端 XSS 面收敛、jsdom 端到端渲染/交互全过。
+
+阶段三：**P0** 通用递归子模块展开（黑盒真连接取代命名配对推断）；**P1** `project/2` 工程包=唯一芯片真相
+（配置沉数据侧、代码零真名，`--project` 读它）；**P2.1** GUI 半自动信号→寄存器匹配；**P2.2** 建库向导
+（GUI 里 netlist+Excel 导入→自动抽取→控制信号候选→建库→导出配置，见上"工程标签"）。

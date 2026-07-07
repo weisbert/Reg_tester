@@ -74,6 +74,13 @@ table.sig th{color:var(--mut);font-weight:600;position:sticky;top:0;background:v
 textarea{width:100%;min-height:220px;background:var(--bg);color:var(--fg);border:1px solid var(--line);
   border-radius:8px;padding:8px;font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre;overflow:auto}
 
+/* 工程/建库向导 tab */
+#tab-project textarea{min-height:0;margin:2px 0 4px}
+#tab-project input{width:100%}
+.wlab{display:block;margin:8px 0 2px;font-size:12px;color:var(--mut)}
+.wsum{cursor:pointer;font-size:12px;color:var(--mut);margin:6px 0}
+#tab-project details{margin:4px 0}
+
 /* step list */
 .step{border-left:3px solid var(--off);padding:6px 10px;margin:6px 0;background:var(--panel2);border-radius:0 8px 8px 0}
 .step h4{margin:0 0 3px;font-size:13px}

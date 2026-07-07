@@ -57,6 +57,21 @@
       return fetch('/api/matching', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
       }).then(function (r) { return r.json(); });
+    },
+    // ---- P2.2 建库向导 ----
+    _post: function (url, body) {
+      if (BUNDLE) return Promise.resolve({ ok: false, error: 'bundle 只读，建库需 --serve' });
+      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}) }).then(function (r) { return r.json(); });
+    },
+    saveConfig: function (cfg) { return this._post('/api/project/config', cfg); },
+    importNetlist: function (path) { return this._post('/api/import/netlist', { path: path }); },
+    importExcel: function (path, sheet, rowdump) { return this._post('/api/import/excel', { path: path, sheet: sheet, rowdump: rowdump }); },
+    saveControlSignals: function (obj) { return this._post('/api/control_signals', obj); },
+    build: function () { return this._post('/api/build', {}); },
+    projectExport: function () {
+      if (BUNDLE) return Promise.resolve({ project: BUNDLE.project, control_signals: {}, modes: BUNDLE.modes || {} });
+      return fetch('/api/project/export').then(function (r) { return r.json(); });
     }
   };
 
@@ -72,7 +87,8 @@
     recording: false,
     undo: [], redo: [],
     lastTc: null,
-    match: null, matchLoading: false
+    match: null, matchLoading: false,
+    needsSetup: false, wiz: null   // P2.2 建库向导本地态
   };
 
   function toast(msg) {
@@ -87,6 +103,7 @@
     (S.fg.nodes || []).forEach(function (n) { S.nodeById[n.id] = n; });
     (S.rm.signals || []).forEach(function (s) { S.sigById[s.id] = s; });
     $('#proj-name').textContent = (S.project && S.project.name) ? ('  ·  ' + S.project.name + (Backend.bundle ? '  (bundle)' : '')) : '';
+    S.needsSetup = !!b.needs_setup;
     initGroups();
     initModeSelect();
     bindUI();
@@ -94,6 +111,7 @@
     else newModeFromScratch();
     relayout(true);
     fit();
+    if (S.needsSetup && !Backend.bundle) { switchTab('project'); toast('新工程：在「工程」标签导入 netlist + Excel 建库'); }
   }).catch(function (e) { toast('加载失败: ' + e); console.error(e); });
 
   function defaultLayout() {
@@ -472,6 +490,12 @@
       else if (act === 'match-remove') matchSetAlias(id, null);
       else if (act === 'match-logic') matchToggleLogic(id);
       else if (act === 'match-reload') loadMatching(true);
+      else if (act === 'wiz-save-config') wizSaveConfig();
+      else if (act === 'wiz-import-netlist') wizImportNetlist();
+      else if (act === 'wiz-import-excel') wizImportExcel();
+      else if (act === 'wiz-save-cs') wizSaveCS();
+      else if (act === 'wiz-build') wizBuild();
+      else if (act === 'wiz-export') wizExport();
     });
 
     // keyboard
@@ -595,9 +619,11 @@
     $$('.tab-body').forEach(function (b) { b.classList.remove('active'); });
     $('#tab-' + t).classList.add('active');
     if (t === 'match' && !S.match && !S.matchLoading) loadMatching();
+    if (t === 'project') renderProjectTab();
     renderTabs();
   }
   function onSelect(id) { if (S.activeTab === 'inspector') renderInspector(id); }
+  // project(工程) tab 不进 renderTabs：它是表单，只在切入/操作后主动渲染，避免打断填写
   function renderTabs() { renderInspector(Object.keys(S.sel)[0]); renderModeTab(); renderMatchTab(); renderSeqTab(); }
 
   function variantOf(sig) {
@@ -916,6 +942,168 @@
       '<style>body{font-family:monospace;background:#0f1216;color:#e6e9ef;padding:20px}table{border-collapse:collapse}td,th{border:1px solid #2a2f3a;padding:4px 8px}.mono{font-family:monospace}</style>' +
       '<h2>' + esc(tc.mode) + ' · ' + esc(tc.reg_group) + '</h2><pre>' + esc(Generator.renderAte(tc)) + '</pre>' +
       '<table><tr><th>step</th><th>off</th><th>writes</th></tr>' + rows + '</table>';
+  }
+
+  // ---------------------------------------------------------------- 工程/建库向导 tab（P2.2）
+  // 占位模板：键=make_mock 需要的字段名（固定契约），值=示例列号；用户按自己表的实际列索引改
+  var COLMAP_TEMPLATE = { reg_name: 0, regtype: 1, offset: 2, width: 3, reset: 4, field_name: 5, bit: 6, attr: 7, default: 8, comment: 9 };
+  var CS_HINT = '{"primary_current_related":[{"reg_net":"","category":"en","drives":["TAG.pin"],"desc":""}],"config_secondary":[]}';
+
+  function initWiz() {
+    if (S.wiz) return;
+    var p = S.project || {}, nl = p.netlist || {}, rb = p.regbook || {};
+    S.wiz = {
+      name: p.name || '', root: nl.root_module || '',
+      targets: (nl.target_modules || []).join('\n'),
+      expand: (nl.expand_submodules || []).join('\n'),
+      base: rb.base_address || '', sheet: rb.sheet_name || '',
+      colmap: JSON.stringify(rb.column_map || COLMAP_TEMPLATE, null, 1),
+      fgrules: p.flowgraph_rules ? JSON.stringify(p.flowgraph_rules, null, 1) : '',
+      cs: '', netpath: '', xlsxpath: '', rowdump: '', st: {}, exportText: ''
+    };
+  }
+  var WIZ_FIELDS = { name: 'w-name', root: 'w-root', targets: 'w-targets', expand: 'w-expand',
+    base: 'w-base', sheet: 'w-sheet', colmap: 'w-colmap', fgrules: 'w-fgrules',
+    cs: 'w-cs', netpath: 'w-netpath', xlsxpath: 'w-xlsxpath', rowdump: 'w-rowdump' };
+  function wizReadForm() {
+    initWiz();
+    Object.keys(WIZ_FIELDS).forEach(function (k) { var e = $('#' + WIZ_FIELDS[k]); if (e) S.wiz[k] = e.value; });
+  }
+  function splitList(s) { return String(s || '').split(/[\n,]+/).map(function (x) { return x.trim(); }).filter(Boolean); }
+  function tryParse(s, what) {
+    try { return { ok: true, val: (s && s.trim()) ? JSON.parse(s) : null }; }
+    catch (e) { toast(what + ' JSON 解析失败：' + e.message); return { ok: false }; }
+  }
+
+  function renderProjectTab() {
+    initWiz();
+    var w = S.wiz, el = $('#tab-project'); if (!el) return;
+    var ro = Backend.bundle;
+    var h = [];
+    h.push('<div class="hint">air-gap 建库流程：①填配置 → ②导入 netlist → ③导入 Excel → ④确认控制信号 → ⑤建库 → ⑥导出配置发回。'
+      + '<br>路径填<b>本机绝对路径</b>；<code>--serve</code> 后端在本机跑抽取脚本。' + (ro ? '<br><b>bundle 只读：建库需 <code>--serve</code></b>' : '') + '</div>');
+
+    h.push('<h3 class="sec">① 芯片配置</h3><div class="kv">');
+    h.push('<div class="k">name</div><div class="v"><input id="w-name" value="' + esc(w.name) + '"></div>');
+    h.push('<div class="k">root_module</div><div class="v"><input id="w-root" value="' + esc(w.root) + '"></div>');
+    h.push('<div class="k">base_address</div><div class="v"><input id="w-base" value="' + esc(w.base) + '" placeholder="0x..."></div>');
+    h.push('<div class="k">sheet_name</div><div class="v"><input id="w-sheet" value="' + esc(w.sheet) + '" placeholder="寄存器 sheet 名"></div>');
+    h.push('</div>');
+    h.push('<label class="wlab">目标模块 target_modules（每行一个）</label><textarea id="w-targets" rows="3">' + esc(w.targets) + '</textarea>');
+    h.push('<label class="wlab">展开子模块 expand_submodules（每行一个，可空）</label><textarea id="w-expand" rows="2">' + esc(w.expand) + '</textarea>');
+    h.push('<label class="wlab">column_map（JSON：字段名→Excel 列号；键固定，值填你表的列索引）</label><textarea id="w-colmap" rows="5" class="mono">' + esc(w.colmap) + '</textarea>');
+    h.push('<details><summary class="wsum">高级：flowgraph_rules（JSON，留空用通用默认；known_cross_edges/module_bands 等芯片专属规则在此）</summary>'
+      + '<textarea id="w-fgrules" rows="6" class="mono" placeholder="留空=代码通用默认">' + esc(w.fgrules) + '</textarea></details>');
+    h.push('<div class="row-actions"><button class="primary" data-act="wiz-save-config"' + (ro ? ' disabled' : '') + '>保存配置</button></div>');
+
+    h.push('<h3 class="sec">② 导入 netlist</h3>');
+    h.push('<label class="wlab">netlist 文件路径</label><input id="w-netpath" value="' + esc(w.netpath) + '" placeholder="C:\\...\\netlist.vh">');
+    h.push('<div class="row-actions"><button data-act="wiz-import-netlist"' + (ro ? ' disabled' : '') + '>抽取连接 + 生成控制信号候选</button></div>');
+    if (w.st.netlist) h.push('<div class="card ' + (/失败/.test(w.st.netlist) ? 'warn' : '') + '">' + esc(w.st.netlist) + '</div>');
+
+    h.push('<h3 class="sec">③ 导入 Excel 寄存器簿</h3>');
+    h.push('<label class="wlab">.xlsm 路径</label><input id="w-xlsxpath" value="' + esc(w.xlsxpath) + '" placeholder="C:\\...\\regbook.xlsm">');
+    h.push('<div class="kv"><div class="k">sheet</div><div class="v"><input id="w-xsheet" value="' + esc(w.sheet) + '" placeholder="默认取配置 sheet_name"></div>');
+    h.push('<div class="k">行区间</div><div class="v"><input id="w-rowdump" value="' + esc(w.rowdump) + '" placeholder="START:END（先 --index/--schema 看结构）"></div></div>');
+    h.push('<div class="row-actions"><button data-act="wiz-import-excel"' + (ro ? ' disabled' : '') + '>抽取寄存器行</button></div>');
+    if (w.st.excel) h.push('<div class="card ' + (/失败/.test(w.st.excel) ? 'warn' : '') + '">' + esc(w.st.excel) + '</div>');
+
+    h.push('<h3 class="sec">④ 控制信号（reg_net 清单）</h3>');
+    h.push('<div class="hint">netlist 导入自动填候选（top_pin 输入控制脚）。<b>category/desc 需人工确认</b>；经内部逻辑门控的漏网脚需手工补。</div>');
+    h.push('<textarea id="w-cs" rows="8" class="mono" placeholder=\'' + esc(CS_HINT) + '\'>' + esc(w.cs) + '</textarea>');
+    h.push('<div class="row-actions"><button data-act="wiz-save-cs"' + (ro ? ' disabled' : '') + '>保存控制信号</button></div>');
+
+    h.push('<h3 class="sec">⑤ 建库</h3>');
+    h.push('<div class="hint">跑 make_mock_regmap → build_regmap → build_flowgraph（读工程包），生成派生物并载入图。</div>');
+    h.push('<div class="row-actions"><button class="primary" data-act="wiz-build"' + (ro ? ' disabled' : '') + '>重建派生物 &amp; 载入图 ▸</button></div>');
+    if (w.st.build) h.push('<div class="card ' + (/失败/.test(w.st.build) ? 'warn' : '') + '">' + esc(w.st.build) + '</div>');
+
+    h.push('<h3 class="sec">⑥ 导出工程配置（发回）</h3>');
+    h.push('<div class="hint">project.json + control_signals + 全部模式，打成一段文本复制发回本地归档。</div>');
+    h.push('<div class="row-actions"><button data-act="wiz-export">复制工程配置文本</button></div>');
+    if (w.exportText) h.push('<textarea readonly rows="8" class="mono">' + esc(w.exportText) + '</textarea>');
+
+    el.innerHTML = h.join('');
+  }
+
+  function wizSaveConfig() {
+    if (Backend.bundle) { toast('bundle 只读'); return; }
+    wizReadForm();
+    var cm = tryParse(S.wiz.colmap, 'column_map'); if (!cm.ok) return;
+    var fr = tryParse(S.wiz.fgrules, 'flowgraph_rules'); if (!fr.ok) return;
+    var p = S.project || {};
+    var cfg = { name: S.wiz.name || 'chip' };
+    cfg.netlist = Object.assign({}, p.netlist || {}, {
+      root_module: S.wiz.root, target_modules: splitList(S.wiz.targets), expand_submodules: splitList(S.wiz.expand) });
+    cfg.regbook = Object.assign({}, p.regbook || {}, {
+      base_address: S.wiz.base, sheet_name: S.wiz.sheet, column_map: cm.val || COLMAP_TEMPLATE });
+    if (fr.val) cfg.flowgraph_rules = fr.val;
+    toast('保存配置…');
+    Backend.saveConfig(cfg).then(function (r) {
+      if (!r || !r.ok) { toast('保存失败'); return; }
+      S.project = r.project; toast('配置已保存');
+    }).catch(function (e) { toast('保存失败: ' + e); });
+  }
+  function wizImportNetlist() {
+    if (Backend.bundle) { toast('bundle 只读'); return; }
+    wizReadForm();
+    if (!S.wiz.netpath) { toast('先填 netlist 路径'); return; }
+    toast('抽取 netlist…（跑 extract_ports，可能需几秒）');
+    Backend.importNetlist(S.wiz.netpath).then(function (r) {
+      if (!r || !r.ok) { S.wiz.st.netlist = '失败：' + ((r && r.error) || '?'); renderProjectTab(); return; }
+      var c = r.candidate || {}, np = (c.primary_current_related || []).length, ns = (c.config_secondary || []).length;
+      S.wiz.cs = JSON.stringify(c, null, 1);
+      S.wiz.st.netlist = '成功：conn ' + r.conn_modules + ' 模块；控制信号候选 ' + (np + ns) + '（primary ' + np + ' / secondary ' + ns + '）'
+        + (r.has_control_signals ? '｜已有 control_signals.json 未覆盖，候选见④，需要则替换后保存' : '｜候选已填入④，确认后保存');
+      renderProjectTab(); toast('netlist 抽取完成');
+    }).catch(function (e) { S.wiz.st.netlist = '失败：' + e; renderProjectTab(); });
+  }
+  function wizImportExcel() {
+    if (Backend.bundle) { toast('bundle 只读'); return; }
+    wizReadForm();
+    var xsheet = ($('#w-xsheet') || {}).value;
+    if (!S.wiz.xlsxpath) { toast('先填 .xlsm 路径'); return; }
+    toast('抽取 Excel…（跑 explore_excel）');
+    Backend.importExcel(S.wiz.xlsxpath, xsheet, S.wiz.rowdump).then(function (r) {
+      if (!r || !r.ok) { S.wiz.st.excel = '失败：' + ((r && r.error) || '?'); renderProjectTab(); return; }
+      S.wiz.st.excel = '成功：sheet ' + esc(r.sheet) + '，抽 ' + r.rows + ' 行 × ' + r.cols + ' 列 → pll_rows.json';
+      renderProjectTab(); toast('Excel 抽取完成');
+    }).catch(function (e) { S.wiz.st.excel = '失败：' + e; renderProjectTab(); });
+  }
+  function wizSaveCS() {
+    if (Backend.bundle) { toast('bundle 只读'); return; }
+    wizReadForm();
+    var cs = tryParse(S.wiz.cs, 'control_signals'); if (!cs.ok) return;
+    if (!cs.val) { toast('控制信号为空'); return; }
+    Backend.saveControlSignals(cs.val).then(function (r) {
+      toast(r && r.ok ? '控制信号已保存' : '保存失败');
+    }).catch(function (e) { toast('保存失败: ' + e); });
+  }
+  function wizBuild() {
+    if (Backend.bundle) { toast('bundle 只读'); return; }
+    toast('建库中…（跑三件套，可能需几秒）');
+    Backend.build().then(function (r) {
+      if (!r || !r.ok) { S.wiz.st.build = '失败：' + ((r && r.error) || '?'); renderProjectTab(); console.error(r); toast('建库失败'); return; }
+      S.fg = r.flowgraph; S.rm = r.regmap; S.needsSetup = !!r.needs_setup;
+      S.nodeById = {}; (S.fg.nodes || []).forEach(function (n) { S.nodeById[n.id] = n; });
+      S.sigById = {}; (S.rm.signals || []).forEach(function (s) { S.sigById[s.id] = s; });
+      S.match = null;   // 强制匹配 tab 下次重载
+      relayout(true); render(); fit(); renderTabs();
+      var srm = r.signal_reg_map || {}, c = srm.counts || {};
+      S.wiz.st.build = '成功：' + (S.fg.nodes || []).length + ' 节点 / ' + (S.rm.signals || []).length + ' 信号'
+        + (c.unresolved !== undefined ? '（' + (c.exact || 0) + ' exact / ' + (c.alias || 0) + ' alias / ' + c.unresolved + ' 未匹配）' : '');
+      renderProjectTab(); toast('已建库 · ' + (S.fg.nodes || []).length + ' 节点');
+    }).catch(function (e) { S.wiz.st.build = '失败：' + e; renderProjectTab(); toast('建库失败: ' + e); });
+  }
+  function wizExport() {
+    Backend.projectExport().then(function (d) {
+      var text = JSON.stringify(d, null, 1);
+      S.wiz.exportText = text; renderProjectTab();
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(
+        function () { toast('已复制（' + text.length + ' 字符）'); },
+        function () { toast('已生成，见下方文本框（剪贴板被拒）'); });
+      else toast('已生成，手动复制下方文本框');
+    }).catch(function (e) { toast('导出失败: ' + e); });
   }
 
   function esc(s) { return String(s === undefined || s === null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
