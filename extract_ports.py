@@ -61,6 +61,17 @@ def _load_default_modules():
             pass
     return list(DEFAULT_MODULES)
 
+
+def _default_modules(proj_dir, expand=False):
+    """缺省目标模块：有 --project 读工程包 netlist 段，否则读本地 tool_config。"""
+    if proj_dir:
+        p = os.path.join(proj_dir, "project.json")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                nl = json.load(f).get("netlist", {})
+            return nl.get("expand_submodules", []) if expand else nl.get("target_modules", [])
+    return _load_default_modules()
+
 POWER_RE = re.compile(r'^(A?V(DD|SS)|D?V(DD|SS)|SUB|GND|VBAT|VCC|VREF)', re.I)
 
 DECL_RE = re.compile(r'\b(input|output|inout)\b\s*(\[[^\]]*\])?\s*([^;]+?);')
@@ -589,7 +600,10 @@ def find_modules(text):
 def main():
     ap = argparse.ArgumentParser(description="抽取指定模块的端口 I/O 与内部连接")
     ap.add_argument("path", help="netlist 文件 (.vh/.v/.va 等)")
-    ap.add_argument("--modules", default=None, help="逗号分隔模块名；缺省读本地 config，无则需显式指定")
+    ap.add_argument("--project", help="工程包目录（project.json schema/2）：缺省目标模块读 netlist.target_modules")
+    ap.add_argument("--expand", action="store_true",
+                    help="配 --project：目标改用 netlist.expand_submodules（抽子模块内部连接）")
+    ap.add_argument("--modules", default=None, help="逗号分隔模块名；缺省读工程包/本地 config，无则需显式指定")
     ap.add_argument("--json", default=None, help="导出 JSON 到该文件")
     ap.add_argument("--list", action="store_true", help="只列出文件里所有模块名")
     ap.add_argument("--connections", action="store_true",
@@ -630,7 +644,7 @@ def main():
         return
 
     targets = ([m.strip() for m in args.modules.split(",") if m.strip()]
-               if args.modules else _load_default_modules())
+               if args.modules else _default_modules(args.project, args.expand))
     if not targets and not args.list:
         sys.exit("未指定目标模块：用 --modules A,B,C，或放 private/tool_config/extract_ports.json")
 

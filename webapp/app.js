@@ -47,6 +47,16 @@
     exportSeq: function (id) {
       if (BUNDLE) return Promise.resolve(null); // bundle：客户端下载
       return fetch('/api/export/' + encodeURIComponent(id), { method: 'POST' }).then(function (r) { return r.json(); });
+    },
+    matching: function () {
+      if (BUNDLE) return Promise.resolve(null); // bundle 只读：无匹配重建
+      return fetch('/api/matching').then(function (r) { return r.ok ? r.json() : null; });
+    },
+    saveMatching: function (payload) {
+      if (BUNDLE) return Promise.resolve({ ok: false, error: 'bundle 只读' });
+      return fetch('/api/matching', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+      }).then(function (r) { return r.json(); });
     }
   };
 
@@ -61,7 +71,8 @@
     activeTab: 'inspector',
     recording: false,
     undo: [], redo: [],
-    lastTc: null
+    lastTc: null,
+    match: null, matchLoading: false
   };
 
   function toast(msg) {
@@ -457,6 +468,10 @@
       else if (act === 'copy') seqCopy();
       else if (act === 'dl') seqDownload(val);
       else if (act === 'export') seqExport();
+      else if (act === 'match-apply') applyMatching();
+      else if (act === 'match-remove') matchSetAlias(id, null);
+      else if (act === 'match-logic') matchToggleLogic(id);
+      else if (act === 'match-reload') loadMatching(true);
     });
 
     // keyboard
@@ -579,10 +594,11 @@
     $$('#side-tabs button').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-tab') === t); });
     $$('.tab-body').forEach(function (b) { b.classList.remove('active'); });
     $('#tab-' + t).classList.add('active');
+    if (t === 'match' && !S.match && !S.matchLoading) loadMatching();
     renderTabs();
   }
   function onSelect(id) { if (S.activeTab === 'inspector') renderInspector(id); }
-  function renderTabs() { renderInspector(Object.keys(S.sel)[0]); renderModeTab(); renderSeqTab(); }
+  function renderTabs() { renderInspector(Object.keys(S.sel)[0]); renderModeTab(); renderMatchTab(); renderSeqTab(); }
 
   function variantOf(sig) {
     var s = S.sigById[sig]; if (!s) return null;
@@ -687,6 +703,144 @@
     h.push('<div class="row-actions"><button class="primary" data-act="gen">生成序列 ▸</button></div>');
     el.innerHTML = h.join('');
     var nm = $('#m-name'); if (nm) nm.addEventListener('change', function () { mutate(function () { S.mode.name = this.value; }.bind(this)); });
+  }
+
+  // ---------------------------------------------------------------- matching tab（P2：信号→寄存器半自动匹配）
+  function shallowObj(o) { var r = {}; Object.keys(o || {}).forEach(function (k) { r[k] = o[k]; }); return r; }
+
+  function loadMatching(force) {
+    if (Backend.bundle) { renderMatchTab(); return; }
+    if (S.matchLoading) return;
+    if (S.match && !S.match.error && !force) { renderMatchTab(); return; }
+    S.matchLoading = true; renderMatchTab();
+    Backend.matching().then(function (d) {
+      S.matchLoading = false;
+      if (!d) { S.match = { error: '无响应' }; renderMatchTab(); return; }
+      var srm = d.signal_reg_map || {}, mt = d.matching || {};
+      var fields = [], seen = {};
+      (srm.registers || []).forEach(function (reg) {
+        (reg.fields || []).forEach(function (f) {
+          if (f.name && !seen[f.name]) { seen[f.name] = 1; fields.push(f.name); }
+        });
+      });
+      S.match = {
+        signals: srm.signals || [], fields: fields, counts: srm.counts || {},
+        alias: shallowObj(mt.alias), logic: (mt.logic_derived || []).slice(),
+        baseAlias: shallowObj(mt.alias), baseLogic: (mt.logic_derived || []).slice()
+      };
+      renderMatchTab();
+    }).catch(function (e) { S.matchLoading = false; S.match = { error: String(e) }; renderMatchTab(); });
+  }
+  function matchDirty() {
+    if (!S.match || S.match.error) return false;
+    return JSON.stringify(S.match.alias) !== JSON.stringify(S.match.baseAlias)
+        || JSON.stringify(S.match.logic.slice().sort()) !== JSON.stringify(S.match.baseLogic.slice().sort());
+  }
+  function matchSetAlias(sig, field) {
+    if (!S.match) return;
+    if (field) { S.match.alias[sig] = field; var i = S.match.logic.indexOf(sig); if (i >= 0) S.match.logic.splice(i, 1); }
+    else delete S.match.alias[sig];
+    renderMatchTab();
+  }
+  function matchToggleLogic(sig) {
+    if (!S.match) return;
+    var i = S.match.logic.indexOf(sig);
+    if (i >= 0) S.match.logic.splice(i, 1);
+    else { S.match.logic.push(sig); delete S.match.alias[sig]; }
+    renderMatchTab();
+  }
+  function matchEffStatus(s) {
+    var sig = s.reg_net, M = S.match;
+    if (s.match === 'exact' || s.match === 'case') return s.match;   // 名字直配，不受 alias 影响
+    if (M.alias[sig]) return (M.baseAlias[sig] === M.alias[sig]) ? 'alias' : 'alias*';
+    if (M.logic.indexOf(sig) >= 0) return (M.baseLogic.indexOf(sig) >= 0) ? 'logic' : 'logic*';
+    return 'unresolved';
+  }
+  function applyMatching() {
+    if (Backend.bundle) { toast('bundle 只读'); return; }
+    if (!matchDirty()) { toast('无改动'); return; }
+    toast('重建中…');
+    Backend.saveMatching({ alias: S.match.alias, logic_derived: S.match.logic }).then(function (r) {
+      if (!r || !r.ok) { toast('重建失败：' + ((r && r.error) || '?')); console.error(r); return; }
+      S.fg = r.flowgraph; S.rm = r.regmap;
+      S.nodeById = {}; (S.fg.nodes || []).forEach(function (n) { S.nodeById[n.id] = n; });
+      S.sigById = {}; (S.rm.signals || []).forEach(function (s) { S.sigById[s.id] = s; });
+      var srm = r.signal_reg_map || {}, mt = r.matching || {};
+      S.match.signals = srm.signals || S.match.signals;
+      S.match.counts = srm.counts || S.match.counts;
+      S.match.alias = shallowObj(mt.alias); S.match.baseAlias = shallowObj(mt.alias);
+      S.match.logic = (mt.logic_derived || []).slice(); S.match.baseLogic = (mt.logic_derived || []).slice();
+      relayout(false); render(); renderTabs();
+      var c = srm.counts || {};
+      toast('已重建 · ' + (c.exact || 0) + ' exact/' + (c.alias || 0) + ' alias/' + (c.unresolved || 0) + ' 未匹配');
+    }).catch(function (e) { toast('重建失败: ' + e); console.error(e); });
+  }
+  function renderMatchTab() {
+    var el = $('#tab-match'); if (!el) return;
+    if (Backend.bundle) { el.innerHTML = '<div class="hint">匹配编辑需 serve 模式（要跑 Python 重建 regmap/flowgraph）。bundle 是只读快照。</div>'; return; }
+    if (S.matchLoading) { el.innerHTML = '<div class="hint">加载匹配状态…</div>'; return; }
+    if (!S.match) { el.innerHTML = '<div class="hint">加载中…</div>'; return; }
+    if (S.match.error) { el.innerHTML = '<div class="card warn">加载失败：' + esc(String(S.match.error)) + '</div>'; return; }
+    var M = S.match;
+    var todo = [], logic = [], resolved = [];
+    M.signals.forEach(function (s) {
+      var st = matchEffStatus(s);
+      if (st === 'unresolved' || st === 'alias*') todo.push({ s: s, st: st });
+      else if (st === 'logic' || st === 'logic*') logic.push({ s: s, st: st });
+      else resolved.push({ s: s, st: st });
+    });
+    var h = [];
+    h.push('<datalist id="fieldcat">');
+    M.fields.forEach(function (f) { h.push('<option value="' + esc(f) + '">'); });
+    h.push('</datalist>');
+    h.push('<h3 class="sec">信号 → 寄存器匹配</h3>');
+    h.push('<div class="hint">网表控制信号名与寄存器字段名经硅迭代漂移；自动匹配 exact/case，对不上的在此点选真字段（写回 <b>project.matching.alias</b>）或标为逻辑推导。确认后重建 regmap/flowgraph。</div>');
+    var dirty = matchDirty();
+    h.push('<div class="kv"><div class="k">状态</div><div class="v">' + resolved.length + ' 已匹配 · ' + todo.length + ' 待处理 · ' + logic.length + ' 逻辑推导</div></div>');
+    h.push('<div class="row-actions"><button class="primary" data-act="match-apply"' + (dirty ? '' : ' disabled') + '>应用 &amp; 重建 ▸</button><button data-act="match-reload">↻ 重载</button></div>');
+    if (dirty) h.push('<div class="card warn" style="font-size:11.5px">有未应用改动，应用会写 project.json 并重跑建库脚本。</div>');
+
+    h.push('<h3 class="sec">需处理 (' + todo.length + ')</h3>');
+    if (!todo.length) h.push('<div class="hint">没有待处理信号 🎉</div>');
+    todo.forEach(function (x) {
+      var s = x.s, sig = s.reg_net, picked = M.alias[sig] || '';
+      h.push('<div class="card" style="padding:8px 10px"><b class="mono">' + esc(short(sig, 32)) + '</b>');
+      if (s.category) h.push(' <span class="pill">' + esc(s.category) + '</span>');
+      if (x.st === 'alias*') h.push(' <span class="pill on">待应用</span>');
+      if ((s.drives || []).length) h.push('<div class="muted" style="font-size:11px">→ ' + esc(s.drives.join(', ')) + '</div>');
+      h.push('<div style="margin-top:5px;display:flex;gap:4px">');
+      h.push('<input list="fieldcat" data-matchsig="' + esc(sig) + '" placeholder="选/输真实字段名…" value="' + esc(picked) + '" style="flex:1">');
+      if (picked) h.push('<button data-act="match-remove" data-id="' + esc(sig) + '" title="清除">✕</button>');
+      h.push('</div>');
+      h.push('<div class="row-actions" style="margin-top:4px"><button data-act="match-logic" data-id="' + esc(sig) + '">标为逻辑推导</button></div>');
+      h.push('</div>');
+    });
+
+    if (logic.length) {
+      h.push('<h3 class="sec">逻辑推导 (' + logic.length + ')</h3>');
+      h.push('<div class="hint">这些不是直接寄存器位（组合逻辑/环路产物），不进 regmap 解析。</div>');
+      logic.forEach(function (x) {
+        var sig = x.s.reg_net;
+        h.push('<div class="card" style="padding:6px 10px"><b class="mono">' + esc(short(sig, 30)) + '</b>' + (x.st === 'logic*' ? ' <span class="pill on">待应用</span>' : '') + ' <button data-act="match-logic" data-id="' + esc(sig) + '" style="float:right">取消</button></div>');
+      });
+    }
+
+    h.push('<h3 class="sec">已匹配 (' + resolved.length + ')</h3>');
+    h.push('<table class="sig"><tr><th>信号</th><th>字段 / addr</th><th>bit</th><th>来源</th></tr>');
+    resolved.forEach(function (x) {
+      var s = x.s;
+      h.push('<tr><td><b class="mono">' + esc(short(s.reg_net, 24)) + '</b></td>');
+      h.push('<td><span class="mono">' + esc(short(s.field_name || '', 22)) + '</span><br><span class="addr">' + esc((s.addr || '').toUpperCase()) + '</span></td>');
+      h.push('<td class="mono">' + esc(s.bit || '') + '</td>');
+      h.push('<td>' + esc(x.st) + (x.st === 'alias' ? ' <button data-act="match-remove" data-id="' + esc(s.reg_net) + '" title="取消别名">✕</button>' : '') + '</td></tr>');
+    });
+    h.push('</table>');
+    el.innerHTML = h.join('');
+    $$('#tab-match input[data-matchsig]').forEach(function (inp) {
+      inp.addEventListener('change', function () {
+        matchSetAlias(this.getAttribute('data-matchsig'), this.value.trim() || null);
+      });
+    });
   }
 
   // ---------------------------------------------------------------- sequence tab

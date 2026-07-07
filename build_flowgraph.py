@@ -80,6 +80,14 @@ DEFAULT_RULES = {
                   "contains": {"div2": "div", "div": "div"}},
     "off_gate_categories": ["master_en", "buf_en", "div_en", "clk_en", "mux_en",
                             "ckdiv_en", "adc_en", "mixed_en", "bias_en"],
+    # ---- 子模块递归展开(P0) ----
+    # 可挂电流门(off_control)的器件类型；glue 标准单元(ND/NR/INV 等,device=unknown)不在此列：
+    # 即使其输入网解析到寄存器使能，也只记为 control 不产 off_control（它不是耗电器件）。
+    "gateable_devices": ["buf", "mux", "div", "dco"],
+    # 展开时额外隐藏的无源器件（去耦电容等）；只在展开子模块内部生效，不动顶层。通用型名。
+    "expand_device_blacklist": ["cfmom", "pcapacitor", "capacitor", "ncapacitor", "resistor"],
+    # 展开子模块内部叶子实例的输出脚判定（通用 Verilog 命名约定 + 常见分频/retime 词根）。
+    "expand_output_pin_regex": r"(?i)(^(out|outn|outp|z|zn|zo|q|qn)$)|((_out|_outn|_outp|_lc)$)|(^div2_[iq]b?$)|(^(rstn_sync|pre_en)$)",
     # 网解析出信号但引脚名无 ctrl 后缀时（如 ADC EN、DCO_EN），按信号类别定角色
     "category_role": {
         "master_en": "enable", "buf_en": "enable", "div_en": "enable", "clk_en": "enable",
@@ -97,6 +105,8 @@ DEFAULT_RULES = {
     # 换项目若同名确可信可开；开时同名边标 provenance=name + warn，且跳过 blocklist。
     "crossmodule_by_netname": False,
     "crossmodule_net_blocklist": [],    # 项目专属，本地 config 覆盖
+    # glue 门控前推：把经内部 glue 逻辑门控的寄存器使能，前推到它最终门控的耗电器件当 off_control。
+    "glue_gate_propagation": True,
     # 已知的 unresolved / logic-derived 集合大小，用于回归自检
     "expected_unresolved_signals": 10,
     "expected_logic_derived_signals": 2,
@@ -107,6 +117,16 @@ DEFAULT_RULES = {
 def load_json(path):
     with io.open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_project(proj_dir):
+    """读工程包 project.json（schema/2）。None 目录 -> 返回 None（走传统默认路径）。"""
+    if not proj_dir:
+        return None
+    p = os.path.join(proj_dir, "project.json")
+    if not os.path.exists(p):
+        sys.exit("工程包缺 project.json: %s" % p)
+    return load_json(p)
 
 
 def parse_expr(expr):
@@ -138,6 +158,7 @@ class Rules:
         self.ls = d["levelshift_prefix"]
         self.out_pin_re = re.compile(d["output_pin_regex"])
         self.route_out_re = re.compile(d["route_output_regex"])
+        self.expand_out_re = re.compile(d["expand_output_pin_regex"])
 
     def pin_dir(self, pin, role, route=False):
         """数据脚方向：out 后缀/输出脚名 -> output；否则 input（做 sink）。
@@ -340,8 +361,9 @@ class SignalTable:
 
 
 # ---------- 主构建 ----------
-def build(conn, regmap, rules):
+def build(conn, regmap, rules, module_defs=None):
     modules = conn["modules"]
+    module_defs = module_defs or {}
     port_to_signal, tag_to_module, module_to_tag, sig_by_id = build_signal_index(regmap, modules)
     ls = rules.ls
     hide = set(rules.d["device_blacklist"])
@@ -397,11 +419,21 @@ def build(conn, regmap, rules):
 
             children = []
             if role == "bufbank":
-                children = synth_channels(inst, iid, tag, rules, port_to_signal, ls_alias,
-                                          sig_by_id, sigtab, net_ep, diag)
-                node["children"] = [c["id"] for c in children]
-                # bank 顶层只登记信号 IO 脚（供连边），控制脚归子节点
-                annotate_io_only(node, inst, tag, rules, net_ep)
+                subdef = module_defs.get(t)
+                if subdef:
+                    # 真实内部连接可用：通用递归展开（取代命名配对推断）
+                    children = expand_submodule(inst, subdef, iid, tag, rules, port_to_signal,
+                                                ls_alias, sig_by_id, sigtab, net_ep, diag, module_defs)
+                    node["children"] = [c["id"] for c in children]
+                    node["expanded"] = True
+                    # 展开后不再 annotate_io_only：真实内部脚已接管边界网
+                else:
+                    children = synth_channels(inst, iid, tag, rules, port_to_signal, ls_alias,
+                                              sig_by_id, sigtab, net_ep, diag)
+                    node["children"] = [c["id"] for c in children]
+                    node["provisional_children"] = True
+                    # bank 顶层只登记信号 IO 脚（供连边），控制脚归子节点
+                    annotate_io_only(node, inst, tag, rules, net_ep)
             elif role == "logic":
                 pass   # 控制域：不挂控制脚、不进 net_index（纯 plumbing）
             elif role == "route":
@@ -416,9 +448,8 @@ def build(conn, regmap, rules):
             nodes.extend(children)
         diag["hidden_counts"][tag] = dict(hidden_c)
 
-    # 后处理：enb 继承互补 en 的 signal_ref；off_controls 按信号去重；未覆盖门诊断
+    # 后处理：enb 继承互补 en 的 signal_ref；off_controls 按信号去重
     fixup_enb_and_off(nodes, sigtab, sig_by_id)
-    diag["uncovered_off_gates"] = compute_uncovered_gates(nodes, sig_by_id, rules)
 
     # ADC 同类型实例配对 diff_partner
     tag_diff_partner(nodes)
@@ -429,6 +460,11 @@ def build(conn, regmap, rules):
                   set(p[0] for p in m["ports"] if p[1] == "output") for m in modules}
     edges = build_edges(net_ep, rules, diag, mod_input, mod_output)
     build_cross_edges(net_ep, rules, edges)
+
+    # glue 门控前推（需 edges）：把 glue 上的寄存器使能前推到终端器件，再算未覆盖门
+    if rules.d.get("glue_gate_propagation", True):
+        propagate_glue_gates(nodes, edges, sigtab, rules, diag)
+    diag["uncovered_off_gates"] = compute_uncovered_gates(nodes, sig_by_id, rules)
 
     diag["polarity_inferred_gates"] = sum(
         1 for n in nodes for oc in n["off_controls"] if oc.get("polarity_inferred"))
@@ -597,6 +633,97 @@ def synth_channels(inst, parent_id, tag, rules, port_to_signal, ls_alias, sig_by
     return children
 
 
+def _bdir(port_dir, pin, prole, rules):
+    """展开时叶子实例数据脚方向。边界端口用子模块端口方向(权威)；inout/未知/内部网用命名启发。"""
+    if port_dir == "output":
+        return "output"
+    if port_dir == "input":
+        return "input"
+    if prole == "out":
+        return "output"
+    if prole == "in":
+        return "input"
+    return "output" if rules.expand_out_re.search(pin) else "input"
+
+
+def expand_submodule(inst, subdef, parent_id, parent_tag, rules, port_to_signal,
+                     parent_ls_alias, sig_by_id, sigtab, net_ep, diag, module_defs, depth=0):
+    """用子模块真实内部连接展开 composite 黑盒（取代 synth_channels 的命名配对推断）。
+    - 边界端口(子模块端口) -> 并入【父命名域】：控制脚经父网解析寄存器，数据脚方向取端口方向。
+    - 纯内部网 -> 留【子命名域】(net scope=parent_id)，产模块内部流/逻辑边。
+    只信连接不信名字；节点用真实实例名（回避 tokenize 脆弱性）。"""
+    portmap = {pin: expr for pin, expr in inst["c"] if pin is not None}
+    subport_dir = {p[0]: p[1] for p in subdef["ports"]}
+    sub_tag = parent_id
+    hide = set(rules.d["device_blacklist"]) | set(rules.d.get("expand_device_blacklist", []))
+    ctrl_roles = set(rules.d["ctrl_roles"])
+    cat_role = rules.d["category_role"]
+    gateable = set(rules.d["gateable_devices"])
+    children = []
+
+    for sinst in subdef["instances"]:
+        st = sinst["t"]
+        if st in hide:
+            continue
+        kind, device, role = rules.classify(st)
+        cid = "%s/%s" % (parent_id, sinst["n"])
+        node = {
+            "id": cid, "kind": kind, "device": device, "symbol": rules.symbol(device),
+            "name": sinst["n"], "module": parent_tag, "parent": parent_id,
+            "inst_type": st, "inst_name": sinst["n"], "inferred": False,
+            "hidden_default": (role == "logic"),
+            "opaque_blackbox": role in ("opaquediv", "route"),
+            "expandable": False, "control_domain": (role == "logic"),
+            "children": [], "pins": [], "controls": [], "off_controls": [],
+            "reg_touch": [], "warn": None,
+        }
+        if device == "div":
+            node["div_ratio"] = 2
+        # P0 不做嵌套展开：内部黑盒(若有)按叶子处理并标注，待需要时再开递归
+        if role == "bufbank" and st in module_defs:
+            node["warn"] = "nested_expandable_not_expanded"
+            diag.setdefault("nested_expandable", []).append(cid)
+        is_gateable = device in gateable
+
+        for pin, expr in sinst["c"]:
+            if rules.is_power(pin):
+                continue
+            netbase = rules.primary_net(expr)
+            if not netbase or rules.is_power(netbase):
+                continue
+            token, prole, lane = tokenize(pin, rules)
+            if netbase in portmap:                       # ---- 边界端口：并入父命名域 ----
+                pexpr = portmap[netbase]
+                pnet = rules.primary_net(pexpr)
+                if pnet is None or rules.is_power(pnet):
+                    continue
+                sid, src = resolve_signal(pexpr, parent_tag, port_to_signal, parent_ls_alias, rules.ls)
+                name_ctrl = prole in ctrl_roles
+                if name_ctrl or sid:
+                    r2 = prole if name_ctrl else cat_role.get(
+                        sig_by_id[sid].get("category") if sid else None, "enable")
+                    if not is_gateable and r2 in ("enable", "enout"):
+                        r2 = "gate_in"                   # glue 逻辑输入：记录不作电流门
+                    _mk_control_pin(node, pin, pexpr, parent_tag, rules, port_to_signal,
+                                    parent_ls_alias, sig_by_id, sigtab, diag, r2, lane,
+                                    presid=sid, presrc=src)
+                    continue
+                pdir = _bdir(subport_dir.get(netbase), pin, prole, rules)
+                node["pins"].append({"id": "%s.%s" % (cid, pin), "name": pin, "dir": pdir,
+                                     "net": pnet, "role": "data_" + ("out" if pdir == "output" else "in"),
+                                     "lane": lane})
+                net_ep[(parent_tag, pnet)].append((cid, pin, pdir))
+            else:                                        # ---- 纯内部网：子命名域数据/逻辑边 ----
+                pdir = _bdir(None, pin, prole, rules)
+                node["pins"].append({"id": "%s.%s" % (cid, pin), "name": pin, "dir": pdir,
+                                     "net": netbase, "role": "data_" + ("out" if pdir == "output" else "in"),
+                                     "lane": lane})
+                net_ep[(sub_tag, netbase)].append((cid, pin, pdir))
+        node["off_controls"] = _dedup_off(node["off_controls"])
+        children.append(node)
+    return children
+
+
 def _dedup_off(offs):
     """按 (signal_ref, lane) 去重：同一寄存器位在同节点只留一个门（en/enout 指同 bit 不重复计）。"""
     seen, out = set(), []
@@ -622,6 +749,49 @@ def fixup_enb_and_off(nodes, sigtab, sig_by_id):
                     p["shared"] = twin.get("shared")
                     sigtab.ref(sid, p["id"])
         n["off_controls"] = _dedup_off(n["off_controls"])
+
+
+def propagate_glue_gates(nodes, edges, sigtab, rules, diag):
+    """把经内部 glue 逻辑门控的寄存器使能，沿数据边前推到它最终门控的耗电器件，作为该器件 off_control。
+    只做拓扑前推（穿过 glue 到 gateable 器件），off_value 用寄存器自身值——把寄存器写到 OFF 即关断其
+    门控的整条通路，与 glue 内部极性无关（AND 型门控：任一使能=0 则通路关）。标 via_glue 供人工核。"""
+    fwd = defaultdict(list)
+    for e in edges:
+        f = e["from"]["node"]
+        for t in e["to"]:
+            fwd[f].append(t["node"])
+    nodemap = {n["id"]: n for n in nodes}
+    gateable = set(rules.d["gateable_devices"])
+    added = []
+    for n in nodes:
+        gate_ins = [c for c in n.get("controls", []) if c.get("role") == "gate_in" and c.get("signal_ref")]
+        if not gate_ins or n["device"] in gateable:
+            continue
+        # BFS 沿数据边前推，穿过 glue（非 gateable）直到耗电器件
+        targets, seen, stack = [], {n["id"]}, list(fwd.get(n["id"], []))
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            xn = nodemap.get(x)
+            if not xn:
+                continue
+            if xn["device"] in gateable:
+                targets.append(xn)
+            else:
+                stack.extend(fwd.get(x, []))
+        for c in gate_ins:
+            sid = c["signal_ref"]
+            for tgt in targets:
+                if any(o["signal_ref"] == sid for o in tgt["off_controls"]):
+                    continue
+                oc = sigtab.off_control(sid, c["pin"], None)
+                oc["via_glue"] = n["id"]
+                tgt["off_controls"].append(oc)
+                tgt["off_controls"] = _dedup_off(tgt["off_controls"])
+                added.append({"signal": sid, "from_glue": n["id"], "to_device": tgt["id"]})
+    diag["glue_propagated"] = added
 
 
 def compute_uncovered_gates(nodes, sig_by_id, rules):
@@ -812,33 +982,72 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="conn.json -> 规范 flowgraph.json")
     here = os.path.dirname(os.path.abspath(__file__))
     pdir = os.path.join(here, "private", "adpll")
-    ap.add_argument("--conn", default=os.path.join(pdir, "conn.json"))
-    ap.add_argument("--regmap", default=os.path.join(pdir, "regmap.json"))
-    ap.add_argument("--out", default=os.path.join(pdir, "flowgraph.json"))
+    ap.add_argument("--project", help="工程包目录（project.json schema/2）：配置读 flowgraph_rules 段，"
+                                       "IO 按 artifacts 从包内解析。取代 private/tool_config + private/adpll 默认。")
+    ap.add_argument("--conn", default=None)
+    ap.add_argument("--regmap", default=None)
+    ap.add_argument("--out", default=None)
     ap.add_argument("--config")
+    ap.add_argument("--expand", action="append",
+                    help="额外子模块连接 JSON（可多次）；其中模块定义可被 composite 黑盒按型名递归展开。"
+                         "缺省自动加载 expand_conn.json（工程包内或 private/adpll/，若存在）")
     ap.add_argument("--print", dest="do_print", action="store_true")
     args = ap.parse_args(argv)
 
+    proj = load_project(args.project)          # None -> 传统 private/adpll + tool_config
+    art = proj.get("artifacts", {}) if proj else {}
+
+    def ppath(name, default):
+        return os.path.join(args.project, name) if args.project else os.path.join(pdir, default)
+
+    conn_path = args.conn or (ppath(art.get("conn", "conn.json"), "conn.json"))
+    regmap_path = args.regmap or (ppath(art.get("regmap", "regmap.json"), "regmap.json"))
+    out_path = args.out or (ppath(art.get("flowgraph", "flowgraph.json"), "flowgraph.json"))
+
     rd = json.loads(json.dumps(DEFAULT_RULES))
-    # 项目专属真实规则（模块名/网名/前缀/跨模块边）放 gitignore 的本地 config，代码里只留通用占位。
-    local_cfg = os.path.join(here, "private", "tool_config", "build_flowgraph.json")
-    if os.path.exists(local_cfg):
-        rd.update(load_json(local_cfg))
+    if proj is not None:
+        # 工程包权威：芯片专属规则来自 project.json 的 flowgraph_rules 段。
+        rd.update(proj.get("flowgraph_rules", {}))
+    else:
+        # 传统：项目专属真实规则放 gitignore 的本地 config，代码里只留通用占位。
+        local_cfg = os.path.join(here, "private", "tool_config", "build_flowgraph.json")
+        if os.path.exists(local_cfg):
+            rd.update(load_json(local_cfg))
     if args.config:
         rd.update(load_json(args.config))
     rules = Rules(rd)
-    for p in (args.conn, args.regmap):
+    for p in (conn_path, regmap_path):
         if not os.path.exists(p):
             print("找不到输入:", p, file=sys.stderr)
             return 2
-    conn = load_json(args.conn)
-    regmap = load_json(args.regmap)
-    fg = build(conn, regmap, rules)
+    conn = load_json(conn_path)
+    regmap = load_json(regmap_path)
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with io.open(args.out, "w", encoding="utf-8") as f:
+    # 可展开子模块定义池：按型名索引。缺省自动纳入 expand_conn.json（若存在）。
+    module_defs = {}
+    for m in conn.get("modules", []):
+        module_defs.setdefault(m["name"], m)
+    expand_files = list(args.expand or [])
+    if not args.expand:
+        if proj is not None:
+            expand_files = [os.path.join(args.project, e) for e in art.get("expand_conn", [])]
+        else:
+            default_bt = os.path.join(pdir, "expand_conn.json")
+            if os.path.exists(default_bt):
+                expand_files = [default_bt]
+    for ef in expand_files:
+        if os.path.exists(ef):
+            for m in load_json(ef).get("modules", []):
+                module_defs[m["name"]] = m
+        else:
+            print("跳过(不存在):", ef, file=sys.stderr)
+
+    fg = build(conn, regmap, rules, module_defs)
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with io.open(out_path, "w", encoding="utf-8") as f:
         json.dump(fg, f, ensure_ascii=False, indent=1, sort_keys=False)
-    print("写出 %s (%d bytes)" % (args.out, os.path.getsize(args.out)))
+    print("写出 %s (%d bytes)" % (out_path, os.path.getsize(out_path)))
     st = fg["stats"]
     print("nodes=%d edges=%d signals=%d  off_controls=%d unresolved=%d" % (
         st["nodes"], st["edges"], st["signals_referenced"], st["off_controls_total"], st["unresolved_control_pins"]))

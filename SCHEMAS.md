@@ -20,6 +20,39 @@ excel   ─(build_regmap)   → regmap/1    ─┼→ GUI 编辑 → modes/1 ─
 
 ---
 
+## 0. `project/2`（工程包 = 唯一芯片真相，P1）
+
+一颗芯片 = 一个 gitignore 的工程包目录 `projects/<chip>/`。`project.json` 吃下**全部芯片专属配置**
+（原先散在 `private/tool_config/` 的 4 个 per-script config + 手工 `aliases.json`），派生物按固定名放同目录。
+所有建库引擎 `--project projects/<chip>` 从这里读配置与 IO；**代码零真实字面量**（模块名/基址/前缀/别名全在数据侧）。
+
+```jsonc
+{
+  "schema_version": "project/2",
+  "name": "<chip>",
+  "netlist":  { "root_module": "TOP", "target_modules": ["MOD_A","MOD_B"],   // extract_ports
+                "expand_submodules": ["MOD_A_BUF"] },                        // build_flowgraph 递归展开
+  "regbook":  { "base_address": "<BASE>", "sheet_name": "REGS",             // make_mock + build_regmap
+                "column_map": {"reg_name":0,"offset":3,"field_name":9,"bit":10,"default":12,"comment":14,"...":0},
+                "reg_group_prefixes": [["G1_","G1"],["G0_","G0"]], "primary_group":"G0", "common_group":"COMMON",
+                "name_xform": {"G1": [["sig_","g1_sig_"]]} },
+  "flowgraph_rules": { "type_rules": [["(?i)buf","primitive","buf","prim"]], // build_flowgraph
+                       "module_bands": {"MOD_A":"A"}, "strip_prefix": ["mod_"],
+                       "known_cross_edges": [], "crossmodule_net_blocklist": [] },
+  "matching": { "alias": {"sig_x":"REG_field_y"}, "logic_derived": [], "unresolved_pending": [] }, // P2 GUI 写回
+  "artifacts": { "conn":"conn.json","expand_conn":["expand_conn.json"],"control_signals":"control_signals.json",
+                 "pll_rows":"pll_rows.json","signal_reg_map":"signal_reg_map.json",
+                 "regmap":"regmap.json","flowgraph":"flowgraph.json" }
+}
+```
+
+引擎映射：`extract_ports --project`→`netlist`；`make_mock_regmap --project`→`regbook`(base/sheet/column_map)+`matching`(alias)；
+`build_regmap --project`→`regbook`(分组前缀/name_xform)；`build_flowgraph --project`→`flowgraph_rules`+`netlist.expand_submodules`。
+GUI（`regtool --project`）只从 `project.json` 取 `name`，其余按固定名读 `flowgraph.json/regmap.json/layout.json/modes/`。
+无 `--project` 时各脚本回退旧默认（`private/tool_config/` + `private/adpll/`），两路输出逐字节一致。
+
+---
+
 ## 1. `flowgraph/1`（M1 产物，`build_flowgraph.py`）
 
 信号流图。GUI 渲染 + inspector + 序列生成器都读它。关键字段（完整见产物）：
@@ -74,7 +107,7 @@ excel   ─(build_regmap)   → regmap/1    ─┼→ GUI 编辑 → modes/1 ─
   "mux_sel": { "MOD/inst_bufblk::leaf_mux": 0 },   // MUX 选择（0=上输入/1=下输入约定）；会写进该 mux 的 sel 字段
   "baseline": {                    // 显式基线字段覆盖：signal_id → 整数值（覆盖 variant.default / 门默认 / mux_sel）
     "sig_itune": 8,                //   en 门由 enabled_nodes 自动置开/关；这里放 ictrl/tune/ct/mt 等手改值
-    "sig_rxbuf_ictrl": 2
+    "sig_buf_ictrl": 2
   },
   "order": {
     "mode": "auto",                // auto = 激活通路反向拓扑；manual = 用户录制顺序

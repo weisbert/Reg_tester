@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -72,6 +73,36 @@ class Project:
 
     def project_json(self):
         return self._read("project.json", {"name": os.path.basename(self.root)})
+
+    def signal_reg_map(self):
+        return self._read("signal_reg_map.json", {})
+
+    def matching(self):
+        return (self.project_json() or {}).get("matching", {}) or {}
+
+    def save_matching(self, alias, logic_derived):
+        """把确认的 alias / logic_derived 写回 project.json 的 matching 段（其余键保留）。"""
+        proj = self.project_json() or {"name": os.path.basename(self.root)}
+        mt = dict(proj.get("matching", {}) or {})
+        mt["alias"] = alias
+        mt["logic_derived"] = logic_derived
+        proj["matching"] = mt
+        self._write("project.json", proj)
+
+    def rebuild(self):
+        """按序跑 make_mock_regmap → build_regmap → build_flowgraph（--project 自身），重生派生物。
+        stdlib subprocess；make_mock 不出 xlsx 故无需 openpyxl。返回 {ok, logs[, failed]}。"""
+        scripts = ["make_mock_regmap.py", "build_regmap.py", "build_flowgraph.py"]
+        logs = []
+        for s in scripts:
+            cmd = [sys.executable, os.path.join(HERE, s), "--project", self.root]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            logs.append({"script": s, "code": r.returncode,
+                         "out": (r.stdout or "")[-1500:], "err": (r.stderr or "")[-1500:]})
+            if r.returncode != 0:
+                return {"ok": False, "failed": s, "logs": logs}
+        return {"ok": True, "logs": logs}
 
     def flowgraph(self):
         return self._read("flowgraph.json", {})
@@ -202,6 +233,9 @@ def make_handler(project):
                     return self._send(200, project.layout())
                 if p == "/api/modes":
                     return self._send(200, project.list_modes())
+                if p == "/api/matching":
+                    return self._send(200, {"signal_reg_map": project.signal_reg_map(),
+                                            "matching": project.matching()})
                 m = re.match(r"^/api/mode/([^/]+)$", p)
                 if m:
                     mid = m.group(1)
@@ -254,6 +288,23 @@ def make_handler(project):
                         return self._send(404, {"error": "bad id"})
                     res = project.export(m.group(1))
                     return self._send(200 if res else 404, res or {"error": "no mode"})
+                if p == "/api/matching":
+                    body = self._read_body()
+                    if body is BAD_BODY or not isinstance(body, dict):
+                        return self._send(400, {"error": "malformed json body"})
+                    # 只接受 str->str 的 alias 与 str 列表的 logic_derived（防脏数据写坏 project.json）
+                    alias = {str(k): str(v) for k, v in (body.get("alias") or {}).items()
+                             if isinstance(k, str) and isinstance(v, str) and v}
+                    logic = [str(x) for x in (body.get("logic_derived") or []) if isinstance(x, str)]
+                    project.save_matching(alias, logic)
+                    rb = project.rebuild()
+                    if not rb.get("ok"):
+                        return self._send(500, {"error": "rebuild failed at " + rb.get("failed", "?"),
+                                                "logs": rb.get("logs")})
+                    return self._send(200, {"ok": True, "regmap": project.regmap(),
+                                            "flowgraph": project.flowgraph(),
+                                            "signal_reg_map": project.signal_reg_map(),
+                                            "matching": project.matching(), "logs": rb.get("logs")})
                 return self._send(404, {"error": "unknown api"})
             except Exception as e:
                 return self._send(500, {"error": str(e)})

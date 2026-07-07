@@ -51,6 +51,16 @@ def load_json(path):
         return json.load(f)
 
 
+def load_project(proj_dir):
+    """读工程包 project.json（schema/2）。None -> 走传统 private/adpll + tool_config 默认。"""
+    if not proj_dir:
+        return None
+    p = os.path.join(proj_dir, "project.json")
+    if not os.path.exists(p):
+        sys.exit("工程包缺 project.json: %s" % p)
+    return load_json(p)
+
+
 def base_name(reg_name, prefixes):
     """去掉 reg_group 前缀返回 (group_label, base)。无前缀 -> (None, reg_name)。"""
     for pref, label in prefixes:
@@ -267,35 +277,51 @@ def print_table(regmap):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="signal_reg_map.json -> 规范 regmap.json（补 WL/WLT 平行字段）")
     here = os.path.dirname(os.path.abspath(__file__))
-    default_in = os.path.join(here, "private", "adpll", "signal_reg_map.json")
-    default_out = os.path.join(here, "private", "adpll", "regmap.json")
-    default_ann = os.path.join(here, "private", "adpll", "control_signals.json")
-    ap.add_argument("--in", dest="inp", default=default_in, help="输入 signal_reg_map.json")
-    ap.add_argument("--out", dest="out", default=default_out, help="输出 regmap.json")
-    ap.add_argument("--signals", default=default_ann, help="control_signals.json（并 warn/desc 标注）")
+    pdir = os.path.join(here, "private", "adpll")
+    ap.add_argument("--project", help="工程包目录（project.json schema/2）：规则读 regbook 段，"
+                                       "IO 按 artifacts 从包内解析。取代 private/tool_config + private/adpll 默认。")
+    ap.add_argument("--in", dest="inp", default=None, help="输入 signal_reg_map.json")
+    ap.add_argument("--out", dest="out", default=None, help="输出 regmap.json")
+    ap.add_argument("--signals", default=None, help="control_signals.json（并 warn/desc 标注）")
     ap.add_argument("--config", help="规则覆盖 JSON（合并进 DEFAULT_RULES）")
     ap.add_argument("--print", dest="do_print", action="store_true", help="额外打印核对表")
     args = ap.parse_args(argv)
 
+    proj = load_project(args.project)
+    art = proj.get("artifacts", {}) if proj else {}
+
+    def ppath(name, default):
+        return os.path.join(args.project, name) if args.project else os.path.join(pdir, default)
+
+    inp = args.inp or ppath(art.get("signal_reg_map", "signal_reg_map.json"), "signal_reg_map.json")
+    out = args.out or ppath(art.get("regmap", "regmap.json"), "regmap.json")
+    signals_path = args.signals or ppath(art.get("control_signals", "control_signals.json"), "control_signals.json")
+
     rules = json.loads(json.dumps(DEFAULT_RULES))
-    local_cfg = os.path.join(here, "private", "tool_config", "build_regmap.json")
-    if os.path.exists(local_cfg):
-        rules.update(load_json(local_cfg))
+    if proj is not None:
+        rb = proj.get("regbook", {})
+        for k in ("reg_group_prefixes", "primary_group", "common_group", "name_xform"):
+            if k in rb:
+                rules[k] = rb[k]
+    else:
+        local_cfg = os.path.join(here, "private", "tool_config", "build_regmap.json")
+        if os.path.exists(local_cfg):
+            rules.update(load_json(local_cfg))
     if args.config:
         rules.update(load_json(args.config))
 
-    if not os.path.exists(args.inp):
-        print("找不到输入:", args.inp, file=sys.stderr)
+    if not os.path.exists(inp):
+        print("找不到输入:", inp, file=sys.stderr)
         return 2
-    sigmap = load_json(args.inp)
-    annotations = load_annotations(args.signals)
+    sigmap = load_json(inp)
+    annotations = load_annotations(signals_path)
     regmap = build(sigmap, rules, annotations)
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with io.open(args.out, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with io.open(out, "w", encoding="utf-8") as f:
         json.dump(regmap, f, ensure_ascii=False, indent=1)
     st = regmap["stats"]
-    print("写出 %s (%d bytes)" % (args.out, os.path.getsize(args.out)))
+    print("写出 %s (%d bytes)" % (out, os.path.getsize(out)))
     print("signals: total=%d resolved=%d  variants: WL=%d WLT=%d single-copy=%d" %
           (st["signals_total"], st["signals_resolved"], st["with_wl_variant"],
            st["with_wlt_variant"], st["single_copy"]))

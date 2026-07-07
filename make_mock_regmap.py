@@ -42,26 +42,41 @@ def _local_cfg():
     return {}
 
 
-# nManager 列布局（0 基）
-A, B, D, E, H, J, K, L, M, O = 0, 1, 3, 4, 7, 9, 10, 11, 12, 14
+def load_project(proj_dir):
+    """读工程包 project.json（schema/2）。None -> 走传统 --rows/--signals/--aliases + tool_config。"""
+    if not proj_dir:
+        return None
+    p = os.path.join(proj_dir, "project.json")
+    if not os.path.exists(p):
+        sys.exit("工程包缺 project.json: %s" % p)
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def parse_registers(rows, base):
+# nManager 列布局（0 基）——默认；项目专属列映射从 project.json regbook.column_map 读。
+DEFAULT_COLMAP = {"reg_name": 0, "regtype": 1, "offset": 3, "width": 4, "reset": 7,
+                  "field_name": 9, "bit": 10, "attr": 11, "default": 12, "comment": 14}
+
+
+def parse_registers(rows, base, cm=None):
+    cm = cm or DEFAULT_COLMAP
+    pad = max(cm.values()) + 1
     regs, cur = [], None
     for r in rows:
-        r = list(r) + [None] * (15 - len(r))
-        name, off = r[A], r[D]
+        r = list(r) + [None] * max(0, pad - len(r))
+        name, off = r[cm["reg_name"]], r[cm["offset"]]
         if name and off:                      # 寄存器头行
             try:
                 addr = base + int(str(off), 16)
             except ValueError:
                 addr = None
-            cur = {"reg_name": name, "regtype": r[B], "offset": str(off),
+            cur = {"reg_name": name, "regtype": r[cm["regtype"]], "offset": str(off),
                    "addr": (hex(addr) if addr is not None else None),
-                   "reset": r[H], "width": r[E], "fields": []}
+                   "reset": r[cm["reset"]], "width": r[cm["width"]], "fields": []}
             regs.append(cur)
-        if r[J]:                              # 字段行(头行也带首字段)
-            f = {"name": r[J], "bit": r[K], "attr": r[L], "default": r[M], "comment": r[O]}
+        if r[cm["field_name"]]:               # 字段行(头行也带首字段)
+            f = {"name": r[cm["field_name"]], "bit": r[cm["bit"]], "attr": r[cm["attr"]],
+                 "default": r[cm["default"]], "comment": r[cm["comment"]]}
             if cur is None:
                 cur = {"reg_name": "(above_range)", "offset": None, "addr": None,
                        "reset": None, "width": None, "fields": []}
@@ -102,22 +117,39 @@ def infer_off(field):
 
 def main():
     ap = argparse.ArgumentParser(description="解析控制信号->寄存器 + 生成复刻 Excel")
-    ap.add_argument("--rows", required=True)
-    ap.add_argument("--signals", required=True)
+    ap.add_argument("--project", help="工程包目录（project.json schema/2）：base/sheet/column_map 读 regbook 段，"
+                                       "alias/logic_derived 读 matching 段，IO 按 artifacts 从包内解析。")
+    ap.add_argument("--rows", default=None)
+    ap.add_argument("--signals", default=None)
     ap.add_argument("--aliases", default=None)
     ap.add_argument("--schema", default=None)
-    ap.add_argument("--base", default=None, help="块基址(默认读本地 config，无则 0x0)")
-    ap.add_argument("--sheet-name", default=None, help="生成表的 sheet 名(默认读本地 config，无则 REGS)")
+    ap.add_argument("--base", default=None, help="块基址(默认读工程包/本地 config，无则 0x0)")
+    ap.add_argument("--sheet-name", default=None, help="生成表的 sheet 名(默认读工程包/本地 config，无则 REGS)")
     ap.add_argument("--out-xlsx", default=None)
     ap.add_argument("--out-map", default=None)
     args = ap.parse_args()
 
+    proj = load_project(args.project)
+    rb = proj.get("regbook", {}) if proj else {}
+    art = proj.get("artifacts", {}) if proj else {}
     cfg = _local_cfg()
-    base = int(args.base or cfg.get("base", "0x0"), 16)
-    sheet_name = args.sheet_name or cfg.get("sheet_name", "REGS")
-    rows_doc = json.load(open(args.rows, encoding="utf-8"))
+
+    def ppath(name):
+        return os.path.join(args.project, name)
+
+    base_str = args.base or (rb.get("base_address") if proj else None) or cfg.get("base", "0x0")
+    base = int(base_str, 16)
+    sheet_name = args.sheet_name or (rb.get("sheet_name") if proj else None) or cfg.get("sheet_name", "REGS")
+    colmap = rb.get("column_map") if proj else None
+    rows_path = args.rows or (ppath(art.get("pll_rows", "pll_rows.json")) if proj else None)
+    signals_path = args.signals or (ppath(art.get("control_signals", "control_signals.json")) if proj else None)
+    out_map = args.out_map or (ppath(art.get("signal_reg_map", "signal_reg_map.json")) if proj else None)
+    if not rows_path or not signals_path:
+        ap.error("需要 --rows 和 --signals（或 --project 从工程包解析）")
+
+    rows_doc = json.load(open(rows_path, encoding="utf-8"))
     rows = rows_doc["rows"]
-    regs = parse_registers(rows, base)
+    regs = parse_registers(rows, base, colmap)
 
     # 字段索引（精确 + 小写）
     fidx, ci = {}, {}
@@ -127,7 +159,11 @@ def main():
             ci.setdefault(f["name"].lower(), (reg, f))
 
     alias, logic_set = {}, set()
-    if args.aliases and os.path.isfile(args.aliases):
+    if proj is not None:                       # 工程包权威：alias/logic_derived 来自 matching 段
+        mt = proj.get("matching", {})
+        alias = mt.get("alias", {})
+        logic_set = set(mt.get("logic_derived", []))
+    elif args.aliases and os.path.isfile(args.aliases):
         ad = json.load(open(args.aliases, encoding="utf-8"))
         alias = ad.get("alias", {})
         logic_set = set(ad.get("logic_derived", []))
@@ -143,7 +179,7 @@ def main():
             return None, "logic-derived"
         return None, "unresolved"
 
-    sig_obj = json.load(open(args.signals, encoding="utf-8"))
+    sig_obj = json.load(open(signals_path, encoding="utf-8"))
     nets = collect_reg_nets(sig_obj)
 
     entries, counts = [], {}
@@ -175,11 +211,11 @@ def main():
             print(f"{e['reg_net']:40} {e['match']:7} {str(e.get('addr')):11} "
                   f"{str(e.get('bit')):6} {str(e.get('default')):6} {e.get('off_value')}")
 
-    if args.out_map:
-        json.dump({"base": args.base, "n_regs": len(regs), "counts": counts,
+    if out_map:
+        json.dump({"base": base_str, "n_regs": len(regs), "counts": counts,
                    "registers": regs, "signals": entries},
-                  open(args.out_map, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-        print(f"\n解析映射已写: {args.out_map}")
+                  open(out_map, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        print(f"\n解析映射已写: {out_map}")
 
     if args.out_xlsx:
         import openpyxl
@@ -194,7 +230,7 @@ def main():
         if not meta_rows:
             meta_rows = [
                 ["Module Name", sheet_name], ["CPU Data Width", 16],
-                ["Base Address", args.base], ["Memory Name", "Memory"],
+                ["Base Address", base_str], ["Memory Name", "Memory"],
                 ["Table/Register Information(Item has * mean must)"],
                 ["*Reg Name", "Description", "C_Reserved", "*Offset Addr", "*Width",
                  "Table Length", "Attribute", "Default Value", "I_Reserved",
