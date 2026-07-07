@@ -221,8 +221,13 @@ python regtool.py --bundle --project projects/<name> --out out.html  # 打成自
 
 GUI 能力：分层信号流图（buf=三角 / mux=梯形 / div=方框 / DCO=振荡器；三 sub-top 成可折叠分组框，
 双击黑盒展开/折叠）、缩放平移搜索小地图、拖拽/框选/隐藏/翻边/备注 + 撤销重做（落 `layout.json`）、
-inspector 侧栏（点节点看控制信号→寄存器/地址/bit/默认/关断值，可改基线字段）、模式编辑
-（点节点开关通路、MUX 选择、录制关闭顺序）、序列生成预览 + 导出 `ate.txt`/`debug.html`。
+inspector 侧栏（点节点看控制信号→寄存器/地址/bit/默认/关断值，可改基线字段）、模式编辑、
+序列生成预览 + 导出 `ate.txt`/`debug.html`。
+
+**描通路（模式主定义方式）**：按**信号流顺序**点节点（DCO 源头→输出末端）= 一条链,同时给出
+**激活集**（哪些 block 开）和**关断顺序**（末端→源头,自动逆序,写进 `mode.flow_path`,派生 `enabled_nodes`
+与 `order.manual`）。不必依赖自动拓扑/边方向——**用户的通路知识直接定义模式**（模拟电路里信号流方向
+网表推不可靠,故由人描）。空 flow_path 时回退老方式（手工激活 + 录制/自动反向拓扑）。
 纯原生 JS + SVG + 自研分层布局（无 npm 依赖，符合红区轻依赖纪律）。中间层 schema 见 `SCHEMAS.md`。
 
 **匹配标签（P2，serve 模式）**：网表控制信号名与寄存器字段名经硅迭代漂移，自动匹配只覆盖 exact/case。

@@ -50,6 +50,7 @@ DEFAULT_RULES = {
         [r"(?i)trace|route",             "primitive", "route",    "route"],
         [r"(?i)div_chain|divchain",      "primitive", "div",      "opaquediv"],
         [r"(?i)osc|_dco",                "primitive", "dco",      "dco"],
+        [r"(?i)power_switch|pwr_?switch|pwrsw", "primitive", "power_switch", "prim"],
         [r"(?i)mux",                     "primitive", "mux",      "prim"],
         [r"(?i)^inv",                    "primitive", "inv",      "prim"],
         [r"(?i)buf|_buf",                "primitive", "buf",      "prim"],
@@ -58,7 +59,7 @@ DEFAULT_RULES = {
     "default_prim_device": "unknown",
     "symbols": {"dco": "oscillator", "buf": "triangle", "inv": "triangle_bubble",
                 "mux": "trapezoid", "div": "box_divN", "route": "pass", "logic": "ctrl_block",
-                "blackbox": "group", "unknown": "box", "group": "group"},
+                "power_switch": "power_gate", "blackbox": "group", "unknown": "box", "group": "group"},
     "module_bands": {},                 # tag -> band 标签（项目专属，本地 config 覆盖）
     "module_reg_group_default": {},     # tag -> 默认 reg_group（项目专属，本地 config 覆盖）
 
@@ -83,7 +84,7 @@ DEFAULT_RULES = {
     # ---- 子模块递归展开(P0) ----
     # 可挂电流门(off_control)的器件类型；glue 标准单元(ND/NR/INV 等,device=unknown)不在此列：
     # 即使其输入网解析到寄存器使能，也只记为 control 不产 off_control（它不是耗电器件）。
-    "gateable_devices": ["buf", "mux", "div", "dco"],
+    "gateable_devices": ["buf", "mux", "div", "dco", "power_switch"],
     # 展开时额外隐藏的无源器件（去耦电容等）；只在展开子模块内部生效，不动顶层。通用型名。
     "expand_device_blacklist": ["cfmom", "pcapacitor", "capacitor", "ncapacitor", "resistor"],
     # 展开子模块内部叶子实例的输出脚判定（通用 Verilog 命名约定 + 常见分频/retime 词根）。
@@ -161,6 +162,7 @@ class Rules:
         self.expand_out_re = re.compile(d["expand_output_pin_regex"])
         # DCO 核的裸差分输出网（tank/gm/buf ...）：振荡源由它驱动。取自 diff_bare_pn。
         self.dco_bare_nets = set(x for pair in d.get("diff_bare_pn", []) for x in pair)
+        self.power_nets = set()   # 电源网按连接判定，compute_power_nets 预算后填入
 
     def pin_dir(self, pin, role, route=False):
         """数据脚方向：out 后缀/输出脚名 -> output；否则 input（做 sink）。
@@ -175,14 +177,19 @@ class Rules:
         """连接表达式的主网锚：优先返回首个**非电源**成员（DCO_FT_SDM 的 concat 里应取 ds 而非 AVSS）。"""
         nets = parse_expr(expr)
         for n in nets:
-            if not self.is_power(n):
+            if not self.is_power_net(n):
                 return n
         return nets[0] if nets else None
 
-    def is_power(self, net):
-        # 只按电源/地网名过滤。net\d+ 类哑网不在此列：它们的非隐藏端点多 <2（另一端是被隐藏的
-        # pinductor/ESD），自然不成边；而 ADC 的 net22/net017 是真实时钟网，必须放行。
-        return bool(net) and bool(self.power_re.match(net))
+    def is_power_pin(self, name):
+        """电源脚：按脚名判（VDD/VSS/VBB/VPP/AVDD/AVSS/SUB…）。脚名可靠。"""
+        return bool(name) and bool(self.power_re.match(name))
+
+    def is_power_net(self, net):
+        """电源网：按**连接**判（compute_power_nets 预算）——只连电源脚的才算电源。
+        名字像电源但连了信号脚的轨（如电流型 buffer 把时钟载在地/供电侧输出轨上，脚名/网名像 AVSS_*/AVDD_* 却载信号）
+        不算电源，照常成边。这样电源域命名不靠谱也不会误杀信号网。"""
+        return bool(net) and net in self.power_nets
 
     def classify(self, t):
         for rx, kind, dev, role in self.type_rules:
@@ -363,9 +370,30 @@ class SignalTable:
 
 
 # ---------- 主构建 ----------
+def compute_power_nets(modules, module_defs, rules):
+    """按**连接**判定电源网：一根网只有当它连的脚**全是电源脚**(VDD/VSS/VBB/VPP…)时才算电源。
+    扫顶层模块 + 所有子模块定义(BUF_TOP 等展开对象)的实例连接。名字像电源、但连了信号脚的轨
+    (电流型 buffer 的地/供电侧输出轨)因此不会被误判成电源。"""
+    net_pins = defaultdict(list)
+
+    def scan(insts):
+        for inst in insts or []:
+            for pin, expr in inst.get("c", []):
+                for net in parse_expr(expr):
+                    net_pins[net].append(pin)
+
+    for m in modules:
+        scan(m.get("instances"))
+    for sd in (module_defs or {}).values():
+        scan(sd.get("instances"))
+    return set(net for net, pins in net_pins.items()
+              if pins and all(rules.is_power_pin(p) for p in pins))
+
+
 def build(conn, regmap, rules, module_defs=None):
     modules = conn["modules"]
     module_defs = module_defs or {}
+    rules.power_nets = compute_power_nets(modules, module_defs, rules)   # 按连接判电源网（早于任何 annotate）
     port_to_signal, tag_to_module, module_to_tag, sig_by_id = build_signal_index(regmap, modules)
     ls = rules.ls
     hide = set(rules.d["device_blacklist"])
@@ -462,6 +490,7 @@ def build(conn, regmap, rules, module_defs=None):
                   set(p[0] for p in m["ports"] if p[1] == "output") for m in modules}
     edges = build_edges(net_ep, rules, diag, mod_input, mod_output)
     build_cross_edges(net_ep, rules, edges)
+    build_power_domain_edges(nodes, modules, module_defs, module_to_tag, rules, edges)   # 电源开关：电源域总闸 + 供电边
 
     # glue 门控前推（需 edges）：把 glue 上的寄存器使能前推到终端器件，再算未覆盖门
     if rules.d.get("glue_gate_propagation", True):
@@ -514,8 +543,17 @@ def _mk_control_pin(node, pin, expr, tag, rules, port_to_signal, ls_alias, sig_b
 def annotate_full(node, inst, tag, rules, port_to_signal, ls_alias, sig_by_id, sigtab, net_ep, diag):
     ctrl_roles = set(rules.d["ctrl_roles"])
     cat_role = rules.d["category_role"]
+    # tank-tapping buffer（源头 acbuf / to-adpll buf）：输入取 DCO tank，输出是**电流型**——
+    # 把时钟载在电源/地名的**信号轨**上（脚名像 AVSS_*/AVDD_* 却实为该 buffer 的时钟输出）。
+    tank_tap = node.get("device") == "buf" and any(
+        first_net(e) in rules.dco_bare_nets for _, e in inst["c"])
     for pin, expr in inst["c"]:
-        if rules.is_power(pin):
+        if rules.is_power_pin(pin):
+            base = first_net(expr)
+            if tank_tap and base and not rules.is_power_net(base):
+                node["pins"].append({"id": "%s.%s" % (node["id"], pin), "name": pin, "dir": "output",
+                                     "net": base, "role": "data_out"})
+                net_ep[(tag, base)].append((node["id"], pin, "output"))
             continue
         token, role, lane = tokenize(pin, rules)
         # 控制脚判定：引脚名后缀是 ctrl 角色，或**驱动网解析出信号**(只信连接不信名字：
@@ -530,7 +568,7 @@ def annotate_full(node, inst, tag, rules, port_to_signal, ls_alias, sig_by_id, s
                             role, lane, presid=sid, presrc=src)
             continue
         base = first_net(expr)
-        if not base or rules.is_power(base):
+        if not base or rules.is_power_net(base):
             continue
         pdir = "input" if role == "in" else rules.pin_dir(pin, role)
         if node.get("device") == "dco" and base in rules.dco_bare_nets:
@@ -542,7 +580,7 @@ def annotate_full(node, inst, tag, rules, port_to_signal, ls_alias, sig_by_id, s
 def annotate_io_only(node, inst, tag, rules, net_ep):
     route = node.get("device") == "route"
     for pin, expr in inst["c"]:
-        if rules.is_power(pin) or rules.is_power(first_net(expr) or ""):
+        if rules.is_power_pin(pin) or rules.is_power_net(first_net(expr) or ""):
             continue
         token, role, lane = tokenize(pin, rules)
         if role in ("enable", "enable_b", "enout", "ictrl_n", "ictrl_p", "ictrl", "sel", "reset"):
@@ -560,7 +598,7 @@ def synth_channels(inst, parent_id, tag, rules, port_to_signal, ls_alias, sig_by
     """buffer bank(composite) -> 推断子节点。lane 合并(如某 divider 的 I/Q/core -> 一个三 lane 脚)。"""
     chans = {}   # token -> {ctrl:[], out:[], in:[], tokens:set}
     for pin, expr in inst["c"]:
-        if rules.is_power(pin) or rules.is_power(first_net(expr) or ""):
+        if rules.is_power_pin(pin) or rules.is_power_net(first_net(expr) or ""):
             continue
         token, role, lane = tokenize(pin, rules)
         if token is None:
@@ -690,18 +728,33 @@ def expand_submodule(inst, subdef, parent_id, parent_tag, rules, port_to_signal,
             node["warn"] = "nested_expandable_not_expanded"
             diag.setdefault("nested_expandable", []).append(cid)
         is_gateable = device in gateable
+        # tank-tapping buffer（源头 acbuf）：电流型输出，把时钟载在电源/地名的**信号轨**上
+        tank_tap = device == "buf" and any(
+            rules.primary_net(e) in rules.dco_bare_nets for _, e in sinst["c"])
 
         for pin, expr in sinst["c"]:
-            if rules.is_power(pin):
+            if rules.is_power_pin(pin):
+                base = rules.primary_net(expr)
+                if tank_tap and base and not rules.is_power_net(base):   # 电流型时钟输出
+                    if base in portmap:
+                        pnet = rules.primary_net(portmap[base])
+                        if pnet and not rules.is_power_net(pnet):
+                            node["pins"].append({"id": "%s.%s" % (cid, pin), "name": pin, "dir": "output",
+                                                 "net": pnet, "role": "data_out"})
+                            net_ep[(parent_tag, pnet)].append((cid, pin, "output"))
+                    else:
+                        node["pins"].append({"id": "%s.%s" % (cid, pin), "name": pin, "dir": "output",
+                                             "net": base, "role": "data_out"})
+                        net_ep[(sub_tag, base)].append((cid, pin, "output"))
                 continue
             netbase = rules.primary_net(expr)
-            if not netbase or rules.is_power(netbase):
+            if not netbase or rules.is_power_net(netbase):
                 continue
             token, prole, lane = tokenize(pin, rules)
             if netbase in portmap:                       # ---- 边界端口：并入父命名域 ----
                 pexpr = portmap[netbase]
                 pnet = rules.primary_net(pexpr)
-                if pnet is None or rules.is_power(pnet):
+                if pnet is None or rules.is_power_net(pnet):
                     continue
                 sid, src = resolve_signal(pexpr, parent_tag, port_to_signal, parent_ls_alias, rules.ls)
                 name_ctrl = prole in ctrl_roles
@@ -874,7 +927,7 @@ def build_edges(net_ep, rules, diag, mod_input, mod_output):
 
 
 def _emit_edge(edges, tag, base, nets, p_eps, n_eps, differential, rules, mod_input, mod_output):
-    if rules.is_power(base):
+    if rules.is_power_net(base):
         return
     drivers = [e for e in p_eps if e[2] == "output"]
     direction = "forward"
@@ -885,12 +938,19 @@ def _emit_edge(edges, tag, base, nets, p_eps, n_eps, differential, rules, mod_in
         if not dsts and any(n in mod_output.get(tag, ()) for n in nets):
             dsts = [(tag, base, "boundary")]
     else:
-        # 无内部驱动脚：net 是模块 input 端口 -> 外部/父层驱动，各端点互不相连（不造假边）
+        # net 是模块 input 端口 -> 外部/父层驱动，本模块内不造边
         if any(n in mod_input.get(tag, ()) for n in nets):
             return
-        if len(p_eps) != 2:
-            return   # 多端点无驱动：方向不明，交给 GUI 手工
-        src, dsts, direction = p_eps[0], [p_eps[1]], "unknown"
+        # 无驱动脚：连接确定、方向不定 —— **仍连边**（绝不因方向不明而丢，只信连接），
+        # 方向标 unknown 交 GUI 手工翻。按节点去重，取首个当源、其余当汇。
+        uniq, seen = [], set()
+        for ep in p_eps:
+            if ep[0] not in seen:
+                seen.add(ep[0])
+                uniq.append(ep)
+        if len(uniq) < 2:
+            return
+        src, dsts, direction = uniq[0], uniq[1:], "unknown"
     dsts = [d for d in dsts if d[0] != src[0]]
     if not dsts:
         return
@@ -899,7 +959,8 @@ def _emit_edge(edges, tag, base, nets, p_eps, n_eps, differential, rules, mod_in
         "differential": differential, "direction": direction, "net_base": base, "nets": nets,
         "from": {"node": src[0], "pin": src[1]},
         "to": [{"node": d[0], "pin": d[1]} for d in dsts if d[0] != src[0]],
-        "provenance": "net", "cross_module": False, "warn": None,
+        "provenance": "net", "cross_module": False,
+        "warn": ("方向待人工确认（只信连接）" if direction == "unknown" else None),
     }
     if differential and n_eps:
         ndrv = [x for x in n_eps if x[2] == "output"]
@@ -927,7 +988,7 @@ def build_cross_edges(net_ep, rules, edges):
                 by_net[net].append((tag, nid, pin, d))
         for net, eps in by_net.items():
             tags = set(e[0] for e in eps)
-            if len(tags) < 2 or rules.is_power(net) or net in blocklist:
+            if len(tags) < 2 or rules.is_power_net(net) or net in blocklist:
                 continue
             reps = {}
             for tag, nid, pin, d in eps:
@@ -953,6 +1014,72 @@ def build_cross_edges(net_ep, rules, edges):
                 "nets": [ce["from_net"], ce["to_net"]],
                 "from": {"node": fa[0][0], "pin": fa[0][1]}, "to": [{"node": tb[0][0], "pin": tb[0][1]}],
                 "provenance": "asserted", "cross_module": True, "warn": "netlist 顶层才连得上，配置桥接", "polarity": ce.get("polarity")})
+
+
+_PWRSW_RE = re.compile(r"(?i)power_switch|pwr_?switch|pwrsw")
+
+
+def build_power_domain_edges(nodes, modules, module_defs, module_to_tag, rules, edges):
+    """power switch（电源开关）= 电源域总闸：它的输出切换轨(int_vdd)给下游 block 供电。
+    连 power_switch -> 所有把 VDD/VPP 接到该切换轨的 block（kind=power 边）。关它 = 整域掉电。
+    切换轨识别：switch 的脚里 **非电源脚名、非控制脚、且被别的 block 当 VDD/VPP 用** 的那根网。"""
+    pwr_consumers = defaultdict(lambda: defaultdict(list))   # tag -> net -> [inst 有VDD/VPP接此]
+    switches = []                                            # [(tag, inst_name, [(pin,net)])]
+    ctrl = set(rules.d["ctrl_roles"])
+
+    def scan(tag, insts):
+        for inst in insts or []:
+            conns = []
+            for pin, expr in inst.get("c", []):
+                nb = first_net(expr)
+                conns.append((pin, nb))
+                if rules.is_power_pin(pin) and nb:
+                    pwr_consumers[tag][nb].append(inst["n"])
+            if _PWRSW_RE.search(inst["t"]):
+                switches.append((tag, inst["n"], conns))
+
+    for m in modules:
+        tag = module_to_tag.get(m["name"], m["name"])
+        scan(tag, m.get("instances"))
+        for inst in m.get("instances", []):
+            sd = module_defs.get(inst["t"])
+            if sd:
+                scan(tag, sd.get("instances"))
+
+    node_by = {}
+    for n in nodes:
+        if n.get("inst_name") and n.get("device") != "group":
+            node_by.setdefault((n["module"], n["inst_name"]), n["id"])
+
+    for tag, sname, conns in switches:
+        src = node_by.get((tag, sname))
+        if not src:
+            continue
+        rail = rail_pin = None
+        for pin, net in conns:
+            if not net or rules.is_power_pin(pin):
+                continue
+            _, role, _ = tokenize(pin, rules)
+            if role in ctrl:
+                continue
+            if net in pwr_consumers[tag]:      # 有别的 block 把它当 VDD/VPP 用 = 切换轨
+                rail, rail_pin = net, pin
+                break
+        if not rail:
+            continue
+        tos = []
+        for c in dict.fromkeys(pwr_consumers[tag][rail]):   # 去重保序
+            cid = node_by.get((tag, c))
+            if cid and cid != src and c != sname:
+                tos.append({"node": cid, "pin": "VDD"})
+        if tos:
+            edges.append({
+                "id": "%s:power" % src, "scope": tag, "kind": "power",
+                "differential": False, "direction": "forward",
+                "net_base": rail, "nets": [rail],
+                "from": {"node": src, "pin": rail_pin}, "to": tos,
+                "provenance": "power_domain", "cross_module": False,
+                "warn": "电源域：关此 power switch 则下游整域掉电"})
 
 
 # ---------- 打印 ----------

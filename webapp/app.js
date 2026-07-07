@@ -88,7 +88,7 @@
     lay: null, // computed layout
     nodeById: {}, sigById: {},
     activeTab: 'inspector',
-    recording: false,
+    recording: false, tracing: false,
     undo: [], redo: [],
     lastTc: null,
     match: null, matchLoading: false,
@@ -157,6 +157,7 @@
     if (!m.order.manual) m.order.manual = [];
     m.extra_writes = m.extra_writes || [];
     m.reg_group = m.reg_group || 'BT';
+    m.flow_path = m.flow_path || [];   // 描通路：信号流顺序(源→末端)的节点链；关断序=其逆序
     return m;
   }
   function newModeFromScratch() {
@@ -430,7 +431,8 @@
       }
       var id = g.getAttribute('data-id');
       onSelect(id);
-      if (S.recording) recordClick(id);
+      if (S.tracing) traceClick(id);
+      else if (S.recording) recordClick(id);
       else if (S.activeTab === 'mode') toggleEnabled(id);
     });
     svg.addEventListener('dblclick', function (ev) {
@@ -467,6 +469,7 @@
     $('#mode-select').addEventListener('change', function () { loadMode(this.value); });
     $('#group-select').addEventListener('change', function () { mutate(function () { S.mode.reg_group = $('#group-select').value; }); renderTabs(); render(); });
     $('#order-select').addEventListener('change', function () { mutate(function () { S.mode.order.mode = $('#order-select').value; }); renderTabs(); });
+    $('#btn-trace').addEventListener('click', toggleTrace);
     $('#btn-record').addEventListener('click', toggleRecord);
     $('#btn-new-mode').addEventListener('click', function () { newModeFromScratch(); promptNewId(); });
     $('#btn-del-mode').addEventListener('click', delMode);
@@ -487,6 +490,9 @@
       else if (act === 'setmux') setMux(id, parseInt(val, 10));
       else if (act === 'gen') { switchTab('seq'); generatePreview(); }
       else if (act === 'clear-manual') { mutate(function () { S.mode.order.manual = []; }); renderModeTab(); }
+      else if (act === 'trace-clear') clearTrace();
+      else if (act === 'trace-undo') undoTrace();
+      else if (act === 'trace-toggle') toggleTrace();
       else if (act === 'copy') seqCopy();
       else if (act === 'dl') seqDownload(val);
       else if (act === 'export') seqExport();
@@ -585,6 +591,35 @@
     if (S.mode.enabled_nodes.indexOf(id) < 0) { toast('该节点不在激活集，先激活它'); return; }
     if (S.mode.order.manual.indexOf(id) < 0) { mutate(function () { S.mode.order.manual.push(id); }); toast('记录 #' + S.mode.order.manual.length + ' ' + id); renderTabs(); }
   }
+
+  // ---- 描通路（trace path）：一个动作定义模式 = 按信号流顺序点节点 ----
+  // 派生：enabled_nodes = flow_path；关断序(order.manual) = flow_path 逆序（末端→源头）。
+  function syncFromFlowPath() {
+    S.mode.enabled_nodes = S.mode.flow_path.slice();
+    S.mode.order.mode = 'manual';
+    S.mode.order.manual = S.mode.flow_path.slice().reverse();
+    $('#order-select').value = 'manual';
+  }
+  function toggleTrace() {
+    S.tracing = !S.tracing;
+    if (S.tracing && S.recording) toggleRecord();   // 两模式互斥
+    var b = $('#btn-trace'); if (b) b.classList.toggle('active', S.tracing);
+    if (S.tracing) toast('描通路：按信号流顺序点节点（DCO 源头→输出末端）');
+    else toast('描通路结束');
+    renderTabs();
+  }
+  function traceClick(id) {
+    var fp = S.mode.flow_path, i = fp.indexOf(id);
+    mutate(function () {
+      if (i >= 0) fp.splice(i, 1);                  // 再点一次=从通路移除
+      else fp.push(id);                             // 追加到信号流末端
+      syncFromFlowPath();
+    });
+    toast(i >= 0 ? ('移除 ' + short(id, 28)) : ('通路 #' + fp.length + ' ' + short(id, 28)));
+    render(); renderTabs();
+  }
+  function clearTrace() { mutate(function () { S.mode.flow_path = []; syncFromFlowPath(); }); render(); renderTabs(); }
+  function undoTrace() { if (S.mode.flow_path.length) { mutate(function () { S.mode.flow_path.pop(); syncFromFlowPath(); }); render(); renderTabs(); } }
   function doSearch(q) {
     q = q.trim().toLowerCase(); if (!q) { S.sel = {}; render(); return; }
     var hit = null;
@@ -700,24 +735,30 @@
   function renderModeTab() {
     var el = $('#tab-mode');
     var m = S.mode; if (!m) { el.innerHTML = ''; return; }
-    var h = [];
+    var h = [], fp = m.flow_path || [];
     h.push('<h3 class="sec">模式</h3><div class="kv">');
     h.push('<div class="k">id</div><div class="v mono">' + esc(m.id) + (S.modeId ? '' : ' <span class="pill">未保存</span>') + '</div>');
     h.push('<div class="k">名称</div><div class="v"><input id="m-name" value="' + esc(m.name || '') + '" style="width:96%"></div>');
     h.push('<div class="k">寄存器组</div><div class="v">' + esc(m.reg_group) + '</div>');
-    h.push('<div class="k">关闭顺序</div><div class="v">' + esc(m.order.mode) + '</div>');
     h.push('</div>');
-    h.push('<div class="hint">在画布点节点=激活/取消（本标签下）。激活集 = 这条被点亮的 LO 通路。</div>');
 
-    h.push('<h3 class="sec">激活节点 (' + m.enabled_nodes.length + ')</h3>');
-    if (!m.enabled_nodes.length) h.push('<div class="hint">还没有激活节点，点画布里的 DCO/buffer/div 把通路点亮。</div>');
-    m.enabled_nodes.forEach(function (id) {
-      var n = S.nodeById[id] || {};
-      var gates = (n.off_controls || []).length;
-      h.push('<div class="card" style="padding:6px 10px"><b class="mono">' + esc(short(id, 34)) + '</b> <span class="pill">' + esc(n.device || '') + '</span> <span class="muted">' + gates + ' 门</span> <button data-act="toggle-en" data-id="' + esc(id) + '" style="float:right">✕</button></div>');
-    });
+    // ---- 描通路（主定义方式）----
+    h.push('<h3 class="sec">描通路' + (S.tracing ? ' <span class="pill on">进行中</span>' : '') + '</h3>');
+    h.push('<div class="hint">按<b>信号流顺序</b>点节点（DCO 源头 → 输出末端）。这一条链同时给出<b>激活集</b>和<b>关断序</b>（末端→源头，自动逆序）。再点链上节点=移除。</div>');
+    h.push('<div class="row-actions"><button data-act="trace-toggle" class="' + (S.tracing ? 'primary' : '') + '">' + (S.tracing ? '⏹ 结束描通路' : '✎ 开始描通路') + '</button>'
+      + '<button data-act="trace-undo">↶ 退一步</button><button data-act="trace-clear">清空</button></div>');
+    if (fp.length) {
+      h.push('<div class="hint">信号流（源 → 末端）:</div>');
+      fp.forEach(function (id, i) {
+        var n = S.nodeById[id] || {};
+        h.push('<div class="card" style="padding:4px 10px">→ #' + (i + 1) + ' <b class="mono">' + esc(short(id, 30)) + '</b> <span class="pill">' + esc(n.device || '') + '</span> <span class="muted">' + ((n.off_controls || []).length) + ' 门</span></div>');
+      });
+      h.push('<div class="card" style="background:var(--panel2)">↓ <b>关断顺序</b>(末端先关): ' + esc(fp.slice().reverse().map(function (id) { return short(id.split('/').pop(), 14); }).join(' → ')) + '</div>');
+    } else {
+      h.push('<div class="hint">还没描通路。点「开始描通路」再在画布上顺着信号点节点。</div>');
+    }
 
-    // mux sel
+    // MUX 选择
     var muxes = (S.fg.nodes || []).filter(function (n) { return n.device === 'mux' && m.enabled_nodes.indexOf(n.id) >= 0; });
     if (muxes.length) {
       h.push('<h3 class="sec">MUX 选择（0=上/1=下，约定可改）</h3>');
@@ -727,10 +768,18 @@
       });
     }
 
-    if (m.order.mode === 'manual') {
-      h.push('<h3 class="sec">录制的关闭顺序 (' + m.order.manual.length + ')</h3>');
-      m.order.manual.forEach(function (id, i) { h.push('<div class="card" style="padding:4px 10px">#' + (i + 1) + ' <span class="mono">' + esc(short(id, 30)) + '</span></div>'); });
-      h.push('<div class="row-actions"><button data-act="clear-manual">清空顺序</button></div>');
+    // 兜底：没描通路时，仍显示手工激活集 / 录制顺序（老方式，向后兼容）
+    if (!fp.length && m.enabled_nodes.length) {
+      h.push('<h3 class="sec">激活节点 (' + m.enabled_nodes.length + ')</h3>');
+      m.enabled_nodes.forEach(function (id) {
+        var n = S.nodeById[id] || {};
+        h.push('<div class="card" style="padding:6px 10px"><b class="mono">' + esc(short(id, 34)) + '</b> <span class="pill">' + esc(n.device || '') + '</span> <button data-act="toggle-en" data-id="' + esc(id) + '" style="float:right">✕</button></div>');
+      });
+      if (m.order.mode === 'manual') {
+        h.push('<h3 class="sec">录制的关闭顺序 (' + m.order.manual.length + ')</h3>');
+        m.order.manual.forEach(function (id, i) { h.push('<div class="card" style="padding:4px 10px">#' + (i + 1) + ' <span class="mono">' + esc(short(id, 30)) + '</span></div>'); });
+        h.push('<div class="row-actions"><button data-act="clear-manual">清空顺序</button></div>');
+      }
     }
     h.push('<div class="row-actions"><button class="primary" data-act="gen">生成序列 ▸</button></div>');
     el.innerHTML = h.join('');
