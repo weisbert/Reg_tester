@@ -521,12 +521,31 @@ def make_handler(project):
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    # 关掉 SO_REUSEADDR：否则 Windows 上能绑到别的进程正占用的端口（不报错），冲突检测失效
+    allow_reuse_address = False
+
+
 def serve(args):
     project = Project(args.project)
     handler = make_handler(project)
-    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    url = "http://127.0.0.1:%d/" % args.port
+    # 端口被占用就自动顺延（--port 0 = 直接让 OS 挑一个空闲端口）
+    candidates = [0] if args.port == 0 else [args.port + i for i in range(30)]
+    httpd, tried = None, []
+    for pt in candidates:
+        try:
+            httpd = _Server(("127.0.0.1", pt), handler)
+            break
+        except OSError:
+            tried.append(pt)
+    if httpd is None:
+        raise SystemExit("端口都被占用（试过 %s–%s）；用 --port <空闲端口> 或 --port 0（自动挑）"
+                         % (tried[0], tried[-1]))
+    actual = httpd.server_address[1]          # 实际绑定端口（顺延/0 时与 --port 不同）
+    url = "http://127.0.0.1:%d/" % actual
     print("Reg_tester GUI  ·  project=%s" % project.root)
+    if tried:
+        print("  端口 %d 被占用，改用 %d" % (args.port, actual))
     print("  serving %s" % url)
     print("  Ctrl-C 退出")
     if args.open:
@@ -600,7 +619,8 @@ def main(argv=None):
     ap.add_argument("--serve", action="store_true", help="起 http 服务（读写 project）")
     ap.add_argument("--bundle", action="store_true", help="打包成自包含单 HTML")
     ap.add_argument("--project", required=True, help="projects/<name> 目录")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=8765,
+                    help="起始端口（默认 8765）；被占用自动顺延，0=让 OS 自动挑空闲端口")
     ap.add_argument("--open", action="store_true", help="serve 时顺便开浏览器")
     ap.add_argument("--out", help="bundle 输出 HTML 路径")
     args = ap.parse_args(argv)
