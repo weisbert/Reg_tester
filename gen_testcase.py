@@ -19,6 +19,7 @@ import argparse
 import html
 import json
 import os
+import re
 import sys
 
 SCHEMA = "testcase/1"
@@ -106,16 +107,22 @@ class RegView:
         return self.by_id.get(sig_id)
 
 
-def collect_gates(flowgraph):
-    """建 gate_nodes[signal]=set(node_id)、node_gates[node]=[gate...]。gate 带 node 归属。"""
+def collect_gates(flowgraph, gate_override=None):
+    """建 gate_nodes[signal]=set(node_id)、node_gates[node]=[gate...]。gate 带 node 归属。
+    gate_override[node_id]=[signal...]：**用户指定该 block 的关断总闸**——只用这些信号做门，
+    其余 off_control 跳过（工具往往在一个 cell 上找到多个使能脚，真·总闸由人指定，存 layout）。"""
+    gate_override = gate_override or {}
     gate_nodes = {}
     node_gates = {}
     for n in flowgraph.get("nodes", []):
         nid = n["id"]
+        ov = gate_override.get(nid)   # 该节点若指定了总闸，只认这些信号
         gs = []
         for oc in n.get("off_controls", []):
             sig = oc.get("signal_ref")
             if not sig:
+                continue
+            if ov is not None and sig not in ov:
                 continue
             g = {
                 "node": nid,
@@ -189,13 +196,13 @@ def shutdown_rank(node_id, node_by_id, preds, memo, stack=None):
 
 
 # ------------------------------------------------------------------ generator
-def generate(flowgraph, regmap, mode):
+def generate(flowgraph, regmap, mode, gate_override=None):
     group = mode.get("reg_group", regmap.get("primary_group", "BT"))
     rv = RegView(regmap, group)
     enabled = set(mode.get("enabled_nodes", []))
     baseline_over = mode.get("baseline", {}) or {}
 
-    gate_nodes, node_gates = collect_gates(flowgraph)
+    gate_nodes, node_gates = collect_gates(flowgraph, gate_override)
 
     # Step B: 每个门信号开/关（共用位：开压倒关）
     def signal_on(sig):
@@ -487,6 +494,292 @@ def render_ate(tc):
     return "\n".join(L) + "\n"
 
 
+def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_expr=None):
+    """Reference 表：每个 block ->
+      - **EN 映射(顶层布尔式)**：底层 EN 脚 = 哪些顶层信号怎么组合（如 `dco_en & buf_en`），
+        由门级网表方程(logic_expr) + regmap.drives 反查(raw net→顶层信号) 拼出；
+      - 布尔式里每个顶层信号 -> 寄存器 addr/bit（**多信号=多行**，block 列跨行合并）。
+    ★=gate_override 指定的关断总闸。没门级方程的 block 退化为直接列 off_controls。"""
+    gate_override = gate_override or {}
+    group = group or regmap.get("primary_group", "BT")
+    sig_by_id = {s["id"]: s for s in regmap.get("signals", [])}
+    node_by_id = {n["id"]: n for n in flowgraph.get("nodes", [])}
+    eqs = (logic_expr or {}).get("equations", {}) or {}
+    powered_by = {}   # block_id -> 供电的 power switch 节点（来自电源域边，按 int_vdd 轨连接，模块内唯一）
+    for e in flowgraph.get("edges", []):
+        if e.get("kind") == "power":
+            for t in e.get("to", []):
+                powered_by[t["node"]] = e["from"]["node"]
+
+    def real_en_pin(node):
+        """EN脚显示 block **符号上**的真实使能脚；off_control 若经 glue 门(via_glue)，
+        A1/A2 是门的脚不是符号脚——回溯到被该门输出驱动的 block 引脚。"""
+        oc = (node.get("off_controls") or [{}])[0]
+        glue = node_by_id.get(oc.get("via_glue")) if oc.get("via_glue") else None
+        if glue:
+            outs = set(p.get("net") for p in glue.get("pins", []) if p.get("dir") == "output")
+            hit = [p["name"] for p in node.get("pins", []) if p.get("net") in outs]
+            if hit:
+                return hit[0] + "（经 glue %s）" % (oc.get("via_glue", "").split("/")[-1])
+        return oc.get("pin") or ""
+
+    def reg_of(sid):
+        s = sig_by_id.get(sid)
+        if not s:
+            return ("(不在regmap)", "", "")
+        v = s.get("variants", {})
+        vv = v.get(group) or v.get("COMMON")
+        if not vv:
+            return ("(无%s/COMMON)" % group, "", "")
+        return (vv.get("addr"), vv.get("bit"), vv.get("reg_name") or "")
+
+    raw2top = {}   # (chain_mod, raw_net) -> 顶层信号（drives 反查）
+    for s in regmap.get("signals", []):
+        for dv in s.get("drives", []) or []:
+            if "." in dv:
+                mod, net = dv.split(".", 1)
+                raw2top[(mod, net)] = s["id"]
+    master_sig = {}   # 每模块主DCO使能 = 该模块 DCO 核(device=dco) 的 off_control 信号（数据驱动，不硬编码网名）
+    for n in flowgraph.get("nodes", []):
+        if n.get("device") == "dco":
+            for o in n.get("off_controls", []):
+                if o.get("signal_ref"):
+                    master_sig.setdefault(n.get("module"), set()).add(o["signal_ref"])
+
+    # ---- 完整 EN 布尔追踪：底层 EN 脚 → 穿过 BUF_TOP glue 门(ND2/NR2/INV/…) + DCO_Logic 方程 → 顶层信号 ----
+    def cell_op(t):
+        t = t or ""
+        if re.match(r'^INV', t): return 'inv'
+        if re.match(r'^(BUFF?|BUFT|DEL|CK)', t): return 'buf'
+        if re.match(r'^ND\d', t): return 'nand'
+        if re.match(r'^NR\d', t): return 'nor'
+        if re.match(r'^AN\d', t): return 'and'
+        if re.match(r'^OR\d', t): return 'or'
+        return None
+
+    net2gate = {}   # BUF_TOP 级简单门：输出网 -> (op, [输入网])
+    for nn in flowgraph.get("nodes", []):
+        op = cell_op(nn.get("inst_type"))
+        if not op:
+            continue
+        outs = [p.get("net") for p in nn.get("pins", []) if p.get("dir") == "output"]
+        ins = [p.get("net") for p in nn.get("pins", []) if p.get("dir") == "input" and p.get("role") != "power"]
+        if len(outs) == 1 and outs[0]:
+            net2gate[outs[0]] = (op, ins)
+
+    def sub_raw(e, mod):
+        return re.sub(r'[A-Za-z_][A-Za-z0-9_]*', lambda mo: raw2top.get((mod, mo.group(0)), mo.group(0)), e)
+
+    def expr_net(net, mod, depth=0, seen=None):
+        seen = seen or set()
+        if depth > 18 or net in seen:
+            return net
+        if net in eqs.get(mod, {}):
+            return sub_raw(eqs[mod][net], mod)          # DCO_Logic 叶子
+        g = net2gate.get(net)
+        if g:
+            op, ins = g
+            sub = [expr_net(i, mod, depth + 1, seen | {net}) for i in ins]
+            if op == 'nand': return '!(%s)' % ' & '.join(sub)
+            if op == 'nor':  return '!(%s)' % ' | '.join(sub)
+            if op == 'and':  return '(%s)' % ' & '.join(sub)
+            if op == 'or':   return '(%s)' % ' | '.join(sub)
+            if op == 'inv':  return '!%s' % sub[0]
+            if op == 'buf':  return sub[0]
+        return raw2top.get((mod, net), net)             # 叶子：raw→顶层，或原样
+
+    def _bal(s):
+        dep = 0
+        for ch in s:
+            if ch == '(': dep += 1
+            elif ch == ')':
+                dep -= 1
+                if dep < 0: return False
+        return dep == 0
+
+    def simplify(e):
+        e = e.strip()
+        for _ in range(20):
+            e2 = re.sub(r'!\(!([A-Za-z0-9_]+)\)', r'\1', e)
+            e2 = re.sub(r'\(([A-Za-z0-9_]+)\s*&\s*\1\)', r'\1', e2)
+            if e2.startswith('!(!(') and e2.endswith('))') and _bal(e2[4:-2]):
+                e2 = e2[4:-2]
+            if e2.startswith('(') and e2.endswith(')') and _bal(e2[1:-1]):
+                e2 = e2[1:-1]
+            if e2 == e:
+                break
+            e = e2
+        return e
+
+    def enable_net(node):
+        oc = (node.get("off_controls") or [{}])[0]
+        glue = node_by_id.get(oc.get("via_glue")) if oc.get("via_glue") else None
+        if glue:
+            outs = set(p.get("net") for p in glue.get("pins", []) if p.get("dir") == "output")
+            for p in node.get("pins", []):
+                if p.get("net") in outs:
+                    return p.get("net"), p.get("name")
+        p = [pp for pp in node.get("pins", []) if pp.get("name") == oc.get("pin")]
+        return (p[0].get("net"), p[0].get("name")) if p else (None, oc.get("pin"))
+
+    def en_expr_of(node):
+        mod = node.get("module")
+        if mod not in eqs:
+            return None
+        net, pin = enable_net(node)
+        if not net:
+            return None
+        raw = expr_net(net, mod)
+        inv = bool(re.search(r'enb$|_b$|nb$', pin or ""))   # enb/复补脚 → ON = !(...)
+        return simplify(('!(%s)' % raw) if inv else raw)
+
+    TOP = re.compile(r'd_[A-Za-z0-9_]+')
+    GATEABLE = ("buf", "div", "mux", "dco", "power_switch")
+    blocks = []
+    for n in flowgraph.get("nodes", []):
+        if n.get("device") not in GATEABLE or not n.get("off_controls"):
+            continue
+        desig = set(gate_override.get(n["id"], []))
+        expr = en_expr_of(n)
+        parts = n["id"].split("/")
+        blk = {"module": n.get("module") or "", "cell": n.get("inst_type") or "?",
+               "path": "/".join(parts[1:]) if len(parts) > 1 else n["id"],   # 模块内唯一路径（真正的标识，非 cell 名）
+               "inst": n.get("inst_name") or parts[-1],
+               "dev": n["device"], "en_pin": real_en_pin(n), "expr": "", "rows": []}
+        if expr:
+            blk["expr"] = expr
+            seen = []
+            for sid in TOP.findall(expr):
+                if sid in seen:
+                    continue
+                seen.append(sid)
+                a, b, r = reg_of(sid)
+                is_master = sid in master_sig.get(n.get("module"), set())
+                role = ("主DCO使能(整域)" if is_master else "本级使能") + ("★总闸" if sid in desig else "")
+                blk["rows"].append({"sig": sid, "addr": a, "bit": b, "reg": r, "role": role, "off": 0, "master": is_master})
+        else:
+            sigs = [o.get("signal_ref") for o in n["off_controls"] if o.get("signal_ref")]
+            show = [s for s in sigs if s in desig] or sigs   # 指定了总闸就只显总闸
+            blk["expr"] = " & ".join(show) + "  (未过 DCO_Logic / 直接控制)"
+            for o in n["off_controls"]:
+                sid = o.get("signal_ref")
+                if not sid:
+                    continue
+                a, b, r = reg_of(sid)
+                role = "使能" + ("★总闸" if sid in desig else "")
+                blk["rows"].append({"sig": sid, "addr": a, "bit": b, "reg": r, "role": role, "off": o.get("off_value", 0), "master": False})
+        # 电源域：若本 block 由 power switch 供电，加一行「电源域总闸」（关它=整域掉电）
+        psw = node_by_id.get(powered_by.get(n["id"]))
+        if psw and psw["id"] != n["id"]:
+            pseen = set(x["sig"] for x in blk["rows"])
+            for o in psw.get("off_controls", []):
+                sid = o.get("signal_ref")
+                if not sid or sid in pseen:
+                    continue
+                pseen.add(sid)
+                a, b, r = reg_of(sid)
+                blk["rows"].append({"sig": sid, "addr": a, "bit": b, "reg": r,
+                                    "role": "电源域总闸(power switch %s)" % (psw.get("inst_name") or ""),
+                                    "off": o.get("off_value", 0), "master": False, "pwr": True})
+        blocks.append(blk)
+    return {"group": group, "blocks": blocks}
+
+
+def render_xlsx(testcases, path, reference=None):
+    """testcases = [(mode_id, tc), ...] -> 一个 .xlsx，**每个模式一张 sheet(tab)**；
+    reference（可选）= build_reference 输出，会加一张 Reference sheet 放最前。
+    需 openpyxl（延迟导入，只在导出 Excel 时用；核心生成仍 stdlib）。"""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    bold = Font(bold=True)
+    hdr_fill = PatternFill("solid", fgColor="D9D9D9")
+    base_fill = PatternFill("solid", fgColor="E2EFDA")   # baseline 段浅绿
+    step_fill = PatternFill("solid", fgColor="FCE4D6")   # 每步边界浅橙（=测量点）
+
+    if reference:
+        pwr_fill = PatternFill("solid", fgColor="DDEBF7")   # 电源域总闸行浅蓝
+        ws = wb.create_sheet("Reference")
+        ws.cell(1, 1, "Reference — 底层 EN 脚 → 顶层信号布尔式(含 glue 门) → 寄存器  (reg_group=%s；唯一标识=模块+实例路径，非 CELL 类型；★=指定总闸；绿=主DCO使能；蓝=电源域总闸)" % reference["group"]).font = bold
+        cols2 = ["模块", "实例路径(唯一标识)", "CELL类型(可重复)", "device", "EN脚", "EN映射(= 顶层布尔式)", "顶层信号", "地址 ADDR", "bit", "关断值", "角色/说明", "寄存器"]
+        for c, h in enumerate(cols2, 1):
+            cell = ws.cell(3, c, h); cell.font = bold; cell.fill = hdr_fill
+        r = 4
+        for blk in reference["blocks"]:
+            r0 = r
+            for row in blk["rows"]:
+                ws.cell(r, 7, row["sig"]); ws.cell(r, 8, row["addr"]); ws.cell(r, 9, row["bit"])
+                ws.cell(r, 10, row["off"]); ws.cell(r, 11, row["role"]); ws.cell(r, 12, row["reg"])
+                fill = pwr_fill if row.get("pwr") else (base_fill if row.get("master") else None)
+                if fill:
+                    for c in range(7, 13):
+                        ws.cell(r, c).fill = fill
+                r += 1
+            ws.cell(r0, 1, blk["module"]); ws.cell(r0, 2, blk["path"]); ws.cell(r0, 3, blk["cell"])
+            ws.cell(r0, 4, blk["dev"]); ws.cell(r0, 5, blk["en_pin"])
+            ws.cell(r0, 6, ("EN = " + blk["expr"]) if blk["expr"] else "")
+            if r - 1 > r0:
+                for c in range(1, 7):
+                    ws.merge_cells(start_row=r0, start_column=c, end_row=r - 1, end_column=c)
+        for c, wd in enumerate([8, 26, 22, 8, 13, 48, 30, 13, 5, 7, 22, 14], 1):
+            ws.column_dimensions[get_column_letter(c)].width = wd
+        ws.freeze_panes = "A4"
+    cols = ["步骤", "操作", "地址 ADDR", "值 VALUE", "寄存器/模块", "信号变化(bit:前→后)"]
+    widths = [9, 22, 13, 10, 22, 44]
+    used = set()
+    for mode_id, tc in testcases:
+        nm = re.sub(r"[\[\]:*?/\\]", "_", str(mode_id or tc.get("mode") or "mode"))[:31] or "mode"
+        base = nm
+        k = 1
+        while nm in used:
+            nm = (base[:28] + "_%d" % k); k += 1
+        used.add(nm)
+        ws = wb.create_sheet(nm)
+        ws.cell(1, 1, "%s  %s  |  reg_group=%s" % (tc.get("mode"), tc.get("mode_name") or "", tc.get("reg_group"))).font = bold
+        ws.cell(2, 1, "累积逐级关闭：每步先发本段写、再测总电流；相邻步电流差 = 该级功耗。")
+        for c, h in enumerate(cols, 1):
+            cell = ws.cell(4, c, h); cell.font = bold; cell.fill = hdr_fill
+        r = 5
+        for i, w in enumerate(tc["baseline"]["writes"]):
+            seg = []
+            for f in w.get("fields", []):
+                if f.get("role") in ("override", "mux_sel"):
+                    seg.append("%s=%s" % (f["signal"], f["value"]))
+                elif f.get("on"):
+                    seg.append("%s=on" % f["signal"])
+            row = ["baseline" if i == 0 else "", "建立全开起始态" if i == 0 else "",
+                   w["addr"], w["value"], w.get("reg") or "", ", ".join(seg)]
+            for c, v in enumerate(row, 1):
+                cc = ws.cell(r, c, v)
+                if i == 0:
+                    cc.fill = base_fill
+            r += 1
+        for st in tc["steps"]:
+            for i, w in enumerate(st["writes"]):
+                ftxt = ", ".join("%s[%s]:%d→%d" % (f["signal"], f["bit"], f["before"], f["after"])
+                                 for f in w.get("fields", []))
+                row = ["step %d" % st["index"] if i == 0 else "",
+                       "OFF %s" % st["off_label"] if i == 0 else "",
+                       w["addr"], w["value"], (st.get("off_node") or "").split("/")[-1], ftxt]
+                for c, v in enumerate(row, 1):
+                    cc = ws.cell(r, c, v)
+                    if i == 0:
+                        cc.fill = step_fill
+                r += 1
+        if tc["diagnostics"].get("uncovered_off_gates"):
+            r += 1
+            ws.cell(r, 1, "⚠ 未覆盖门（需人工补写）:").font = bold; r += 1
+            for u in tc["diagnostics"]["uncovered_off_gates"]:
+                ws.cell(r, 1, "%s : %s" % (u["signal"], u.get("note", ""))); r += 1
+        for c, wd in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(c)].width = wd
+        ws.freeze_panes = "A5"
+    wb.save(path)
+    return len(testcases)
+
+
 def render_debug_html(tc, flowgraph=None):
     def esc(s):
         return html.escape(str(s if s is not None else ""))
@@ -562,19 +855,25 @@ th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)}th{col
 
 # ------------------------------------------------------------------ project I/O
 def load_inputs(args):
+    gate_override = {}
     if args.project:
         fg = load_json(os.path.join(args.project, "flowgraph.json"))
         rm = load_json(os.path.join(args.project, "regmap.json"))
         if not args.mode:
             sys.exit("--project 需配 --mode <id>")
         mode = load_json(os.path.join(args.project, "modes", args.mode + ".json"))
+        lp = os.path.join(args.project, "layout.json")   # 关断总闸指定（per-block，跨模式复用）
+        if os.path.exists(lp):
+            gate_override = (load_json(lp) or {}).get("gate_override", {}) or {}
     else:
         if not (args.flowgraph and args.regmap and args.mode_file):
             sys.exit("需 --project 或 (--flowgraph --regmap --mode-file)")
         fg = load_json(args.flowgraph)
         rm = load_json(args.regmap)
         mode = load_json(args.mode_file)
-    return fg, rm, mode
+    gate_override = dict(gate_override)
+    gate_override.update(mode.get("gate_override", {}) or {})   # 模式内可再覆盖（per-mode 优先）
+    return fg, rm, mode, gate_override
 
 
 def _harden_stdout():
@@ -598,11 +897,36 @@ def main(argv=None):
     ap.add_argument("--out-json", help="写 testcase JSON（默认 project/testcases/<mode>.json）")
     ap.add_argument("--out-ate", help="写 ate.txt")
     ap.add_argument("--out-html", help="写 debug.html")
+    ap.add_argument("--xlsx", help="导出 Excel：**每个模式一张 sheet**。--project X --xlsx out.xlsx（默认导所有模式；配 --mode a,b 只导指定的）")
     ap.add_argument("--print", dest="do_print", action="store_true", help="打印 ate.txt 到控制台")
     args = ap.parse_args(argv)
 
-    fg, rm, mode = load_inputs(args)
-    tc = generate(fg, rm, mode)
+    if args.xlsx:                                    # 多模式 → 一个 Excel（每模式一 tab）
+        if not args.project:
+            sys.exit("--xlsx 需配 --project")
+        fg = load_json(os.path.join(args.project, "flowgraph.json"))
+        rm = load_json(os.path.join(args.project, "regmap.json"))
+        lp = os.path.join(args.project, "layout.json")
+        go = ((load_json(lp) or {}).get("gate_override", {}) or {}) if os.path.exists(lp) else {}
+        mdir = os.path.join(args.project, "modes")
+        ids = ([m.strip() for m in args.mode.split(",") if m.strip()] if args.mode
+               else [f[:-5] for f in sorted(os.listdir(mdir)) if f.endswith(".json")] if os.path.isdir(mdir) else [])
+        if not ids:
+            sys.exit("没找到模式：%s" % mdir)
+        tcs = []
+        for mid in ids:
+            m = load_json(os.path.join(mdir, mid + ".json"))
+            g = dict(go); g.update(m.get("gate_override", {}) or {})
+            tcs.append((mid, generate(fg, rm, m, g)))
+        lep = os.path.join(args.project, "dco_logic_expr.json")   # 门级布尔式（可选，用于 EN 映射列）
+        logic_expr = load_json(lep) if os.path.exists(lep) else None
+        ref = build_reference(fg, rm, go, logic_expr=logic_expr)   # block→EN布尔式→寄存器 参考表
+        render_xlsx(tcs, args.xlsx, reference=ref)
+        print("Excel 已写: %s  (Reference + %d 个模式 sheet: %s)" % (args.xlsx, len(tcs), ", ".join(ids)))
+        return
+
+    fg, rm, mode, gate_override = load_inputs(args)
+    tc = generate(fg, rm, mode, gate_override)
 
     out_json = args.out_json
     if not out_json and args.project:

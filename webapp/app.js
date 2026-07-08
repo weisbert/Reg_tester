@@ -120,7 +120,7 @@
 
   function defaultLayout() {
     return { schema_version: 'layout/1', positions: {}, collapsed: [], hidden: [], shown: [],
-             symbol_override: {}, edge_flip: {}, notes: {}, expanded: [] };
+             symbol_override: {}, edge_flip: {}, notes: {}, expanded: [], gate_override: {} };
   }
 
   function initGroups() {
@@ -928,7 +928,10 @@
   function generatePreview() {
     try {
       S.mode.reg_group = $('#group-select').value; S.mode.order.mode = $('#order-select').value;
-      S.lastTc = Generator.generate(S.fg, S.rm, S.mode);
+      var go = {}; var lgo = (S.layout && S.layout.gate_override) || {};
+      Object.keys(lgo).forEach(function (k) { go[k] = lgo[k]; });          // 关断总闸：layout（跨模式复用）
+      Object.keys(S.mode.gate_override || {}).forEach(function (k) { go[k] = S.mode.gate_override[k]; });  // 模式内覆盖
+      S.lastTc = Generator.generate(S.fg, S.rm, S.mode, go);
       renderSeqTab();
     } catch (e) { toast('生成失败: ' + e); console.error(e); }
   }

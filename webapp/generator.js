@@ -60,15 +60,18 @@
     return v[this.group] || v[this.common] || null;
   };
 
-  function collectGates(fg) {
+  function collectGates(fg, gateOverride) {
+    gateOverride = gateOverride || {};
     var gateNodes = {}, nodeGates = {};
     var nodes = fg.nodes || [];
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i], gs = [];
+      var ov = gateOverride[n.id];   // 指定了关断总闸则只用这些信号
       var ocs = n.off_controls || [];
       for (var j = 0; j < ocs.length; j++) {
         var oc = ocs[j], sig = oc.signal_ref;
         if (!sig) continue;
+        if (ov && ov.indexOf(sig) < 0) continue;
         var g = {
           node: n.id, signal: sig, pin: oc.pin,
           off_value: oc.off_value === undefined ? 0 : oc.off_value,
@@ -131,12 +134,12 @@
     return o;
   }
 
-  function generate(fg, regmap, mode) {
+  function generate(fg, regmap, mode, gateOverride) {
     var group = mode.reg_group || regmap.primary_group || 'BT';
     var rv = new RegView(regmap, group);
     var enabled = {}; (mode.enabled_nodes || []).forEach(function (n) { enabled[n] = true; });
     var baselineOver = mode.baseline || {};
-    var cg = collectGates(fg), gateNodes = cg.gateNodes, nodeGates = cg.nodeGates;
+    var cg = collectGates(fg, gateOverride), gateNodes = cg.gateNodes, nodeGates = cg.nodeGates;
 
     function signalOn(sig) {
       var ns = gateNodeSet(gateNodes, sig);

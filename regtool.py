@@ -148,7 +148,9 @@ class Project:
         mode = self.read_mode(mid)
         if not mode:
             return None
-        tc = gen_testcase.generate(self.flowgraph(), self.regmap(), mode)
+        go = dict((self.layout() or {}).get("gate_override", {}) or {})   # 关断总闸指定（layout，跨模式复用）
+        go.update(mode.get("gate_override", {}) or {})                    # 模式内可再覆盖
+        tc = gen_testcase.generate(self.flowgraph(), self.regmap(), mode, go)
         return {"testcase": tc,
                 "ate": gen_testcase.render_ate(tc),
                 "html": gen_testcase.render_debug_html(tc, self.flowgraph())}
