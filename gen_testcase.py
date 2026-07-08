@@ -725,6 +725,8 @@ def render_xlsx(testcases, path, reference=None):
     hdr_fill = PatternFill("solid", fgColor="D9D9D9")
     base_fill = PatternFill("solid", fgColor="E2EFDA")   # baseline 段浅绿
     step_fill = PatternFill("solid", fgColor="FCE4D6")   # 每步边界浅橙（=测量点）
+    in_fill = PatternFill("solid", fgColor="FFF2CC")     # 输入格黄
+    out_fill = PatternFill("solid", fgColor="C6E0B4")    # 输出格绿
 
     if reference:
         pwr_fill = PatternFill("solid", fgColor="DDEBF7")   # 电源域总闸行浅蓝
@@ -766,8 +768,6 @@ def render_xlsx(testcases, path, reference=None):
         wsd.sheet_state = "hidden"
 
         we = wb.create_sheet("位编辑器")
-        in_fill = PatternFill("solid", fgColor="FFF2CC")   # 输入格黄
-        out_fill = PatternFill("solid", fgColor="C6E0B4")  # 输出格绿
         we.cell(1, 1, "位编辑器 — 只在「目标」行填你要改的 bit（0/1），其余留空自动保持；新值自动算出").font = bold
         we.cell(3, 1, "当前值(hex) →").font = bold
         c = we.cell(3, 2, "3F4B"); c.fill = in_fill; c.font = bold; c.number_format = "@"   # 文本格式：防 3E48 被当科学计数
@@ -824,8 +824,56 @@ def render_xlsx(testcases, path, reference=None):
         for cc, w in {"A": 14, "B": 10, "E": 30, "F": 13, "G": 6, "H": 16, "I": 12, "J": 7, "K": 9}.items():
             wx.column_dimensions[cc].width = w
         wx.freeze_panes = "A3"
-    cols = ["步骤", "操作", "地址 ADDR", "值 VALUE", "寄存器/模块", "信号变化(bit:前→后)"]
-    widths = [9, 22, 13, 10, 22, 44]
+    # ---- 初始值(RMW)：用户填每个被影响寄存器的真实初始值 → 各模式值按 (init AND keep) OR our 自动重算 ----
+    def touched_regs(tc):
+        info = {}
+        def acc(w):
+            e = info.setdefault(w["addr"], {"reg": w.get("reg") or "", "reset": w.get("reset") or "", "mask": 0})
+            if not e["reg"]:
+                e["reg"] = w.get("reg") or ""
+            if not e["reset"]:
+                e["reset"] = w.get("reset") or ""
+            for f in w.get("fields", []):
+                bs = str(f.get("bit", ""))
+                if not bs:
+                    continue
+                if ":" in bs:
+                    hi, lo = bs.split(":", 1); hi, lo = int(hi), int(lo)
+                else:
+                    hi = lo = int(bs)
+                for p in range(min(lo, hi), max(lo, hi) + 1):
+                    e["mask"] |= (1 << p)
+        for w in tc["baseline"]["writes"]:
+            acc(w)
+        for st in tc["steps"]:
+            for w in st["writes"]:
+                acc(w)
+        return info
+
+    all_regs = {}
+    for _mid, tc in testcases:
+        for a, e in touched_regs(tc).items():
+            g = all_regs.setdefault(a, {"reg": e["reg"], "reset": e["reset"], "mask": 0})
+            g["mask"] |= e["mask"]
+            g["reg"] = g["reg"] or e["reg"]
+            g["reset"] = g["reset"] or e["reset"]
+    wi = wb.create_sheet("初始值")
+    wi.cell(1, 1, "初始值设定 — 填每个被影响寄存器的**真实初始值**(默认=复位值)。各模式的「值」= (初始值 AND 保留位) OR 本工具使能位，"
+                  "只覆盖我们控制的 bit、保留你的其它 bit；填完各模式自动重算成可用序列。").font = bold
+    for j, h in enumerate(["key", "地址", "寄存器", "我们控制的bit(mask)", "初始值(hex,填这列)", "说明"], 1):
+        cc = wi.cell(2, j, h); cc.font = bold; cc.fill = hdr_fill
+    for i, (a, e) in enumerate(sorted(all_regs.items()), 3):
+        wi.cell(i, 1, re.sub(r'(?i)^0x', '', a).upper())
+        wi.cell(i, 2, a); wi.cell(i, 3, e["reg"]); wi.cell(i, 4, "0x%04X" % e["mask"])
+        c = wi.cell(i, 5, e["reset"] or "0x0000"); c.fill = in_fill; c.number_format = "@"
+        wi.cell(i, 6, "默认=复位值；改成实际初始值后各模式自动重算")
+    wi.column_dimensions["A"].hidden = True
+    for cc2, w in {"B": 13, "C": 18, "D": 20, "E": 18, "F": 42}.items():
+        wi.column_dimensions[cc2].width = w
+    wi.freeze_panes = "A3"
+
+    cols = ["步骤", "操作", "地址 ADDR", "值 VALUE(按初始值重算)", "寄存器/模块", "信号变化(bit:前→后)"]
+    widths = [9, 22, 13, 22, 22, 44]
     used = set()
     for mode_id, tc in testcases:
         nm = re.sub(r"[\[\]:*?/\\]", "_", str(mode_id or tc.get("mode") or "mode"))[:31] or "mode"
@@ -835,8 +883,17 @@ def render_xlsx(testcases, path, reference=None):
             nm = (base[:28] + "_%d" % k); k += 1
         used.add(nm)
         ws = wb.create_sheet(nm)
+        minfo = touched_regs(tc)
+
+        def rmw(row_i, addr, val_hex):
+            mask = minfo.get(addr, {}).get("mask", 0)
+            keep = 0xFFFF ^ mask
+            ourval = int(str(val_hex).replace("0x", "").replace("0X", ""), 16) & mask
+            ws.cell(row_i, 8, '=IFERROR(INDEX(\'初始值\'!$E:$E,MATCH(UPPER(SUBSTITUTE(SUBSTITUTE(C%d,"0x",""),"0X","")),\'初始值\'!$A:$A,0)),"")' % row_i)
+            ws.cell(row_i, 4, '=IF($H%d="","(填初始值)","0x"&DEC2HEX(BITOR(BITAND(HEX2DEC(SUBSTITUTE(SUBSTITUTE($H%d,"0x",""),"0X","")),%d),%d),4))' % (row_i, row_i, keep, ourval))
+
         ws.cell(1, 1, "%s  %s  |  reg_group=%s" % (tc.get("mode"), tc.get("mode_name") or "", tc.get("reg_group"))).font = bold
-        ws.cell(2, 1, "累积逐级关闭：每步先发本段写、再测总电流；相邻步电流差 = 该级功耗。")
+        ws.cell(2, 1, "累积逐级关闭：每步先发本段写、再测总电流；相邻步电流差 = 该级功耗。「值」按『初始值』sheet 自动重算(RMW)。")
         mw = tc.get("warnings") or (tc.get("diagnostics") or {}).get("warnings") or []
         if mw:
             ws.cell(3, 1, "⚠ 模式级：" + "；".join(str(x) for x in mw)).font = bold
@@ -850,21 +907,20 @@ def render_xlsx(testcases, path, reference=None):
                     seg.append("%s=%s" % (f["signal"], f["value"]))
                 elif f.get("on"):
                     seg.append("%s=on" % f["signal"])
-            row = ["baseline" if i == 0 else "", "建立全开起始态" if i == 0 else "",
-                   w["addr"], w["value"], w.get("reg") or "", ", ".join(seg)]
-            for c, v in enumerate(row, 1):
-                cc = ws.cell(r, c, v)
-                if i == 0:
-                    cc.fill = base_fill
+            ws.cell(r, 1, "baseline" if i == 0 else ""); ws.cell(r, 2, "建立全开起始态" if i == 0 else "")
+            ws.cell(r, 3, w["addr"]); ws.cell(r, 5, w.get("reg") or ""); ws.cell(r, 6, ", ".join(seg))
+            rmw(r, w["addr"], w["value"])
+            if i == 0:
+                for c in range(1, 7):
+                    ws.cell(r, c).fill = base_fill
             r += 1
         for st in tc["steps"]:
             node = (st.get("off_node") or "").split("/")[-1]
             hlabel, hop = "step %d" % st["index"], "OFF %s" % st["off_label"]
             tail = "；".join(list(st.get("warnings") or []) + ([st["note"]] if st.get("note") else []))
             if not st["writes"]:
-                # 空步骤：本级门已被前面共用位提前关掉，仍是一个测量点 —— 必须保留(修 1.8)
-                cells = [hlabel, hop, "", "", node, "（本级门已被前面共用位提前关，仍是测量点）" + ("；" + tail if tail else "")]
-                for c, v in enumerate(cells, 1):
+                # 空步骤：门已被前面共用位提前关，仍是一个测量点 —— 必须保留(1.8)
+                for c, v in enumerate([hlabel, hop, "", "", node, "（本级门已被前面共用位提前关，仍是测量点）" + ("；" + tail if tail else "")], 1):
                     ws.cell(r, c, v).fill = step_fill
                 r += 1
                 continue
@@ -873,12 +929,12 @@ def render_xlsx(testcases, path, reference=None):
                                  for f in w.get("fields", []))
                 if i == 0 and tail:
                     ftxt = (ftxt + "   ⚠ " + tail) if ftxt else ("⚠ " + tail)
-                row = [hlabel if i == 0 else "", hop if i == 0 else "",
-                       w["addr"], w["value"], node, ftxt]
-                for c, v in enumerate(row, 1):
-                    cc = ws.cell(r, c, v)
-                    if i == 0:
-                        cc.fill = step_fill
+                ws.cell(r, 1, hlabel if i == 0 else ""); ws.cell(r, 2, hop if i == 0 else "")
+                ws.cell(r, 3, w["addr"]); ws.cell(r, 5, node); ws.cell(r, 6, ftxt)
+                rmw(r, w["addr"], w["value"])
+                if i == 0:
+                    for c in range(1, 7):
+                        ws.cell(r, c).fill = step_fill
                 r += 1
         if tc["diagnostics"].get("uncovered_off_gates"):
             r += 1
@@ -887,6 +943,7 @@ def render_xlsx(testcases, path, reference=None):
                 ws.cell(r, 1, "%s : %s" % (u["signal"], u.get("note", ""))); r += 1
         for c, wd in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(c)].width = wd
+        ws.column_dimensions["H"].hidden = True
         ws.freeze_panes = "A5"
     wb.save(path)
     return len(testcases)
