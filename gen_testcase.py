@@ -682,7 +682,16 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
                                     "role": "电源域总闸(power switch %s)" % (psw.get("inst_name") or ""),
                                     "off": o.get("off_value", 0), "master": False, "pwr": True})
         blocks.append(blk)
-    return {"group": group, "blocks": blocks}
+    # 位定义：地址+bit -> 信号（供 Excel 位编辑器 VLOOKUP 标注）
+    bit_defs = []
+    for s in regmap.get("signals", []):
+        v = s.get("variants", {})
+        vv = v.get(group) or v.get("COMMON")
+        if vv and vv.get("addr") and str(vv.get("bit", "")) != "":
+            addr_key = re.sub(r'(?i)^0x', '', str(vv["addr"])).upper()
+            bit_defs.append({"key": "%s_%s" % (addr_key, vv["bit"]), "addr": vv["addr"],
+                             "bit": vv["bit"], "sig": s["id"], "reg": vv.get("reg_name") or ""})
+    return {"group": group, "blocks": blocks, "bit_defs": bit_defs}
 
 
 def render_xlsx(testcases, path, reference=None):
@@ -726,6 +735,70 @@ def render_xlsx(testcases, path, reference=None):
         for c, wd in enumerate([8, 26, 22, 8, 13, 48, 30, 13, 5, 7, 22, 14], 1):
             ws.column_dimensions[get_column_letter(c)].width = wd
         ws.freeze_panes = "A4"
+
+        # ---- 位编辑器（Excel 原生公式，无宏）：只改要动的 bit，其余自动保持 ----
+        bd = reference.get("bit_defs", [])
+        wsd = wb.create_sheet("位定义")     # VLOOKUP 用，隐藏
+        for j, h in enumerate(["key", "信号", "寄存器", "地址", "bit"], 1):
+            wsd.cell(1, j, h).font = bold
+        for i, x in enumerate(bd, 2):
+            wsd.cell(i, 1, x["key"]); wsd.cell(i, 2, x["sig"]); wsd.cell(i, 3, x["reg"])
+            wsd.cell(i, 4, x["addr"]); wsd.cell(i, 5, x["bit"])
+        wsd.sheet_state = "hidden"
+
+        we = wb.create_sheet("位编辑器")
+        in_fill = PatternFill("solid", fgColor="FFF2CC")   # 输入格黄
+        out_fill = PatternFill("solid", fgColor="C6E0B4")  # 输出格绿
+        we.cell(1, 1, "位编辑器 — 只在「目标」行填你要改的 bit（0/1），其余留空自动保持；新值自动算出").font = bold
+        we.cell(3, 1, "当前值(hex) →").font = bold
+        c = we.cell(3, 2, "3F4B"); c.fill = in_fill; c.font = bold
+        we.cell(4, 1, "地址(可选,标信号) →")
+        c = we.cell(4, 2, ""); c.fill = in_fill
+        we.cell(5, 1, "新值(hex) →").font = bold
+        cur = 'HEX2DEC(SUBSTITUTE(SUBSTITUTE($B$3,"0x",""),"0X",""))'
+        akey = 'UPPER(SUBSTITUTE(SUBSTITUTE($B$4,"0x",""),"0X",""))'
+        we.cell(7, 1, "bit"); we.cell(8, 1, "信号名"); we.cell(9, 1, "当前bit")
+        we.cell(10, 1, "目标(留空=不变)").font = bold
+        we.cell(11, 1, "结果bit")
+        bits = list(range(15, -1, -1))
+        for i, b in enumerate(bits):
+            col = 2 + i
+            L = get_column_letter(col)
+            we.cell(7, col, b).font = bold
+            we.cell(8, col, '=IFERROR(VLOOKUP(%s&"_"&%s$7,\'位定义\'!$A:$B,2,FALSE),"")' % (akey, L))
+            we.cell(9, col, '=MOD(INT(%s/2^%s$7),2)' % (cur, L))
+            we.cell(10, col, None).fill = in_fill
+            we.cell(11, col, '=IF(%s10="",%s9,%s10)' % (L, L, L))
+        f, la = get_column_letter(2), get_column_letter(1 + len(bits))
+        c = we.cell(5, 2, '="0x"&DEC2HEX(SUMPRODUCT(%s11:%s11,2^(%s7:%s7)),4)' % (f, la, f, la))
+        c.fill = out_fill; c.font = bold
+        we.column_dimensions["A"].width = 18
+        for col in range(2, 2 + len(bits)):
+            we.column_dimensions[get_column_letter(col)].width = 5
+
+        # ---- 解码器（反向）：粘贴一串 (地址,值) → 自动列出每个寄存器哪些 bit=1、哪些信号在开 ----
+        wx = wb.create_sheet("解码器")
+        wx.cell(1, 1, "解码器 — 左边粘贴 dump(地址+值hex)，右表自动算每个信号 ON/off；点右表筛选「状态=● ON」看开着的").font = bold
+        wx.cell(2, 1, "地址").font = bold
+        wx.cell(2, 2, "值(hex)").font = bold
+        wx.cell(2, 3, "key")
+        for r in range(3, 63):   # 60 行输入
+            wx.cell(r, 1, None).fill = in_fill
+            wx.cell(r, 2, None).fill = in_fill
+            wx.cell(r, 3, '=UPPER(SUBSTITUTE(SUBSTITUTE(A%d,"0x",""),"0X",""))' % r)
+        wx.column_dimensions["C"].hidden = True
+        for j, h in enumerate(["信号", "地址", "bit", "寄存器", "该寄存器值", "bit值", "状态"], 5):  # 列 E..K
+            wx.cell(2, j, h).font = bold
+        for i, x in enumerate(bd, 3):
+            key = 'UPPER(SUBSTITUTE(SUBSTITUTE(F%d,"0x",""),"0X",""))' % i
+            wx.cell(i, 5, x["sig"]); wx.cell(i, 6, x["addr"]); wx.cell(i, 7, x["bit"]); wx.cell(i, 8, x["reg"])
+            wx.cell(i, 9, '=IFERROR(INDEX($B:$B,MATCH(%s,$C:$C,0)),"")' % key)
+            wx.cell(i, 10, '=IF(I%d="","",MOD(INT(HEX2DEC(SUBSTITUTE(SUBSTITUTE(I%d,"0x",""),"0X",""))/2^G%d),2))' % (i, i, i))
+            wx.cell(i, 11, '=IF(J%d=1,"● ON",IF(J%d=0,"off",""))' % (i, i))
+        wx.auto_filter.ref = "E2:K%d" % (2 + len(bd))
+        for cc, w in {"A": 14, "B": 10, "E": 30, "F": 13, "G": 5, "H": 16, "I": 12, "J": 6, "K": 8}.items():
+            wx.column_dimensions[cc].width = w
+        wx.freeze_panes = "A3"
     cols = ["步骤", "操作", "地址 ADDR", "值 VALUE", "寄存器/模块", "信号变化(bit:前→后)"]
     widths = [9, 22, 13, 10, 22, 44]
     used = set()
