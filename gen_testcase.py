@@ -511,10 +511,19 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
             for t in e.get("to", []):
                 powered_by[t["node"]] = e["from"]["node"]
 
+    def picked_oc(node):
+        """选定用于 EN 脚/追踪的 off_control：优先用户指定的关断总闸(gate_override)，否则第一个。"""
+        ocs = node.get("off_controls") or [{}]
+        dz = gate_override.get(node["id"], [])
+        for o in ocs:
+            if o.get("signal_ref") in dz:
+                return o
+        return ocs[0]
+
     def real_en_pin(node):
         """EN脚显示 block **符号上**的真实使能脚；off_control 若经 glue 门(via_glue)，
         A1/A2 是门的脚不是符号脚——回溯到被该门输出驱动的 block 引脚。"""
-        oc = (node.get("off_controls") or [{}])[0]
+        oc = picked_oc(node)
         glue = node_by_id.get(oc.get("via_glue")) if oc.get("via_glue") else None
         if glue:
             outs = set(p.get("net") for p in glue.get("pins", []) if p.get("dir") == "output")
@@ -612,7 +621,7 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
         return e
 
     def enable_net(node):
-        oc = (node.get("off_controls") or [{}])[0]
+        oc = picked_oc(node)
         glue = node_by_id.get(oc.get("via_glue")) if oc.get("via_glue") else None
         if glue:
             outs = set(p.get("net") for p in glue.get("pins", []) if p.get("dir") == "output")
@@ -633,65 +642,74 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
         inv = bool(re.search(r'enb$|_b$|nb$', pin or ""))   # enb/复补脚 → ON = !(...)
         return simplify(('!(%s)' % raw) if inv else raw)
 
+    def parse_bit(bs):
+        bs = str(bs)
+        if ":" in bs:
+            hi, lo = bs.split(":", 1)
+            return int(lo), int(hi) - int(lo) + 1     # (lo, width)
+        return int(bs), 1
+
+    def add_row(blk, seen, sid, role, off, master=False, pwr=False):
+        if not sid or sid in seen:
+            return
+        seen.add(sid)
+        a, b, r = reg_of(sid)
+        blk["rows"].append({"sig": sid, "addr": a, "bit": b, "reg": r, "role": role,
+                            "off": off, "master": master, "pwr": pwr})
+
     TOP = re.compile(r'd_[A-Za-z0-9_]+')
     GATEABLE = ("buf", "div", "mux", "dco", "power_switch")
     blocks = []
     for n in flowgraph.get("nodes", []):
         if n.get("device") not in GATEABLE or not n.get("off_controls"):
             continue
+        mod = n.get("module")
         desig = set(gate_override.get(n["id"], []))
         expr = en_expr_of(n)
         parts = n["id"].split("/")
-        blk = {"module": n.get("module") or "", "cell": n.get("inst_type") or "?",
+        blk = {"module": mod or "", "cell": n.get("inst_type") or "?",
                "path": "/".join(parts[1:]) if len(parts) > 1 else n["id"],   # 模块内唯一路径（真正的标识，非 cell 名）
                "inst": n.get("inst_name") or parts[-1],
                "dev": n["device"], "en_pin": real_en_pin(n), "expr": "", "rows": []}
+        seen = set()
+        # 1) EN映射布尔式里的顶层信号（追踪的那条使能路径）
         if expr:
             blk["expr"] = expr
-            seen = []
             for sid in TOP.findall(expr):
-                if sid in seen:
-                    continue
-                seen.append(sid)
-                a, b, r = reg_of(sid)
-                is_master = sid in master_sig.get(n.get("module"), set())
+                is_master = sid in master_sig.get(mod, set())
                 role = ("主DCO使能(整域)" if is_master else "本级使能") + ("★总闸" if sid in desig else "")
-                blk["rows"].append({"sig": sid, "addr": a, "bit": b, "reg": r, "role": role, "off": 0, "master": is_master})
-        else:
+                add_row(blk, seen, sid, role, 0, master=is_master)
+        # 2) **所有** off_controls 的信号都列出（2.2：多门块不能只显第一个；也兜底 2.1 空表达式）
+        for o in n["off_controls"]:
+            sid = o.get("signal_ref")
+            add_row(blk, seen, sid, "本级使能" + ("★总闸" if sid in desig else ""), o.get("off_value", 0))
+        if not blk["expr"]:
             sigs = [o.get("signal_ref") for o in n["off_controls"] if o.get("signal_ref")]
-            show = [s for s in sigs if s in desig] or sigs   # 指定了总闸就只显总闸
-            blk["expr"] = " & ".join(show) + "  (未过 DCO_Logic / 直接控制)"
-            for o in n["off_controls"]:
-                sid = o.get("signal_ref")
-                if not sid:
-                    continue
-                a, b, r = reg_of(sid)
-                role = "使能" + ("★总闸" if sid in desig else "")
-                blk["rows"].append({"sig": sid, "addr": a, "bit": b, "reg": r, "role": role, "off": o.get("off_value", 0), "master": False})
-        # 电源域：若本 block 由 power switch 供电，加一行「电源域总闸」（关它=整域掉电）
+            show = [s for s in sigs if s in desig] or sigs
+            blk["expr"] = " & ".join(show) + "  (未过逻辑门 / 直接控制)"
+        # 3) 电源域总闸：若本 block 由 power switch 供电（关它=整域掉电）
         psw = node_by_id.get(powered_by.get(n["id"]))
         if psw and psw["id"] != n["id"]:
-            pseen = set(x["sig"] for x in blk["rows"])
             for o in psw.get("off_controls", []):
-                sid = o.get("signal_ref")
-                if not sid or sid in pseen:
-                    continue
-                pseen.add(sid)
-                a, b, r = reg_of(sid)
-                blk["rows"].append({"sig": sid, "addr": a, "bit": b, "reg": r,
-                                    "role": "电源域总闸(power switch %s)" % (psw.get("inst_name") or ""),
-                                    "off": o.get("off_value", 0), "master": False, "pwr": True})
+                add_row(blk, seen, o.get("signal_ref"),
+                        "电源域总闸(power switch %s)" % (psw.get("inst_name") or ""),
+                        o.get("off_value", 0), pwr=True)
         blocks.append(blk)
-    # 位定义：地址+bit -> 信号（供 Excel 位编辑器 VLOOKUP 标注）
-    bit_defs = []
+    # 位定义（per-signal，含 lo/width）+ per-bit 展开（供位编辑器逐 bit 标注）
+    bit_defs, bit_lookup = [], []
     for s in regmap.get("signals", []):
         v = s.get("variants", {})
         vv = v.get(group) or v.get("COMMON")
-        if vv and vv.get("addr") and str(vv.get("bit", "")) != "":
-            addr_key = re.sub(r'(?i)^0x', '', str(vv["addr"])).upper()
-            bit_defs.append({"key": "%s_%s" % (addr_key, vv["bit"]), "addr": vv["addr"],
-                             "bit": vv["bit"], "sig": s["id"], "reg": vv.get("reg_name") or ""})
-    return {"group": group, "blocks": blocks, "bit_defs": bit_defs}
+        if not (vv and vv.get("addr") and str(vv.get("bit", "")) != ""):
+            continue
+        lo, width = parse_bit(vv["bit"])
+        addr_key = re.sub(r'(?i)^0x', '', str(vv["addr"])).upper()
+        bit_defs.append({"addr": vv["addr"], "addr_key": addr_key, "bit_str": str(vv["bit"]),
+                         "lo": lo, "width": width, "sig": s["id"], "reg": vv.get("reg_name") or "",
+                         "off": s.get("off_value", 0)})
+        for bb in range(lo, lo + width):
+            bit_lookup.append({"key": "%s_%d" % (addr_key, bb), "sig": s["id"]})
+    return {"group": group, "blocks": blocks, "bit_defs": bit_defs, "bit_lookup": bit_lookup}
 
 
 def render_xlsx(testcases, path, reference=None):
@@ -726,6 +744,8 @@ def render_xlsx(testcases, path, reference=None):
                     for c in range(7, 13):
                         ws.cell(r, c).fill = fill
                 r += 1
+            if r == r0:          # 无信号行也占一行，绝不被下一块覆盖(2.1)
+                r = r0 + 1
             ws.cell(r0, 1, blk["module"]); ws.cell(r0, 2, blk["path"]); ws.cell(r0, 3, blk["cell"])
             ws.cell(r0, 4, blk["dev"]); ws.cell(r0, 5, blk["en_pin"])
             ws.cell(r0, 6, ("EN = " + blk["expr"]) if blk["expr"] else "")
@@ -738,12 +758,11 @@ def render_xlsx(testcases, path, reference=None):
 
         # ---- 位编辑器（Excel 原生公式，无宏）：只改要动的 bit，其余自动保持 ----
         bd = reference.get("bit_defs", [])
+        blk_lookup = reference.get("bit_lookup", [])   # per-bit 展开：多位字段的每个 bit 都能查到信号名
         wsd = wb.create_sheet("位定义")     # VLOOKUP 用，隐藏
-        for j, h in enumerate(["key", "信号", "寄存器", "地址", "bit"], 1):
-            wsd.cell(1, j, h).font = bold
-        for i, x in enumerate(bd, 2):
-            wsd.cell(i, 1, x["key"]); wsd.cell(i, 2, x["sig"]); wsd.cell(i, 3, x["reg"])
-            wsd.cell(i, 4, x["addr"]); wsd.cell(i, 5, x["bit"])
+        wsd.cell(1, 1, "key").font = bold; wsd.cell(1, 2, "信号").font = bold
+        for i, x in enumerate(blk_lookup, 2):
+            wsd.cell(i, 1, x["key"]); wsd.cell(i, 2, x["sig"])
         wsd.sheet_state = "hidden"
 
         we = wb.create_sheet("位编辑器")
@@ -751,9 +770,9 @@ def render_xlsx(testcases, path, reference=None):
         out_fill = PatternFill("solid", fgColor="C6E0B4")  # 输出格绿
         we.cell(1, 1, "位编辑器 — 只在「目标」行填你要改的 bit（0/1），其余留空自动保持；新值自动算出").font = bold
         we.cell(3, 1, "当前值(hex) →").font = bold
-        c = we.cell(3, 2, "3F4B"); c.fill = in_fill; c.font = bold
+        c = we.cell(3, 2, "3F4B"); c.fill = in_fill; c.font = bold; c.number_format = "@"   # 文本格式：防 3E48 被当科学计数
         we.cell(4, 1, "地址(可选,标信号) →")
-        c = we.cell(4, 2, ""); c.fill = in_fill
+        c = we.cell(4, 2, ""); c.fill = in_fill; c.number_format = "@"
         we.cell(5, 1, "新值(hex) →").font = bold
         cur = 'HEX2DEC(SUBSTITUTE(SUBSTITUTE($B$3,"0x",""),"0X",""))'
         akey = 'UPPER(SUBSTITUTE(SUBSTITUTE($B$4,"0x",""),"0X",""))'
@@ -766,11 +785,12 @@ def render_xlsx(testcases, path, reference=None):
             L = get_column_letter(col)
             we.cell(7, col, b).font = bold
             we.cell(8, col, '=IFERROR(VLOOKUP(%s&"_"&%s$7,\'位定义\'!$A:$B,2,FALSE),"")' % (akey, L))
-            we.cell(9, col, '=MOD(INT(%s/2^%s$7),2)' % (cur, L))
-            we.cell(10, col, None).fill = in_fill
+            we.cell(9, col, '=IFERROR(MOD(INT(%s/2^%s$7),2),"")' % (cur, L))
+            cc = we.cell(10, col, None); cc.fill = in_fill; cc.number_format = "@"
             we.cell(11, col, '=IF(%s10="",%s9,%s10)' % (L, L, L))
         f, la = get_column_letter(2), get_column_letter(1 + len(bits))
-        c = we.cell(5, 2, '="0x"&DEC2HEX(SUMPRODUCT(%s11:%s11,2^(%s7:%s7)),4)' % (f, la, f, la))
+        c = we.cell(5, 2, '=IF($B$3="","",IF(ISERROR(%s),"⚠当前值需hex",IF(%s>65535,"⚠超16位",'
+                          '"0x"&DEC2HEX(SUMPRODUCT(%s11:%s11,2^(%s7:%s7)),4))))' % (cur, cur, f, la, f, la))
         c.fill = out_fill; c.font = bold
         we.column_dimensions["A"].width = 18
         for col in range(2, 2 + len(bits)):
@@ -778,25 +798,30 @@ def render_xlsx(testcases, path, reference=None):
 
         # ---- 解码器（反向）：粘贴一串 (地址,值) → 自动列出每个寄存器哪些 bit=1、哪些信号在开 ----
         wx = wb.create_sheet("解码器")
-        wx.cell(1, 1, "解码器 — 左边粘贴 dump(地址+值hex)，右表自动算每个信号 ON/off；点右表筛选「状态=● ON」看开着的").font = bold
+        wx.cell(1, 1, "解码器 — 左边粘贴 dump(地址+值hex)，右表自动算每个信号；单 bit 显 ● ON/off，多位字段显「值 N」；筛「状态」看开着的").font = bold
         wx.cell(2, 1, "地址").font = bold
         wx.cell(2, 2, "值(hex)").font = bold
         wx.cell(2, 3, "key")
         for r in range(3, 63):   # 60 行输入
-            wx.cell(r, 1, None).fill = in_fill
-            wx.cell(r, 2, None).fill = in_fill
-            wx.cell(r, 3, '=UPPER(SUBSTITUTE(SUBSTITUTE(A%d,"0x",""),"0X",""))' % r)
+            ca = wx.cell(r, 1, None); ca.fill = in_fill; ca.number_format = "@"
+            cb = wx.cell(r, 2, None); cb.fill = in_fill; cb.number_format = "@"
+            # 地址与值都填了才算一条（半行粘贴不会被误判为"全关"，修 1.5）
+            wx.cell(r, 3, '=IF(OR(A%d="",B%d=""),"",UPPER(SUBSTITUTE(SUBSTITUTE(A%d,"0x",""),"0X","")))' % (r, r, r))
         wx.column_dimensions["C"].hidden = True
-        for j, h in enumerate(["信号", "地址", "bit", "寄存器", "该寄存器值", "bit值", "状态"], 5):  # 列 E..K
+        for j, h in enumerate(["信号", "地址", "bit", "寄存器", "该寄存器值", "字段值", "状态"], 5):  # 列 E..K
             wx.cell(2, j, h).font = bold
         for i, x in enumerate(bd, 3):
             key = 'UPPER(SUBSTITUTE(SUBSTITUTE(F%d,"0x",""),"0X",""))' % i
-            wx.cell(i, 5, x["sig"]); wx.cell(i, 6, x["addr"]); wx.cell(i, 7, x["bit"]); wx.cell(i, 8, x["reg"])
+            lo, wid = x["lo"], x["width"]
+            wx.cell(i, 5, x["sig"]); wx.cell(i, 6, x["addr"]); wx.cell(i, 7, x["bit_str"]); wx.cell(i, 8, x["reg"])
             wx.cell(i, 9, '=IFERROR(INDEX($B:$B,MATCH(%s,$C:$C,0)),"")' % key)
-            wx.cell(i, 10, '=IF(I%d="","",MOD(INT(HEX2DEC(SUBSTITUTE(SUBSTITUTE(I%d,"0x",""),"0X",""))/2^G%d),2))' % (i, i, i))
-            wx.cell(i, 11, '=IF(J%d=1,"● ON",IF(J%d=0,"off",""))' % (i, i))
+            wx.cell(i, 10, '=IFERROR(IF(I%d="","",MOD(INT(HEX2DEC(SUBSTITUTE(SUBSTITUTE(I%d,"0x",""),"0X",""))/2^%d),2^%d)),"?")' % (i, i, lo, wid))
+            if wid == 1:
+                wx.cell(i, 11, '=IF(J%d="","",IF(J%d=1,"● ON","off"))' % (i, i))
+            else:
+                wx.cell(i, 11, '=IF(J%d="","","值 "&J%d)' % (i, i))   # 多位字段：显字段值，不误当 ON/off
         wx.auto_filter.ref = "E2:K%d" % (2 + len(bd))
-        for cc, w in {"A": 14, "B": 10, "E": 30, "F": 13, "G": 5, "H": 16, "I": 12, "J": 6, "K": 8}.items():
+        for cc, w in {"A": 14, "B": 10, "E": 30, "F": 13, "G": 6, "H": 16, "I": 12, "J": 7, "K": 9}.items():
             wx.column_dimensions[cc].width = w
         wx.freeze_panes = "A3"
     cols = ["步骤", "操作", "地址 ADDR", "值 VALUE", "寄存器/模块", "信号变化(bit:前→后)"]
@@ -812,6 +837,9 @@ def render_xlsx(testcases, path, reference=None):
         ws = wb.create_sheet(nm)
         ws.cell(1, 1, "%s  %s  |  reg_group=%s" % (tc.get("mode"), tc.get("mode_name") or "", tc.get("reg_group"))).font = bold
         ws.cell(2, 1, "累积逐级关闭：每步先发本段写、再测总电流；相邻步电流差 = 该级功耗。")
+        mw = tc.get("warnings") or (tc.get("diagnostics") or {}).get("warnings") or []
+        if mw:
+            ws.cell(3, 1, "⚠ 模式级：" + "；".join(str(x) for x in mw)).font = bold
         for c, h in enumerate(cols, 1):
             cell = ws.cell(4, c, h); cell.font = bold; cell.fill = hdr_fill
         r = 5
@@ -830,12 +858,23 @@ def render_xlsx(testcases, path, reference=None):
                     cc.fill = base_fill
             r += 1
         for st in tc["steps"]:
+            node = (st.get("off_node") or "").split("/")[-1]
+            hlabel, hop = "step %d" % st["index"], "OFF %s" % st["off_label"]
+            tail = "；".join(list(st.get("warnings") or []) + ([st["note"]] if st.get("note") else []))
+            if not st["writes"]:
+                # 空步骤：本级门已被前面共用位提前关掉，仍是一个测量点 —— 必须保留(修 1.8)
+                cells = [hlabel, hop, "", "", node, "（本级门已被前面共用位提前关，仍是测量点）" + ("；" + tail if tail else "")]
+                for c, v in enumerate(cells, 1):
+                    ws.cell(r, c, v).fill = step_fill
+                r += 1
+                continue
             for i, w in enumerate(st["writes"]):
                 ftxt = ", ".join("%s[%s]:%d→%d" % (f["signal"], f["bit"], f["before"], f["after"])
                                  for f in w.get("fields", []))
-                row = ["step %d" % st["index"] if i == 0 else "",
-                       "OFF %s" % st["off_label"] if i == 0 else "",
-                       w["addr"], w["value"], (st.get("off_node") or "").split("/")[-1], ftxt]
+                if i == 0 and tail:
+                    ftxt = (ftxt + "   ⚠ " + tail) if ftxt else ("⚠ " + tail)
+                row = [hlabel if i == 0 else "", hop if i == 0 else "",
+                       w["addr"], w["value"], node, ftxt]
                 for c, v in enumerate(row, 1):
                     cc = ws.cell(r, c, v)
                     if i == 0:
