@@ -644,6 +644,93 @@ def export_xlsx(conn, out_path, all_runs=False):
     wb.save(out_path)
 
 
+def cmd_summary_export(conn, out_path):
+    """人直接看的功耗表：总览（每模式一行）+ 模块×模式矩阵（µA）。"""
+    runs_all = conn.execute(
+        "SELECT run_id,mode,chip,temp_c,src_file,run_ts FROM runs ORDER BY mode,chip,run_ts").fetchall()
+    latest = {}
+    for r in runs_all:
+        latest[(r[1], r[2])] = r  # 同 mode+chip 取最新
+    runs = sorted(latest.values(), key=lambda r: (r[1], r[2]))
+    multi_chip = len({r[2] for r in runs}) > 1
+
+    def col_title(mode, chip):
+        return f"{mode}({chip})" if multi_chip else mode
+
+    wb = openpyxl.Workbook()
+
+    # ---- 总览
+    ws = wb.active
+    ws.title = "总览"
+    ws.append(["Mode", "Chip", "Temp_C", "测试时间", "Init电流_mA", "锁定后总电流_mA",
+               "模块合计_mA", "关完残留_mA", "模块组数", "源文件"])
+    per_run = {}
+    for run_id, mode, chip, temp, src, run_ts in runs:
+        init_row = conn.execute(
+            "SELECT current_ma FROM meas_raw WHERE run_id=? AND seq_idx=1 AND kind='init'"
+            " AND current_ma IS NOT NULL ORDER BY row_idx LIMIT 1", (run_id,)).fetchone()
+        base_row = conn.execute(
+            "SELECT current_ma FROM meas_raw WHERE run_id=? AND seq_idx=1 AND kind='lock'"
+            " AND current_ma IS NOT NULL ORDER BY row_idx DESC LIMIT 1", (run_id,)).fetchone()
+        if base_row is None:
+            base_row = init_row
+        groups = conn.execute(
+            "SELECT step_order,group_disp,step_name,current_ua,note FROM meas_module"
+            " WHERE run_id=? ORDER BY step_order", (run_id,)).fetchall()
+        base = base_row[0] if base_row else None
+        total_ua = sum(g[3] for g in groups)
+        ws.append([mode, chip, temp, run_ts,
+                   rnd(init_row[0], 4) if init_row else None,
+                   rnd(base, 4) if base is not None else None,
+                   rnd(total_ua / 1000.0, 4),
+                   rnd(base - total_ua / 1000.0, 4) if base is not None else None,
+                   len(groups), os.path.basename(src)])
+        per_run[(mode, chip)] = groups
+    style_sheet(ws, [16, 7, 8, 17, 12, 15, 12, 12, 9, 46])
+
+    # ---- 模块×模式矩阵（µA）
+    ws = wb.create_sheet("模块矩阵_uA")
+    col_keys = [(r[1], r[2]) for r in runs]
+    ws.append(["编号", "模块(OFF步名)"] + [col_title(m, c) for m, c in col_keys] + ["备注"])
+    matrix, order_sum, order_cnt, notes = {}, {}, {}, {}
+    for (mode, chip), groups in per_run.items():
+        for step_order, disp, step_name, ua, note in groups:
+            key = (disp, step_name)
+            matrix.setdefault(key, {})[(mode, chip)] = ua
+            order_sum[key] = order_sum.get(key, 0) + step_order
+            order_cnt[key] = order_cnt.get(key, 0) + 1
+            if note:
+                keep = "；".join(x for x in note.split("；")
+                                 if "不在被测LDO" in x or "映射" in x and "未映射" not in x)
+                if keep:
+                    notes[key] = keep
+    keys = sorted(matrix, key=lambda k: (order_sum[k] / order_cnt[k], str(k[0])))
+    for key in keys:
+        disp, step_name = key
+        row = [disp, step_name]
+        row += [rnd(matrix[key].get(ck), 1) for ck in col_keys]
+        row.append(notes.get(key, ""))
+        ws.append(row)
+    total_row = ["合计", "Σ模块(µA)"]
+    for ck in col_keys:
+        total_row.append(rnd(sum(matrix[k][ck] for k in keys if ck in matrix[k]), 1))
+    total_row.append("")
+    ws.append(total_row)
+    for c in ws[ws.max_row]:
+        c.font = Font(bold=True)
+    style_sheet(ws, [13, 26] + [16] * len(col_keys) + [38])
+
+    wb.save(out_path)
+    return len(runs), len(keys)
+
+
+def cmd_summary(args):
+    conn = open_db(args.db)
+    n_runs, n_rows = cmd_summary_export(conn, args.out)
+    conn.close()
+    print(f"[完成] 功耗表: {args.out}（{n_runs} 个模式，矩阵 {n_rows} 行）")
+
+
 # ---------------------------------------------------------------- 命令
 
 def walk_xlsx(root, skip_dirs, exclude_globs=()):
@@ -798,6 +885,11 @@ def main():
     e.add_argument("--out", required=True)
     e.add_argument("--all-runs", action="store_true")
     e.set_defaults(func=cmd_export)
+
+    m = sub.add_parser("summary", help="导出人直接看的功耗表（总览+模块×模式矩阵）")
+    m.add_argument("--db", required=True)
+    m.add_argument("--out", required=True)
+    m.set_defaults(func=cmd_summary)
 
     args = ap.parse_args()
     args.func(args)
