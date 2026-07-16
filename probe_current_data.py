@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-probe_current_data.py — 电流数据探查脚本 v2（在数据机上运行，单文件，仅依赖 openpyxl）
+probe_current_data.py — 电流数据探查脚本 v3（在数据机上运行，单文件，仅依赖 openpyxl）
 
-对数据根目录做一次结构+数据快照，输出一个 JSON：
-  - 目录树（文件名/大小/修改时间），全递归，与层级无关
-  - 每个 xlsx 的 tab 列表
-  - 仿真长表：不认文件名，扫描所有工作簿的所有 tab，表头含 ID+Mode+Current
-    （且有 simulation/Unit/Tier 之一）即整页 dump
-  - 实测：任意层级下匹配 Result*.xlsx 的文件，按表头定位 NO./Mode/Current/Temperature 列
-    并 dump；其他工作簿里长得像实测表的 tab 只打标记不 dump
+对数据根目录做一次结构+数据快照，输出紧凑 JSON（同时生成 .gz 压缩版，优先传 .gz）：
+  - 目录树 + 每个 xlsx 的 tab 列表（全递归，与层级无关）
+  - 仿真长表：不认文件名，任何 tab 表头含 ID+Mode+Current（且有 simulation/Unit/Tier
+    之一）即整页 dump
+  - 实测 Result*.xlsx：按表头定位 NO./Mode/Current_mA/Temperature 列。
+    列匹配带优先级：带单位后缀的 Current_mA 优先于裸 Current（测试项开关列），
+    Temperature 开头优先于 Vtemp。只 dump 测量区的行（有电流值或 Init/Lock/OFF/chamber 行），
+    测试计划行不要。表头模板跨文件去重。
 
 用法：
   python probe_current_data.py <数据根目录>
-  # 生成 <根目录>\probe_dump.json，拷回开发机后用 mirror_from_probe.py 重建本地镜像
+  # 生成 <根目录>\probe_dump.json 和 probe_dump.json.gz，拷 .gz 回开发机
 
 不改动任何原文件，只读。
 """
 import argparse
 import datetime
 import fnmatch
+import gzip
 import json
 import os
+import re
 import sys
 
 import openpyxl
 
-MAX_ROWS = 2000    # 每个 sheet 最多 dump 的数据行数，防意外超大表
+MAX_ROWS = 2000    # 每个 sheet 最多 dump 的数据行数
 SCAN_ROWS = 30     # 找表头时扫描的行数
+MAX_SAMPLE_CELLS = 120
+MAX_CELL_STR = 100
+# 本套工具自己的输出，扫描时跳过（防自吞：current_db 导出簿的 Sim_long 页长得像仿真表）
+EXCLUDE_GLOBS = ["Current_compare_pivot*.xlsx", "probe_dump*", "current.db"]
 
 
 def norm(v):
@@ -43,6 +50,8 @@ def cell(row, idx):
 def jval(v):
     if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
         return str(v)
+    if isinstance(v, str) and len(v) > MAX_CELL_STR:
+        return v[:MAX_CELL_STR] + "…"
     return v
 
 
@@ -52,27 +61,48 @@ def match_sim_header(row):
     return ("id" in names and "mode" in names
             and any(n.startswith("current") for n in names)
             and (any(n.startswith("simulation") for n in names)
-                 or "unit" in names or "tier" in names))
+                 or "unit" in names))  # 注意: 不认 tier——本工具导出的 Sim_long 页有 tier 列
 
 
 def match_result_header(row):
-    """实测表表头：NO. + Current*。返回列映射 dict 或 None。"""
-    no_col = mode_col = cur_col = temp_col = None
+    """实测表表头。带优先级：Current_mA(带单位) > Current(裸)；Temperature* > temp。
+    返回列映射 dict（含 unit）或 None。"""
+    no_col = mode_col = None
+    cur_exact = cur_bare = temp_exact = temp_bare = None
     for j, c in enumerate(row):
         n = norm(c)
-        if n in ("no.", "no", "no．"):
+        if n in ("no.", "no", "no．") and no_col is None:
             no_col = j
         elif n == "mode" and mode_col is None:
             mode_col = j
-        elif n.startswith("current") and cur_col is None:
-            cur_col = j
-        elif "temp" in n and temp_col is None:
-            temp_col = j
+        elif re.fullmatch(r"current[_\s]*[munµμ]?a", n) and cur_exact is None:
+            cur_exact = j
+        elif n == "current" and cur_bare is None:
+            cur_bare = j
+        elif n.startswith("temperature") and temp_exact is None:
+            temp_exact = j
+        elif n == "temp" and temp_bare is None:
+            temp_bare = j
+    cur_col = cur_exact if cur_exact is not None else cur_bare
+    temp_col = temp_exact if temp_exact is not None else temp_bare
     if no_col is None or cur_col is None:
         return None
     if mode_col is None:
         mode_col = no_col + 1
-    return {"no": no_col, "mode": mode_col, "cur": cur_col, "temp": temp_col}
+    unit = "ma"
+    m = re.fullmatch(r"current[_\s]*([munµμ]?a)", norm(row[cur_col]))
+    if m and m.group(1):
+        unit = m.group(1)
+    return {"no": no_col, "mode": mode_col, "cur": cur_col, "temp": temp_col, "unit": unit}
+
+
+def is_meas_row(no_raw, label, cur):
+    """测量区行：有电流值，或是序列结构行（Init/Lock/OFF/chamber）。"""
+    if cur is not None:
+        return True
+    ln, nn = norm(label), norm(no_raw)
+    return (ln.startswith(("init", "lock", "off"))
+            or "chamber" in ln or "chamber" in nn)
 
 
 def scan_workbook(path):
@@ -91,7 +121,7 @@ def scan_workbook(path):
                 if cols is not None:
                     info["result_sheets"][sn] = {
                         "header_row": i,
-                        "key_cols_1based": {k: (v + 1 if v is not None else None)
+                        "key_cols_1based": {k: (v + 1 if isinstance(v, int) else v)
                                             for k, v in cols.items()}}
                     break
         return info, None
@@ -122,13 +152,13 @@ def dump_sheet_rows(path, sheet):
 
 
 def dump_result(path, sheet, hdr_idx, cols_1b):
-    """按已定位的表头 dump 实测关键列 + 前 2 行全列样本。"""
-    cols = {k: (v - 1 if v is not None else None) for k, v in cols_1b.items()}
+    """按已定位的表头 dump 实测关键列（只留测量区行）+ 1 行全列样本。"""
+    cols = {k: (v - 1 if isinstance(v, int) else v) for k, v in cols_1b.items()}
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb[sheet]
         hdr_row = None
-        rows, samples = [], []
+        rows, samples, n_skipped = [], [], 0
         for i, row in enumerate(ws.iter_rows(values_only=True), 1):
             if i == hdr_idx:
                 hdr_row = row
@@ -141,18 +171,23 @@ def dump_result(path, sheet, hdr_idx, cols_1b):
             temp = cell(row, cols["temp"]) if cols["temp"] is not None else None
             if no_raw is None and label is None and cur is None:
                 continue
+            if not is_meas_row(no_raw, label, cur):
+                n_skipped += 1
+                continue
             rows.append([i, jval(no_raw), jval(label), jval(cur), jval(temp)])
-            if len(samples) < 2:
-                samples.append([[j + 1,
-                                 str(cell(hdr_row, j)) if cell(hdr_row, j) is not None else "",
-                                 jval(v)] for j, v in enumerate(row) if v is not None])
+            if not samples and cur is not None:
+                cells = [[j + 1,
+                          str(cell(hdr_row, j)) if cell(hdr_row, j) is not None else "",
+                          jval(v)] for j, v in enumerate(row) if v is not None]
+                samples.append(cells[:MAX_SAMPLE_CELLS])
             if len(rows) >= MAX_ROWS:
                 break
         headers = [[j + 1, str(v)] for j, v in enumerate(hdr_row or []) if v not in (None, "")]
         return {"sheet": sheet, "header_row": hdr_idx,
                 "key_cols_1based": cols_1b, "headers": headers,
                 "row_fields": ["row_idx", "no_raw", "mode_label", "current", "temp"],
-                "rows": rows, "sample_rows_full": samples}
+                "rows": rows, "rows_skipped_non_meas": n_skipped,
+                "sample_rows_full": samples}
     finally:
         wb.close()
 
@@ -160,7 +195,7 @@ def dump_result(path, sheet, hdr_idx, cols_1b):
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    ap = argparse.ArgumentParser(description="电流数据探查 v2：对数据根目录做 JSON 快照（全递归）")
+    ap = argparse.ArgumentParser(description="电流数据探查 v3：紧凑 JSON 快照（全递归）")
     ap.add_argument("root", help="数据根目录")
     ap.add_argument("-o", "--out", help="输出 JSON 路径（默认 <root>\\probe_dump.json）")
     ap.add_argument("--result-glob", default="Result*.xlsx", help="实测文件名通配符")
@@ -171,10 +206,17 @@ def main():
         raise SystemExit(f"[错误] 目录不存在: {root}")
     out_path = args.out or os.path.join(root, "probe_dump.json")
 
-    dump = {"probe_version": 2,
+    dump = {"probe_version": 3,
             "probed_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "root": root, "tree": [], "workbooks": {}, "detected": {},
-            "sim": [], "results": []}
+            "header_profiles": [], "sim": [], "results": []}
+
+    def profile_id(headers):
+        for i, p in enumerate(dump["header_profiles"]):
+            if p == headers:
+                return i
+        dump["header_profiles"].append(headers)
+        return len(dump["header_profiles"]) - 1
 
     xlsx_files = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -189,11 +231,11 @@ def main():
                                      .strftime("%Y-%m-%d %H:%M:%S")})
             except OSError:
                 continue
-            if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$"):
-                xlsx_files.append((rel, full,
-                                   os.path.basename(dirpath) if rel_dir != "." else ""))
+            if (f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$")
+                    and not any(fnmatch.fnmatch(f, pat) for pat in EXCLUDE_GLOBS)):
+                xlsx_files.append((rel, full))
 
-    for rel, full, folder in xlsx_files:
+    for rel, full in xlsx_files:
         info, err = scan_workbook(full)
         if info is None:
             dump["workbooks"][rel] = {"error": err}
@@ -216,12 +258,13 @@ def main():
             for sn, meta in info["result_sheets"].items():
                 try:
                     r = dump_result(full, sn, meta["header_row"], meta["key_cols_1based"])
+                    r["header_profile"] = profile_id(r.pop("headers"))
                     r["file"] = os.path.basename(rel)
                     r["folder"] = os.path.dirname(rel)
-                    r["folder_name"] = folder
                     dump["results"].append(r)
-                    print(f"[实测] {rel} / {sn} -> {len(r['rows'])} 行 "
-                          f"关键列={r['key_cols_1based']}")
+                    print(f"[实测] {rel} / {sn} -> 测量区 {len(r['rows'])} 行"
+                          f"（滤掉计划行 {r['rows_skipped_non_meas']}）"
+                          f" 关键列={r['key_cols_1based']}")
                 except Exception as e:
                     dump["results"].append({"file": os.path.basename(rel),
                                             "folder": os.path.dirname(rel),
@@ -234,18 +277,20 @@ def main():
             print(f"[实测] {rel} -> 没找到表头！tab={info['sheets']}")
         elif info["result_sheets"]:
             dump["detected"][rel] = {"result_like_sheets": info["result_sheets"]}
-            print(f"[标记] {rel} 里有疑似实测表（未 dump）: {list(info['result_sheets'])}")
 
     if not dump["sim"]:
         print("\n[警告] 没有发现仿真长表（表头需含 ID/Mode/Current + simulation|Unit|Tier）！")
-        print("       请确认仿真数据工作簿是否在这个目录里。")
+        print("       请把仿真数据工作簿放进这个目录（文件名任意）后重跑。")
 
+    blob = json.dumps(dump, ensure_ascii=False, separators=(",", ":"), default=str)
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(dump, f, ensure_ascii=False, indent=1, default=str)
-    size_kb = os.path.getsize(out_path) / 1024
-    print(f"\n[完成] 快照已写入 {out_path}（{size_kb:.0f} KB）")
+        f.write(blob)
+    gz_path = out_path + ".gz"
+    with gzip.open(gz_path, "wt", encoding="utf-8") as f:
+        f.write(blob)
+    print(f"\n[完成] {out_path}（{os.path.getsize(out_path)/1024:.0f} KB）")
+    print(f"       {gz_path}（{os.path.getsize(gz_path)/1024:.0f} KB）<- 优先传这个")
     print(f"       仿真表 {len(dump['sim'])} 张 / 实测文件 {len(dump['results'])} 个")
-    print("把这个 JSON 拷回开发机，用 mirror_from_probe.py 重建本地镜像。")
 
 
 if __name__ == "__main__":

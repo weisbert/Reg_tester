@@ -57,6 +57,7 @@ DEFAULT_CONFIG = {
         "mode_map": "文件夹名 -> 仿真表 Mode 名 的映射（同名可省略）",
         "ldo_reparent": "子模块ID -> 父模块ID：子模块不在被测 LDO 下，实测/仿真都并入父模块组",
         "label_groups": "NO. 列非数字标签 -> 仿真模块ID列表，如 {\"DCO5G\": [21]}",
+        "exclude_globs": "扫描时按文件名跳过的通配符（本工具自己的输出必须在内，防自吞）",
     },
     "sim_workbook": None,
     "sim_sheet": "Current_data",
@@ -66,6 +67,7 @@ DEFAULT_CONFIG = {
     "mode_map": {},
     "ldo_reparent": {"8": "6", "28": "26"},
     "label_groups": {},
+    "exclude_globs": ["Current_compare_pivot*.xlsx", "probe_dump*"],
 }
 
 
@@ -167,7 +169,7 @@ def match_sim_header(row):
     return ("id" in names and "mode" in names
             and any(n.startswith("current") for n in names)
             and (any(n.startswith("simulation") for n in names)
-                 or "unit" in names or "tier" in names))
+                 or "unit" in names))  # 注意: 不认 tier——本工具导出的 Sim_long 页有 tier 列
 
 
 def find_sim_header(ws):
@@ -254,6 +256,38 @@ def ingest_sim(conn, xlsx, sheet_name):
 
 # ---------------------------------------------------------------- 实测表解析
 
+def match_result_header(row):
+    """实测表表头。带优先级：Current_mA(带单位) > Current(裸开关列)；Temperature* > temp
+    （防撞 Vtemp）。返回列映射 dict（含 unit）或 None。"""
+    no_col = mode_col = None
+    cur_exact = cur_bare = temp_exact = temp_bare = None
+    for j, c in enumerate(row):
+        n = norm(c)
+        if n in ("no.", "no", "no．") and no_col is None:
+            no_col = j
+        elif n == "mode" and mode_col is None:
+            mode_col = j
+        elif re.fullmatch(r"current[_\s]*[munµμ]?a", n) and cur_exact is None:
+            cur_exact = j
+        elif n == "current" and cur_bare is None:
+            cur_bare = j
+        elif n.startswith("temperature") and temp_exact is None:
+            temp_exact = j
+        elif n == "temp" and temp_bare is None:
+            temp_bare = j
+    cur_col = cur_exact if cur_exact is not None else cur_bare
+    temp_col = temp_exact if temp_exact is not None else temp_bare
+    if no_col is None or cur_col is None:
+        return None
+    if mode_col is None:
+        mode_col = no_col + 1
+    unit = "ma"
+    m = re.fullmatch(r"current[_\s]*([munµμ]?a)", norm(row[cur_col]))
+    if m and m.group(1):
+        unit = m.group(1)
+    return {"no": no_col, "mode": mode_col, "cur": cur_col, "temp": temp_col, "unit": unit}
+
+
 def find_result_sheet(wb, sheet_name):
     """返回 (worksheet, 表头行号, 列映射)。按表头名定位，不按列字母。"""
     names = [sheet_name] if sheet_name else wb.sheetnames
@@ -262,37 +296,20 @@ def find_result_sheet(wb, sheet_name):
             continue
         ws = wb[sn]
         for i, row in enumerate(ws.iter_rows(min_row=1, max_row=30, values_only=True), 1):
-            no_col = mode_col = cur_col = temp_col = None
-            for j, c in enumerate(row):
-                n = norm(c)
-                if n in ("no.", "no", "no．"):
-                    no_col = j
-                elif n == "mode" and mode_col is None:
-                    mode_col = j
-                elif n.startswith("current") and cur_col is None:
-                    cur_col = j
-                elif "temp" in n and temp_col is None:
-                    temp_col = j
-            if no_col is not None and cur_col is not None:
-                if mode_col is None:
-                    mode_col = no_col + 1
-                unit = "ma"
-                m = re.search(r"current[_\s]*([munµμ]?a)", norm(row[cur_col]))
-                if m:
-                    unit = m.group(1)
-                return ws, i, {"no": no_col, "mode": mode_col, "cur": cur_col,
-                               "temp": temp_col, "unit": unit}
+            cols = match_result_header(row)
+            if cols is not None:
+                return ws, i, cols
     return None, None, None
 
 
 def classify_rows(ws, hdr, cols):
     """逐行分类并做差。返回 (rows, temp)。
-    rows: dict(row_idx, no_raw, label, cur_ma, delta_ma, temp, seq, kind)"""
+    rows: dict(row_idx, no_raw, label, cur_ma, delta_ma, temp, seq, kind)
+    两遍扫描：先看有没有显式 Init 行——有的话序列只从 Init 行开始，
+    Init 之前的带电流行（其他测试项）留在 seq=0 不参与做差；
+    全表都没有 Init 行时，才把第一个带电流行当作序列起点。"""
     factor_to_ma = UNIT_TO_UA.get(cols["unit"], 1000.0) / 1000.0  # 原始单位 -> mA
-    out = []
-    seq = 0
-    prev_cur = None
-    temp_first = None
+    raw = []
     for i, row in enumerate(ws.iter_rows(min_row=hdr + 1, values_only=True), hdr + 1):
         no_raw = cell(row, cols["no"])
         label = cell(row, cols["mode"])
@@ -300,10 +317,18 @@ def classify_rows(ws, hdr, cols):
         temp = as_float(cell(row, cols["temp"])) if cols["temp"] is not None else None
         if no_raw is None and label is None and cur is None:
             continue
+        raw.append((i, no_raw, label, cur, temp))
+    has_init = any(norm(label).startswith("init") for _i, _n, label, _c, _t in raw)
+
+    out = []
+    seq = 0
+    prev_cur = None
+    temp_first = None
+    for i, no_raw, label, cur, temp in raw:
         ln, nn = norm(label), norm(no_raw)
         if "chamber" in ln or "chamber" in nn:
             kind = "chamber"
-        elif ln.startswith("init") or ln.startswith("inital") or ln.startswith("initail"):
+        elif ln.startswith("init"):
             kind = "init"
             seq += 1
         elif "lock" in ln:
@@ -312,8 +337,8 @@ def classify_rows(ws, hdr, cols):
             kind = "off"
         else:
             kind = "other"
-        if seq == 0 and cur is not None:
-            seq = 1  # 没有显式 Init 行时，第一段视为正式测量
+        if seq == 0 and not has_init and cur is not None:
+            seq = 1  # 整表无显式 Init 行时，第一段视为正式测量
             if kind == "other":
                 kind = "init"
         delta = None
@@ -321,8 +346,10 @@ def classify_rows(ws, hdr, cols):
             delta = prev_cur * factor_to_ma - cur * factor_to_ma
         if seq == 1 and cur is not None and kind != "chamber":
             prev_cur = cur
-        if temp is not None and temp_first is None:
+        if temp is not None and temp_first is None and seq >= 1:
             temp_first = temp
+        if kind == "other" and cur is None and seq == 0:
+            continue  # Init 之前的测试计划行，不入库
         out.append(dict(row_idx=i, no_raw=no_raw, label=label,
                         cur_ma=(cur * factor_to_ma) if cur is not None else None,
                         delta_ma=delta, temp=temp, seq=seq, kind=kind))
@@ -619,13 +646,16 @@ def export_xlsx(conn, out_path, all_runs=False):
 
 # ---------------------------------------------------------------- 命令
 
-def walk_xlsx(root, skip_dirs):
-    """递归列出 root 下所有 xlsx（跳过 skip_dirs 子树和 ~$ 锁文件）。"""
+def walk_xlsx(root, skip_dirs, exclude_globs=()):
+    """递归列出 root 下所有 xlsx（跳过 skip_dirs 子树、~$ 锁文件和排除名单）。"""
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for f in sorted(filenames):
-            if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$"):
-                yield os.path.join(dirpath, f)
+            if not f.lower().endswith((".xlsx", ".xlsm")) or f.startswith("~$"):
+                continue
+            if any(fnmatch.fnmatch(f, pat) for pat in exclude_globs):
+                continue
+            yield os.path.join(dirpath, f)
 
 
 def find_sim_workbook(root, config):
@@ -634,9 +664,10 @@ def find_sim_workbook(root, config):
         p = config["sim_workbook"]
         return (p if os.path.isabs(p) else os.path.join(root, p)), config.get("sim_sheet")
     skip = set(config.get("skip_dirs") or [])
+    excl = list(config.get("exclude_globs") or [])
     sim_sheet = norm(config.get("sim_sheet", "Current_data"))
     cands = []
-    for path in walk_xlsx(root, skip):
+    for path in walk_xlsx(root, skip, excl):
         try:
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
             for sn in wb.sheetnames:
@@ -684,9 +715,12 @@ def cmd_build(args):
 
     mode_map = config.get("mode_map") or {}
     skip = set(config.get("skip_dirs") or [])
+    excl = list(config.get("exclude_globs") or [])
+    out = args.out or os.path.join(root, "Current_compare_pivot.xlsx")
+    excl.append(os.path.basename(out))
     result_glob = config.get("result_glob", "Result*.xlsx")
     n_runs = 0
-    for f in walk_xlsx(root, skip):
+    for f in walk_xlsx(root, skip, excl):
         if not fnmatch.fnmatch(os.path.basename(f), result_glob):
             continue
         d = os.path.basename(os.path.dirname(f))  # 模式 = 所在文件夹名
@@ -698,7 +732,6 @@ def cmd_build(args):
     if n_runs == 0:
         print("[警告] 没有扫到任何 Result 文件")
 
-    out = args.out or os.path.join(root, "Current_compare_pivot.xlsx")
     export_xlsx(conn, out, all_runs=args.all_runs)
     conn.close()
     print(f"[完成] 数据库: {db_path}")
