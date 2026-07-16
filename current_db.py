@@ -585,7 +585,7 @@ def export_xlsx(conn, out_path, all_runs=False):
                 if miss:
                     notes.append(f"仿真表缺ID: {miss}")
             elif sim_ids and not mode_in_sim:
-                notes.append(f"仿真表无模式 {mode}")
+                notes.append("仿真表未导入" if not sim_modes else f"仿真表无模式 {mode}")
             note_s = "；".join(n for n in notes if n)
             diff = (meas_ua - sim_post) if (sim_post is not None) else None
             ratio = (meas_ua / sim_post) if sim_post else None
