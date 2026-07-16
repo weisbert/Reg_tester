@@ -55,7 +55,8 @@ DEFAULT_CONFIG = {
         "result_sheet": "实测数据所在 tab；null=自动扫描含 NO./Current 表头的第一个 tab",
         "skip_dirs": "扫描 root 子目录时跳过的文件夹",
         "mode_map": "文件夹名 -> 仿真表 Mode 名 的映射（同名可省略）",
-        "ldo_reparent": "子模块ID -> 父模块ID：子模块不在被测 LDO 下，实测/仿真都并入父模块组",
+        "ldo_reparent": "子模块ID -> 父模块ID：子模块不在被测 LDO 下，其实测 delta 并入父模块组",
+        "ldo_reparent_sim_add_child": "归并时仿真侧是否把子模块电流也加进对比和（子模块电流不在被测轨上时应为 false）",
         "label_groups": "NO. 列非数字标签 -> 仿真模块ID列表，如 {\"DCO5G\": [21]}",
         "exclude_globs": "扫描时按文件名跳过的通配符（本工具自己的输出必须在内，防自吞）",
     },
@@ -66,6 +67,7 @@ DEFAULT_CONFIG = {
     "skip_dirs": ["Simulation", "自动化"],
     "mode_map": {},
     "ldo_reparent": {"8": "6", "28": "26"},
+    "ldo_reparent_sim_add_child": False,
     "label_groups": {},
     "exclude_globs": ["Current_compare_pivot*.xlsx", "probe_dump*"],
 }
@@ -397,10 +399,12 @@ def build_groups(rows, config):
                     f"模块{child}不在被测LDO下（父模块{parent}本次未测，未归并）"
             continue
         parent_step["delta_ua"] += child_step["delta_ua"]
-        parent_step["sim_ids"] = (parent_step["sim_ids"] or []) + [child]
+        add_child_sim = bool(config.get("ldo_reparent_sim_add_child", False))
+        if add_child_sim:
+            parent_step["sim_ids"] = (parent_step["sim_ids"] or []) + [child]
         parent_step["disp"] = parent_step["disp"] + f"+{child}"
         parent_step["note"] = (parent_step["note"] + "；" if parent_step["note"] else "") + \
-            f"含模块{child}（{child}不在被测LDO下，实测与仿真均并入）"
+            f"含模块{child}的实测delta（{child}不在被测LDO下，仿真侧{'已并入' if add_child_sim else '不计'}{child}）"
         absorbed[child_step["row_idx"]] = parent_step["disp"]
     steps = [s for s in steps if s["row_idx"] not in absorbed]
     for order, s in enumerate(steps, 1):
@@ -508,10 +512,10 @@ def sim_lookup(conn, mode, ids, stage):
 def module_names(conn, ids):
     names = []
     for mid in ids or []:
-        row = conn.execute(
-            "SELECT module_name FROM sim_current WHERE module_id=? AND module_name!='' LIMIT 1",
-            (mid,)).fetchone()
-        names.append(row[0] if row else f"ID{mid}")
+        rows = conn.execute(
+            "SELECT DISTINCT module_name FROM sim_current WHERE module_id=? AND module_name!=''"
+            " ORDER BY module_name", (mid,)).fetchall()
+        names.append("/".join(r[0] for r in rows) if rows else f"ID{mid}")
     return " + ".join(names)
 
 
