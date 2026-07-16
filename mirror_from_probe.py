@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mirror_from_probe.py — 用 probe_current_data.py 的 JSON 快照在本地重建数据镜像
+mirror_from_probe.py — 用 probe_current_data.py(v2) 的 JSON 快照在本地重建数据镜像
 
 重建内容（够 current_db.py 跑通即可，不还原 Result 里的寄存器列）：
-  - 仿真工作簿（Current_data 页全量）
-  - 各模式文件夹下的 Result 文件（NO./Mode/Current/Temperature 按原列号原行号写回）
+  - 仿真工作簿（按原相对路径、原 tab 名，整页写回）
+  - Result 文件（按原相对路径，NO./Mode/Current/Temperature 按原列号原行号写回）
 
 用法：
-  python mirror_from_probe.py probe_dump.json [-o private\\current_mirror]
+  python mirror_from_probe.py private\\probe_dump.json [-o private\\current_mirror]
   python current_db.py build --root private\\current_mirror --chip C1
 """
 import argparse
@@ -17,6 +17,12 @@ import os
 import sys
 
 import openpyxl
+
+
+def ensure_dir(path):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
 
 def main():
@@ -30,30 +36,36 @@ def main():
 
     with open(args.dump, "r", encoding="utf-8") as f:
         dump = json.load(f)
+    if dump.get("probe_version", 1) < 2:
+        print("[警告] 这是 v1 探查快照，建议用 v2 脚本重新探查（git pull 后重跑）")
     out_root = os.path.abspath(args.out)
     os.makedirs(out_root, exist_ok=True)
 
-    # 仿真工作簿
+    # 仿真工作簿：同一文件的多个 sim tab 合进一个工作簿
+    sim_books = {}
     for sim in dump.get("sim", []):
         if "error" in sim or not sim.get("rows"):
             print(f"[仿真] {sim.get('file')} 跳过（{sim.get('error', '无数据')}）")
             continue
+        sim_books.setdefault(sim["file"], []).append(sim)
+    for rel, sheets in sim_books.items():
         wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sim.get("sheet", "Current_data")
-        for row in sim["rows"]:
-            ws.append(row)
-        path = os.path.join(out_root, sim["file"])
+        for k, sim in enumerate(sheets):
+            ws = wb.active if k == 0 else wb.create_sheet()
+            ws.title = sim["sheet"]
+            for row in sim["rows"]:
+                ws.append(row)
+        path = os.path.join(out_root, rel)
+        ensure_dir(path)
         wb.save(path)
-        print(f"[仿真] {sim['file']} -> {len(sim['rows'])} 行")
+        print(f"[仿真] {rel} -> {sum(len(s['rows']) for s in sheets)} 行 / {len(sheets)} tab")
 
     # Result 文件
     for res in dump.get("results", []):
         if "error" in res:
             print(f"[实测] {res.get('folder')}/{res.get('file')} 跳过（{res['error']}）")
             continue
-        folder = os.path.join(out_root, res["folder"])
-        os.makedirs(folder, exist_ok=True)
+        rel = os.path.join(res.get("folder", ""), res["file"])
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = res.get("sheet", "Sheet1")
@@ -70,9 +82,10 @@ def main():
                 ws.cell(row=row_idx, column=cols["cur"], value=cur)
             if cols.get("temp") and temp is not None:
                 ws.cell(row=row_idx, column=cols["temp"], value=temp)
-        path = os.path.join(folder, res["file"])
+        path = os.path.join(out_root, rel)
+        ensure_dir(path)
         wb.save(path)
-        print(f"[实测] {res['folder']}/{res['file']} -> {len(res['rows'])} 行")
+        print(f"[实测] {rel} -> {len(res['rows'])} 行")
 
     print(f"\n[完成] 镜像根目录: {out_root}")
     print(f"下一步: python current_db.py build --root \"{out_root}\" --chip C1")

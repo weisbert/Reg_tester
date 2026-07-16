@@ -31,7 +31,7 @@ current_db.py — 电流数据库（阶段一：SQLite + pivot 长表导出）
 """
 import argparse
 import datetime
-import glob
+import fnmatch
 import json
 import os
 import re
@@ -161,6 +161,15 @@ def open_db(path):
 
 # ---------------------------------------------------------------- 仿真表导入
 
+def match_sim_header(row):
+    """仿真长表表头：ID + Mode + Current*，且有 simulation/Unit/Tier 佐证。"""
+    names = [norm(c) for c in row]
+    return ("id" in names and "mode" in names
+            and any(n.startswith("current") for n in names)
+            and (any(n.startswith("simulation") for n in names)
+                 or "unit" in names or "tier" in names))
+
+
 def find_sim_header(ws):
     for i, row in enumerate(ws.iter_rows(min_row=1, max_row=30, values_only=True), 1):
         names = [norm(c) for c in row]
@@ -198,9 +207,16 @@ def ingest_sim(conn, xlsx, sheet_name):
                 if norm(sn) == norm(sheet_name or "current_data"):
                     ws = wb[sn]
                     break
+        if ws is None:  # 按名字没找到 -> 按表头内容扫
+            for sn in wb.sheetnames:
+                cand = wb[sn]
+                if any(match_sim_header(r) for r in
+                       cand.iter_rows(min_row=1, max_row=30, values_only=True)):
+                    ws = cand
+                    break
         if ws is None:
-            raise SystemExit(f"[错误] {os.path.basename(xlsx)} 里找不到仿真 tab {sheet_name!r}，"
-                             f"现有 tab: {wb.sheetnames}")
+            raise SystemExit(f"[错误] {os.path.basename(xlsx)} 里找不到仿真 tab（按名 {sheet_name!r} "
+                             f"或按表头 ID/Mode/Current 都没命中），现有 tab: {wb.sheetnames}")
         hdr, cols = find_sim_header(ws)
         if hdr is None:
             raise SystemExit(f"[错误] 仿真 tab {ws.title!r} 找不到表头行（需含 ID/Mode/Current 列）")
@@ -603,21 +619,43 @@ def export_xlsx(conn, out_path, all_runs=False):
 
 # ---------------------------------------------------------------- 命令
 
+def walk_xlsx(root, skip_dirs):
+    """递归列出 root 下所有 xlsx（跳过 skip_dirs 子树和 ~$ 锁文件）。"""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for f in sorted(filenames):
+            if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$"):
+                yield os.path.join(dirpath, f)
+
+
 def find_sim_workbook(root, config):
+    """返回 (工作簿路径, tab名) 或 (None, None)。不认文件名，按表头内容全递归扫。"""
     if config.get("sim_workbook"):
         p = config["sim_workbook"]
-        return p if os.path.isabs(p) else os.path.join(root, p)
-    cands = sorted(glob.glob(os.path.join(root, "Current_all_mode*.xlsx")), reverse=True)
-    for c in cands:
+        return (p if os.path.isabs(p) else os.path.join(root, p)), config.get("sim_sheet")
+    skip = set(config.get("skip_dirs") or [])
+    sim_sheet = norm(config.get("sim_sheet", "Current_data"))
+    cands = []
+    for path in walk_xlsx(root, skip):
         try:
-            wb = openpyxl.load_workbook(c, read_only=True)
-            names = wb.sheetnames
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            for sn in wb.sheetnames:
+                if norm(sn) == sim_sheet or any(
+                        match_sim_header(r) for r in
+                        wb[sn].iter_rows(min_row=1, max_row=30, values_only=True)):
+                    cands.append((os.path.getmtime(path), path, sn))
+                    break
             wb.close()
-            if any(norm(n) == norm(config.get("sim_sheet", "Current_data")) for n in names):
-                return c
         except Exception:
             continue
-    return None
+    if not cands:
+        return None, None
+    cands.sort(reverse=True)
+    if len(cands) > 1:
+        print("[提示] 发现多个疑似仿真长表，取最新修改的；其余可在 config.sim_workbook 里指定：")
+        for _mt, p, sn in cands:
+            print(f"       {os.path.relpath(p, root)} / {sn}")
+    return cands[0][1], cands[0][2]
 
 
 def cmd_build(args):
@@ -633,32 +671,30 @@ def cmd_build(args):
         os.remove(db_path)  # build = 全量重建；增量请用 ingest-* 子命令
     conn = open_db(db_path)
 
-    sim_wb = args.sim or find_sim_workbook(root, config)
-    if sim_wb and os.path.exists(sim_wb):
-        n = ingest_sim(conn, sim_wb, config.get("sim_sheet", "Current_data"))
-        print(f"[仿真] {os.path.basename(sim_wb)} -> {n} 行")
+    if args.sim:
+        sim_wb, sim_sheet = args.sim, config.get("sim_sheet")
     else:
-        print("[警告] 未找到仿真工作簿（Current_all_mode*.xlsx），只导入实测；"
-              "可用 --sim 或 config.sim_workbook 指定")
+        sim_wb, sim_sheet = find_sim_workbook(root, config)
+    if sim_wb and os.path.exists(sim_wb):
+        n = ingest_sim(conn, sim_wb, sim_sheet)
+        print(f"[仿真] {os.path.relpath(sim_wb, root)} / {sim_sheet or '自动'} -> {n} 行")
+    else:
+        print("[警告] 未找到仿真长表（任意工作簿中表头含 ID/Mode/Current+simulation|Unit|Tier 的 tab），"
+              "只导入实测；可用 --sim 或 config.sim_workbook 指定")
 
     mode_map = config.get("mode_map") or {}
     skip = set(config.get("skip_dirs") or [])
+    result_glob = config.get("result_glob", "Result*.xlsx")
     n_runs = 0
-    for d in sorted(os.listdir(root)):
-        sub = os.path.join(root, d)
-        if not os.path.isdir(sub) or d in skip:
+    for f in walk_xlsx(root, skip):
+        if not fnmatch.fnmatch(os.path.basename(f), result_glob):
             continue
-        files = sorted(glob.glob(os.path.join(sub, config.get("result_glob", "Result*.xlsx"))))
-        if not files:
-            continue
+        d = os.path.basename(os.path.dirname(f))  # 模式 = 所在文件夹名
         mode = mode_map.get(d, d)
-        for f in files:
-            if os.path.basename(f).startswith("~$"):
-                continue
-            run_id, n_steps, temp, run_ts = ingest_run(conn, f, mode, args.chip, config)
-            n_runs += 1
-            print(f"[实测] {d} <- {os.path.basename(f)}  run#{run_id}  {n_steps} 个模块组  "
-                  f"{temp if temp is not None else '?'}°C  {run_ts}")
+        run_id, n_steps, temp, run_ts = ingest_run(conn, f, mode, args.chip, config)
+        n_runs += 1
+        print(f"[实测] {mode} <- {os.path.relpath(f, root)}  run#{run_id}  {n_steps} 个模块组  "
+              f"{temp if temp is not None else '?'}°C  {run_ts}")
     if n_runs == 0:
         print("[警告] 没有扫到任何 Result 文件")
 
