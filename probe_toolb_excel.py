@@ -7,10 +7,11 @@
 另有合并单元格/隐藏行列/公式/批注/宏 都可能承载工具B的执行语义。
 
 用法：
-    python probe_toolb_excel.py <工具B样例.xlsx/.xlsm> [--json out.json] [--rows 30] [--sheet NAME]
+    python probe_toolb_excel.py <工具B样例.xlsx/.xlsm> [--json out.json] [--rows 30] [--cols 0] [--sheet NAME]
 
   --json   完整结构落盘 JSON（★把这个文件带回来分析，控制台只是摘要）
   --rows   每个 sheet 顶部 dump 的行数（默认 30，0=不 dump）
+  --cols   每行最多探测的列数（默认 0=全部列；行 dump 只存非空格子，宽表不怕大）
   --sheet  只探测指定 sheet（默认全部，含隐藏 sheet）
 
 每个 sheet 报告：
@@ -52,8 +53,9 @@ def detect_repeat_groups(cells):
     return {b: n for b, n in Counter(base).items() if n >= 3}
 
 
-def probe_sheet(ws, ws_formula, dump_rows):
+def probe_sheet(ws, ws_formula, dump_rows, max_cols=0):
     """探测单个 sheet → dict。ws 来自 data_only=True 加载，ws_formula 来自 data_only=False。"""
+    from openpyxl.utils import get_column_letter
     info = {
         "name": ws.title,
         "state": ws.sheet_state,                      # visible / hidden / veryHidden
@@ -78,13 +80,19 @@ def probe_sheet(ws, ws_formula, dump_rows):
         info["validations"].append({"error_reading": repr(e)})
 
     # 顶部行 dump + 表头候选（非空格子多的行）+ 重复列组
-    ncol = min(ws.max_column or 0, 60)
+    ncol = ws.max_column or 0
+    if max_cols:
+        ncol = min(ncol, max_cols)
     top = []
     for i, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 0, max(dump_rows, 15)),
                                          max_col=ncol, values_only=True), start=1):
         top.append((i, [s(c, 80) for c in row]))
     for i, vals in top[:dump_rows]:
-        info["rows"].append({"r": i, "cells": vals})
+        cells = {}
+        for j, v in enumerate(vals, start=1):
+            if v:
+                cells[get_column_letter(j)] = v
+        info["rows"].append({"r": i, "cells": cells})
     for i, vals in top[:15]:
         nz = sum(1 for v in vals if v)
         if nz >= 3:
@@ -117,6 +125,7 @@ def main(argv=None):
     ap.add_argument("xlsx")
     ap.add_argument("--json", help="完整结构落盘 JSON（带回来分析用）")
     ap.add_argument("--rows", type=int, default=30, help="每 sheet 顶部 dump 行数（默认 30）")
+    ap.add_argument("--cols", type=int, default=0, help="每行最多探测列数（默认 0=全部列）")
     ap.add_argument("--sheet", help="只探测该 sheet")
     args = ap.parse_args(argv)
 
@@ -161,7 +170,7 @@ def main(argv=None):
             report["sheets"].append({"name": sn, "state": "non-worksheet", "skipped": True})
             continue
         wsf = wbf[sn] if (wbf is not None and sn in wbf.sheetnames) else None
-        report["sheets"].append(probe_sheet(ws, wsf, args.rows))
+        report["sheets"].append(probe_sheet(ws, wsf, args.rows, args.cols))
 
     # ---- 控制台摘要 ----
     print("文件: %s   宏(VBA): %s" % (args.xlsx, "有 ★宏逻辑需另行导出" if has_vba else "无"))
@@ -192,7 +201,7 @@ def main(argv=None):
         if i["comments"]:
             print("  批注 %d 条（详见 JSON）" % len(i["comments"]))
         for r in i["rows"][:8]:
-            print("   r%-3d | %s" % (r["r"], " | ".join(v for v in r["cells"])[:150]))
+            print("   r%-3d | %s" % (r["r"], " | ".join("%s:%s" % (k, v) for k, v in r["cells"].items())[:150]))
         if len(i["rows"]) > 8:
             print("   …顶部共 dump %d 行，全在 JSON 里" % len(i["rows"]))
 
