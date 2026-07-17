@@ -178,6 +178,7 @@ def build_report(labels, modes, out_path):
     head = ["Register Name", "Address"] + labels + ["覆盖", "差异", "多写模式"]
     ws.append(head)
     n_diff_addr = 0
+    diff_list = []
     for a, name in union.items():
         vals = [states[lb].get(a) for lb in labels]
         vnorms = set(w["vnorm"] for w in vals if w)
@@ -185,6 +186,9 @@ def build_report(labels, modes, out_path):
         differ = len(vnorms) > 1
         n_diff_addr += differ
         mw = ",".join(lb for lb in labels if a in multi[lb])
+        if differ or covered < len(labels):
+            diff_list.append({"addr": a, "name": name, "mw": mw,
+                              "vals": [(w["value"] if w else None) for w in vals]})
         r = [name, a] + [(w["value"] if w else "") for w in vals] + \
             ["%d/%d" % (covered, len(labels)), "Y" if differ else "", mw]
         ws.append(r)
@@ -268,9 +272,16 @@ def build_report(labels, modes, out_path):
         for col, w in widths.items():
             ws.column_dimensions[col].width = w
 
+    multi_lines = []
+    for lb in labels:
+        for a, hs in multi[lb].items():
+            multi_lines.append({"mode": lb, "addr": a, "name": hs[0]["name"],
+                                "seq": " -> ".join(h["value"] for h in hs)})
+
     wb.save(out_path)
     return {"union": len(union), "diff_addr": n_diff_addr, "orphan": n_orphan,
-            "prefix": npfx, "pair_diff": pair_diff}
+            "prefix": npfx, "pair_diff": pair_diff,
+            "diff_list": diff_list, "multi_lines": multi_lines}
 
 
 def _history(writes):
@@ -321,8 +332,34 @@ def main(argv=None):
     print("地址并集 %d 个；模式间有末态差异的地址 %d 个；未被全部模式覆盖的孤儿地址 %d 个；"
           % (stat["union"], stat["diff_addr"], stat["orphan"]))
     print("所有模式完全相同的公共前缀 %d 行。" % stat["prefix"])
+
+    # 差异清单（切换签名块的原料，直接从控制台复制走）
+    if stat["diff_list"]:
+        print()
+        print("== 差异地址清单（%d 个；末态不同或未全覆盖；∅=该模式没写）==" % len(stat["diff_list"]))
+        for i, lb in enumerate(labels, 1):
+            print("   M%d = %s" % (i, lb))
+        for d in stat["diff_list"][:200]:
+            cells = " ".join("M%d=%s" % (i, v if v is not None else "∅")
+                             for i, v in enumerate(d["vals"], 1))
+            tag = ("   ★撞多写:" + d["mw"]) if d["mw"] else ""
+            print("  %-10s %-26s %s%s" % (d["addr"], d["name"][:26], cells, tag))
+        if len(stat["diff_list"]) > 200:
+            print("  …共 %d 个，超出 200 的看工作簿 末态对比 sheet" % len(stat["diff_list"]))
+
+    if stat["multi_lines"]:
+        print()
+        print("== 同址多写时间线（顺序敏感段，禁止折叠进签名块）==")
+        agg = OrderedDict()
+        for m in stat["multi_lines"]:
+            agg.setdefault((m["addr"], m["name"], m["seq"]), []).append(m["mode"])
+        for (a, nm, seq), lbs in agg.items():
+            who = "全部模式" if len(lbs) == len(labels) else ",".join(lbs)
+            print("  %-10s %-26s %s   [%s]" % (a, nm[:26], seq, who))
+
+    print()
     print("审计工作簿已写: %s" % args.out)
-    print("⚠ 提醒：本报告仅供审计，跨模式切换请全量重放原写序。")
+    print("⚠ 提醒：差异清单需配合每模式 init+lock 行使用；撞多写的地址要整段原序重放。")
 
 
 if __name__ == "__main__":
