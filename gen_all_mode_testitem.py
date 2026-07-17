@@ -15,8 +15,15 @@
 
 用法（在 Analyzer\\excel 目录下）：
     python gen_all_mode_testitem.py 00_Mode_Reg 00_Mode_testitem \
+        [--temps 25,105,-40] \
         [--out Current_all_mode_testitem_gen.xlsx] [--order 子串,子串,...] \
         [--template 某testitem子串] [--map "testitem子串=reg子串" ...] [--force] [--overwrite]
+
+  --temps     温度点序列（℃，逗号分隔，按给定顺序执行）。给了就生成全温度流程：
+              每个温度段开头插一行 Chamber=YES 的设温行（SET_TEMP_x，只控温不测量），
+              段内=完整的全模式链，且所有行 Temperature 列改写为该温度（探查/入库
+              按这列区分温度）；若末温≠首温，结尾自动加回首温的设温行再 Chamber_Close
+              （避免低温开箱结霜）。不给 --temps 维持单温度旧行为。
 
   --order     模式顺序（testitem 文件名子串，默认按文件名排序）
   --template  用哪个 testitem 当输出模板（表头/说明sheet/格式，默认顺序第一个）
@@ -148,6 +155,7 @@ def main(argv=None):
     ap.add_argument("--out", default="Current_all_mode_testitem_gen.xlsx")
     ap.add_argument("--order", help="模式顺序：testitem 文件名子串，逗号分隔")
     ap.add_argument("--template", help="当模板的 testitem 文件名子串（默认顺序第一个）")
+    ap.add_argument("--temps", help="温度点序列（℃，逗号分隔，如 25,105,-40）")
     ap.add_argument("--map", action="append", default=[], metavar="T子串=R子串",
                     help="手工指定 testitem↔寄存器表 配对，可多次")
     ap.add_argument("--force", action="store_true", help="表头不一致仍按列位置拷贝")
@@ -245,10 +253,26 @@ def main(argv=None):
     if out_ws.max_row > hr:
         out_ws.delete_rows(hr + 1, out_ws.max_row - hr)
 
-    # 逐模式拼装
+    # 温度点解析
+    c_temp = next((i for i, h in enumerate(tpl_header) if h.startswith("Temperature")), None)
+    temps = None
+    if args.temps:
+        temps = []
+        for x in args.temps.split(","):
+            x = x.strip()
+            if x:
+                temps.append(float(x) if "." in x else int(x))
+        if not temps:
+            sys.exit("--temps 是空的")
+        if c_temp is None:
+            sys.exit("模板表头没找到 Temperature 列，做不了多温度")
+
+    # 收集各模式块（签名行 + 原行），只读一遍文件
     n_sig_rows = -(-len(sig_addrs) // npairs)
     last_chamber = None
-    total = 0
+    blocks = []
+    tempset_base = None
+    chamber_yes_in = []
     print()
     for t in titems:
         header, data, chamber = read_rows(t)
@@ -269,6 +293,9 @@ def main(argv=None):
                        flags=re.I).strip("_")
         state = parsed[pairing[t]]["state"]
         base = list(data[0]) + [None] * max(0, len(tpl_header) - len(data[0]))
+        if tempset_base is None:
+            tempset_base = list(base)
+        rows = []
         for i in range(n_sig_rows):
             row = list(base)
             if c_no is not None:
@@ -287,15 +314,62 @@ def main(argv=None):
                     row[cv] = v if v.lower().startswith("0x") else "0x" + v
                 else:
                     row[ca] = row[cv] = None
-            out_ws.append(row)
+            rows.append(row)
+        ci = c_flags.get("Chamber")
         for row in data:
-            out_ws.append(list(row))
-        total += n_sig_rows + len(data)
+            rows.append(list(row))
+            if (ci is not None and ci < len(row) and row[ci] is not None
+                    and str(row[ci]).strip().upper() == "YES"):
+                chamber_yes_in.append(os.path.basename(t))
+        blocks.append(rows)
         print("  %-42s 签名 %d 行 + 原行 %d 行（Chamber_Close 摘除 %d 行）"
               % (os.path.basename(t), n_sig_rows, len(data), len(chamber)))
+    if chamber_yes_in:
+        print("  ⚠ 以下 testitem 的原行里已有 Chamber=YES，会和设温行叠加，请自查：%s"
+              % sorted(set(chamber_yes_in)))
+
+    def make_tempset(T):
+        """设温行：只控温不写不测。Chamber=YES + Temperature=T。"""
+        row = list(tempset_base)
+        if c_no is not None:
+            row[c_no] = "CHAMBER"
+        if c_mode is not None:
+            row[c_mode] = "SET_TEMP_%s" % T
+        for name, ci2 in c_flags.items():
+            if ci2 is not None:
+                row[ci2] = "YES" if name in ("Test", "Chamber") else "NO"
+        for ca, cv in c_pairs:
+            row[ca] = row[cv] = None
+        row[c_temp] = T
+        return row
+
+    # 拼装输出：多温度 = [设温行 + 全模式链] × N + 回首温 + Chamber_Close
+    total = 0
+    for T in (temps if temps else [None]):
+        if T is not None:
+            out_ws.append(make_tempset(T))
+            total += 1
+        for rows in blocks:
+            for r in rows:
+                rr = list(r)
+                if T is not None:
+                    while len(rr) <= c_temp:
+                        rr.append(None)
+                    rr[c_temp] = T
+                out_ws.append(rr)
+                total += 1
+    if temps and temps[-1] != temps[0]:
+        out_ws.append(make_tempset(temps[0]))
+        total += 1
+        print("  末温 %s ≠ 首温 %s：已加回温行（避免低温开箱结霜）" % (temps[-1], temps[0]))
 
     if last_chamber is not None:
-        out_ws.append(list(last_chamber))
+        lc = list(last_chamber)
+        if temps:
+            while len(lc) <= c_temp:
+                lc.append(None)
+            lc[c_temp] = temps[0]
+        out_ws.append(lc)
         total += 1
         print("  末尾追加 Chamber_Close ×1")
     else:
@@ -318,9 +392,13 @@ def main(argv=None):
 
     out_wb.save(args.out)
     print()
-    print("✔ 已生成 %s：%d 个模式，数据行共 %d 行（表头沿用 %s）"
-          % (args.out, len(titems), total, os.path.basename(tpl_path)))
-    print("  结构：每模式 [签名 %d 行(测量全NO) → 原 init/lock/OFF 行原样] → 末尾 Chamber_Close" % n_sig_rows)
+    print("✔ 已生成 %s：%d 个模式 × %s，数据行共 %d 行（表头沿用 %s）"
+          % (args.out, len(titems),
+             ("%d 个温度点 %s" % (len(temps), temps)) if temps else "单温度",
+             total, os.path.basename(tpl_path)))
+    print("  结构：%s每模式 [签名 %d 行(测量全NO) → 原 init/lock/OFF 行原样] → 末尾 Chamber_Close"
+          % ("每温度段 [SET_TEMP 设温行(Chamber=YES) → 全模式链(Temperature 列已改写)] → 回首温 → " if temps else "",
+             n_sig_rows))
     print("  ⚠ 输出为纯值（公式列已取算好的值）；上温箱前先常温跑通整链：逐模式判锁 + 电流对表。")
 
 
