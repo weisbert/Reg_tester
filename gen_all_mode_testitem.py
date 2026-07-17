@@ -42,8 +42,11 @@ FLAG_COLS = ["Test", "IPN", "SpotPN", "ReadBack", "OtherSpur", "Vtune", "Vtemp",
 
 # ---------- 模式名 token 匹配（testitem ↔ 寄存器表） ----------
 
+AXES = ("radio", "band", "dir", "dco", "sync", "loop")
+
+
 def features(name):
-    """文件名 → 特征轴 {radio, band, dir, dco}。缺失轴=None。"""
+    """文件名 → 特征轴 {radio, band, dir, dco, sync, loop}。缺失轴=None。"""
     s = os.path.splitext(os.path.basename(name))[0].lower()
     f = {}
     if "wifi" in s or re.search(r"(^|[^a-z])w[25]g", s):
@@ -54,6 +57,12 @@ def features(name):
         f["dco"] = "2g"
     elif "dco5g" in s:
         f["dco"] = "5g"
+    if "unsync" in s:
+        f["sync"] = "unsync"
+    elif "sync" in s:
+        f["sync"] = "sync"
+    if "loopback" in s or re.search(r"(^|[^a-z])loop($|[^a-z])", s):
+        f["loop"] = "y"
     t = re.sub(r"dco[25]g", "", s)
     if "2g" in t:
         f["band"] = "2g"
@@ -78,7 +87,7 @@ def auto_match(titem, regs, overrides):
     scored = []
     for r in regs:
         fr = features(r)
-        if any(ft.get(k) and fr.get(k) and ft[k] != fr[k] for k in ("radio", "band", "dir", "dco")):
+        if any(ft.get(k) and fr.get(k) and ft[k] != fr[k] for k in AXES):
             continue                                    # 任一轴冲突 → 淘汰
         score = sum(1 for k in ft if fr.get(k) == ft[k])
         scored.append((score, r))
