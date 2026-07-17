@@ -30,6 +30,7 @@
 """
 import argparse
 import io
+import json
 import re
 import sys
 from collections import OrderedDict
@@ -295,6 +296,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="模式寄存器写序 Excel 差异审计（只看不改，不生成执行序）")
     ap.add_argument("inputs", nargs="+", help="模式 xlsx 文件或目录")
     ap.add_argument("--out", default="模式差异审计.xlsx")
+    ap.add_argument("--handoff", default="模式差异_交接.json",
+                    help="单文件交接 JSON（差异清单+多写时间线，打开后整个复制贴回即可）")
     ap.add_argument("--sheet", help="只读各文件的该 sheet（默认全部）")
     args = ap.parse_args(argv)
 
@@ -357,8 +360,28 @@ def main(argv=None):
             who = "全部模式" if len(lbs) == len(labels) else ",".join(lbs)
             print("  %-10s %-26s %s   [%s]" % (a, nm[:26], seq, who))
 
+    # 单文件交接 JSON：签名块生成所需的一切
+    handoff = {
+        "modes": labels,
+        "per_mode_stats": {lb: {"rows": len(modes[lb]["writes"]),
+                                "unique_addrs": len(last_state(modes[lb]["writes"])),
+                                "multi_write_addrs": sum(1 for hs in _history(modes[lb]["writes"]).values() if len(hs) > 1),
+                                "skipped": len(modes[lb]["skipped"])} for lb in labels},
+        "union_addrs": stat["union"],
+        "common_prefix_rows": stat["prefix"],
+        "pair_diff": {"%s | %s" % (a, b): n for (a, b), n in stat["pair_diff"].items()},
+        "diff_list": [{"addr": d["addr"], "name": d["name"],
+                       "vals": dict(zip(labels, d["vals"])),
+                       "multi_write_in": [x for x in d["mw"].split(",") if x]}
+                      for d in stat["diff_list"]],
+        "multi_write_timelines": stat["multi_lines"],
+    }
+    with io.open(args.handoff, "w", encoding="utf-8") as f:
+        json.dump(handoff, f, ensure_ascii=False, indent=1)
+
     print()
     print("审计工作簿已写: %s" % args.out)
+    print("★交接文件已写: %s   ← 用记事本打开、全选复制、整个贴回来，其他都不用" % args.handoff)
     print("⚠ 提醒：差异清单需配合每模式 init+lock 行使用；撞多写的地址要整段原序重放。")
 
 
