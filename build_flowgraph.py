@@ -108,6 +108,11 @@ DEFAULT_RULES = {
     "crossmodule_net_blocklist": [],    # 项目专属，本地 config 覆盖
     # glue 门控前推：把经内部 glue 逻辑门控的寄存器使能，前推到它最终门控的耗电器件当 off_control。
     "glue_gate_propagation": True,
+    # 人工确认的控制脚绑定（项目专属，project.json flowgraph_rules 覆盖）：
+    # 网表命名错位链（脚名/网名/端口名全不搭）导致自动解析不到、但经 schematic 人工点验实锤的绑定。
+    # 结构：[{"node","pin","signal","role","note"}]。role=enable 且器件可门控时才追加 off_control，
+    # 其余(sel/ictrl/tune/reset)只补 controls/引脚标注（inspector/Reference 可见）。
+    "manual_control_bindings": [],
     # 已知的 unresolved / logic-derived 集合大小，用于回归自检
     "expected_unresolved_signals": 10,
     "expected_logic_derived_signals": 2,
@@ -492,6 +497,8 @@ def build(conn, regmap, rules, module_defs=None):
     build_cross_edges(net_ep, rules, edges)
     build_power_domain_edges(nodes, modules, module_defs, module_to_tag, rules, edges)   # 电源开关：电源域总闸 + 供电边
 
+    # 人工确认的控制脚绑定（命名错位链经 schematic 点验后固化，值在 project.json flowgraph_rules）
+    apply_manual_bindings(nodes, rules, sig_by_id, sigtab, diag)
     # glue 门控前推（需 edges）：把 glue 上的寄存器使能前推到终端器件，再算未覆盖门
     if rules.d.get("glue_gate_propagation", True):
         propagate_glue_gates(nodes, edges, sigtab, rules, diag)
@@ -516,6 +523,53 @@ def build(conn, regmap, rules, module_defs=None):
         "nodes": nodes, "edges": edges, "signals": sigtab.out,
         "stats": stats, "diagnostics": diag,
     }
+
+
+def apply_manual_bindings(nodes, rules, sig_by_id, sigtab, diag):
+    """人工确认的控制脚绑定（rules.manual_control_bindings）。
+    自动解析靠 网名/端口名/ls_ 别名 链，命名错位链（每跳名字都不搭）解析不到；
+    经 schematic 点验实锤后在数据侧固化，这里应用：
+      - 已存在的引脚（此前多半被当 data_in）就地升级 role/signal_ref，无则补引脚记录；
+      - 追加 node.controls（带 manual_binding 标记，inspector/Reference 可见）；
+      - role=enable 且器件可门控且信号属电流门类别 → 才追加 off_control；
+      - 从 unresolved_control_pins 诊断清单里销账。幂等：同 (pin,signal) 已绑则跳过。"""
+    binds = rules.d.get("manual_control_bindings") or []
+    if not binds:
+        return
+    by_id = {n["id"]: n for n in nodes}
+    applied = []
+    for b in binds:
+        node = by_id.get(b.get("node"))
+        sid = b.get("signal")
+        pin_name = b.get("pin")
+        if not node or not pin_name or sid not in sig_by_id:
+            diag.setdefault("manual_bindings_skipped", []).append(b)
+            continue
+        if any(c.get("pin") == pin_name and c.get("signal_ref") == sid for c in node["controls"]):
+            continue
+        role = b.get("role") or "sel"
+        s = sig_by_id[sid]
+        pin_id = "%s.%s" % (node["id"], pin_name)
+        p = next((pp for pp in node["pins"] if pp.get("name") == pin_name), None)
+        if p is None:
+            p = {"id": pin_id, "name": pin_name, "dir": "input", "net": None}
+            node["pins"].append(p)
+        p.update({"role": role, "signal_ref": sid, "shared": s.get("shared"),
+                  "warn": s.get("warn"), "resolved": s.get("resolved"), "manual_binding": True})
+        node["controls"].append({"pin": pin_name, "signal_ref": sid, "role": role,
+                                 "shared": s.get("shared"), "lane": None,
+                                 "manual_binding": True, "note": b.get("note")})
+        sigtab.ref(sid, pin_id)
+        if (role == "enable" and node.get("device") in rules.d.get("gateable_devices", [])
+                and sigtab.is_off_gate(sid, role)
+                and not any(o.get("signal_ref") == sid for o in node["off_controls"])):
+            node["off_controls"].append(sigtab.off_control(sid, pin_name, None))
+        diag["unresolved_control_pins"] = [
+            u for u in diag["unresolved_control_pins"]
+            if not (u.get("node") == node["id"] and u.get("pin") == pin_name)]
+        applied.append({"node": node["id"], "pin": pin_name, "signal": sid, "role": role})
+    if applied:
+        diag["manual_bindings_applied"] = applied
 
 
 def _mk_control_pin(node, pin, expr, tag, rules, port_to_signal, ls_alias, sig_by_id, sigtab, diag, role, lane,

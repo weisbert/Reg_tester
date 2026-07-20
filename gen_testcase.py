@@ -201,6 +201,8 @@ def generate(flowgraph, regmap, mode, gate_override=None):
     rv = RegView(regmap, group)
     enabled = set(mode.get("enabled_nodes", []))
     baseline_over = mode.get("baseline", {}) or {}
+    aliases = mode.get("aliases", {}) or {}   # 节点→用户架构图编号(功耗统计别名)，透传到步骤/Excel
+    vsteps = mode.get("virtual_steps", {}) or {}   # 显式手动步骤(PLL_REG 外/特殊绝对地址寄存器): vid→{addr,reg,bit,off,before,label,signal,note,reset}
 
     gate_nodes, node_gates = collect_gates(flowgraph, gate_override)
 
@@ -315,6 +317,31 @@ def generate(flowgraph, regmap, mode, gate_override=None):
             "fields": fields_set[addr],
         })
 
+    # 5.5) virtual_steps 的地址也出基线行——初始态可见(如 TX bank 影子寄存器/特殊寄存器)。
+    #      value=按共址 vstep 的 before 拼的映像(仅供 JSON/ate 参考)；Excel 端该行标 virtual、
+    #      直接回显该模式初始值(不走 RMW mask——整寄存器型 vstep 的 mask 盖住全部位, masked 值无意义)。
+    _seen_va = set(w["addr"] for w in baseline_writes)
+    for _vid in sorted(vsteps.keys()):
+        _vd = vsteps[_vid]
+        _va = hex_addr(_vd["addr"])
+        if _va in _seen_va:
+            continue
+        _seen_va.add(_va)
+        _img = 0
+        _flds = []
+        for _vd2 in vsteps.values():
+            if hex_addr(_vd2["addr"]) != _va:
+                continue
+            _bs = str(_vd2.get("bit", "0"))
+            _hl = _bs.split(":")
+            _lo2 = min(int(_hl[0]), int(_hl[-1]))
+            _img |= int(_vd2.get("before", 1)) << _lo2
+            _flds.append({"signal": _vd2.get("signal", ""), "bit": _bs,
+                          "value": int(_vd2.get("before", 1)), "role": "enable", "on": True})
+        baseline_writes.append({"addr": _va, "reg": _vd.get("reg", ""), "value": hex4(_img),
+                                "reset": _vd.get("reset", "0x0000"), "virtual": True, "fields": _flds})
+    baseline_writes.sort(key=lambda w: w["addr"])
+
     # Step D: 关闭步骤 -------------------------------------------------------
     # active_gate_nodes = enabled 里有至少一个基线为开门的节点
     active_nodes = []
@@ -340,7 +367,7 @@ def generate(flowgraph, regmap, mode, gate_override=None):
 
     if order_mode == "manual":
         manual = list((mode.get("order", {}) or {}).get("manual", []))
-        ordered = [n for n in manual if n in active_nodes]
+        ordered = [n for n in manual if n in active_nodes or n in vsteps]
         rest = [n for n in active_nodes if n not in ordered]
         if rest:
             warnings.append("manual 顺序未覆盖的激活节点按 auto 追加：%s" % ", ".join(sorted(rest)))
@@ -364,6 +391,46 @@ def generate(flowgraph, regmap, mode, gate_override=None):
     steps = []
     shared_collateral = []
     for idx, nid in enumerate(ordered, 1):
+        if nid in vsteps:      # 显式手动步骤：特殊绝对地址寄存器(不在 PLL_REG)，直接给 addr/bit/off
+            vd = vsteps[nid]
+
+            def _fld(bs):
+                bs = str(bs)
+                hi, lo = (int(x) for x in bs.split(":", 1)) if ":" in bs else (int(bs), int(bs))
+                hi, lo = max(hi, lo), min(hi, lo)
+                return lo, ((1 << (hi - lo + 1)) - 1) << lo
+
+            _lo, _fm = _fld(vd.get("bit", "0"))
+            _off = int(vd.get("off", 0)); _before = int(vd.get("before", 1))
+            _va = hex_addr(vd["addr"])
+            # 值必须累积（同地址多个 virtual step 时，step1 不能把 step2 的位也显示成已清）：
+            # 地址不在基线映像里时，先按**所有共址 vstep** 的 before 值拼出初始映像，再逐步读-改-写。
+            if _va not in reg_image:
+                img0 = 0
+                for _v2 in vsteps.values():
+                    if hex_addr(_v2["addr"]) != _va:
+                        continue
+                    l2, _ = _fld(_v2.get("bit", "0"))
+                    img0 |= int(_v2.get("before", 1)) << l2
+                reg_image[_va] = img0
+            _prev_img = reg_image[_va]
+            reg_image[_va] = (_prev_img & ~_fm) | ((_off << _lo) & _fm)
+            steps.append({
+                "index": idx, "off_node": nid,
+                "off_label": vd.get("label") or nid.lstrip("@"),
+                "device": "special", "measure": "关此级后测总电流",
+                "alias": aliases.get(nid, ""), "gates": [], "warnings": [],
+                "note": vd.get("note"),
+                "writes": [{
+                    "addr": _va, "reg": vd.get("reg", ""),
+                    "prev": hex4(_prev_img), "value": hex4(reg_image[_va]),
+                    "reset": vd.get("reset", "0x0000"),
+                    "fields": [{"signal": vd.get("signal", nid.lstrip("@")),
+                                "bit": str(vd.get("bit", "0")),
+                                "before": _before, "after": _off, "role": "enable"}],
+                }],
+            })
+            continue
         node = node_by_id.get(nid, {})
         gs = [g for g in node_gates.get(nid, []) if signal_on(g["signal"])]
         writes_by_addr = {}
@@ -415,16 +482,22 @@ def generate(flowgraph, regmap, mode, gate_override=None):
             "off_label": node.get("inst_name") or node.get("name") or nid.split("::")[-1],
             "device": node.get("device"),
             "measure": "关此级后测总电流",
+            "alias": aliases.get(nid, ""),
             "gates": step_gates,
             "writes": writes,
             "warnings": step_warn,
             "note": note,
         })
 
-    # Step E: 诊断透传
+    # Step E: 诊断透传（未覆盖门带上 reg/bit，供渲染层按该模式初值过滤——初值里已关的位对本模式无关，不显示）
     uncovered = []
     for u in flowgraph.get("diagnostics", {}).get("uncovered_off_gates", []):
-        uncovered.append({"signal": u.get("signal"), "note": "真门但无可挂节点，序列不会自动关，需人工补"})
+        sig = u.get("signal")
+        rec = {"signal": sig, "note": "真门但无可挂节点，序列不会自动关，需人工补"}
+        v = rv.variant(sig)
+        if v and v.get("reg_name"):
+            rec["reg"] = v.get("reg_name"); rec["bit"] = v.get("bit"); rec["reset"] = v.get("reset")
+        uncovered.append(rec)
 
     return {
         "schema_version": SCHEMA,
@@ -487,10 +560,7 @@ def render_ate(tc):
         for w in tc["extra_writes"]:
             ap("%s %s  extra  ; %s" % (hex_addr(w["addr"]), hex4(to_int(w["value"])), w.get("note", "")))
         ap("")
-    if tc["diagnostics"]["uncovered_off_gates"]:
-        ap("# --- ⚠ 未覆盖的门（需人工补写）---")
-        for u in tc["diagnostics"]["uncovered_off_gates"]:
-            ap("#   %s : %s" % (u["signal"], u["note"]))
+    # 未覆盖门诊断不写入 ate.txt（用户关断列表即权威；已知个别 uncovered 门经电路确认为悬空历史遗留，非真门）
     return "\n".join(L) + "\n"
 
 
@@ -659,9 +729,23 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
 
     TOP = re.compile(r'd_[A-Za-z0-9_]+')
     GATEABLE = ("buf", "div", "mux", "dco", "power_switch")
+    # 非 EN 控制脚的角色标签/排序（sel/ictrl/tune/rstn + 未作关断门的 enable）
+    ROLE_ORD = {"sel": 1, "ictrl": 2, "tune": 3, "reset": 4, "enable": 5}
+    ROLE_LBL = {"sel": "SEL 选择", "ictrl": "ICTRL 电流档", "tune": "TUNE 调谐/trim",
+                "reset": "RSTN 复位", "enable": "使能(非本级关断门)"}
+
+    def _resolvable(sid):
+        a, _b, _r = reg_of(sid)
+        return bool(a) and not str(a).startswith("(")
+
     blocks = []
     for n in flowgraph.get("nodes", []):
-        if n.get("device") not in GATEABLE or not n.get("off_controls"):
+        if n.get("device") not in GATEABLE:
+            continue
+        # 有关断门，或有任一能解析到寄存器位的控制脚（如主 rx buf：无独立 EN、但有 sel/ictrl），都入表
+        has_extra = any(c.get("signal_ref") and _resolvable(c["signal_ref"])
+                        for c in n.get("controls", []))
+        if not n.get("off_controls") and not has_extra:
             continue
         mod = n.get("module")
         desig = set(gate_override.get(n["id"], []))
@@ -680,13 +764,14 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
                 role = ("主DCO使能(整域)" if is_master else "本级使能") + ("★总闸" if sid in desig else "")
                 add_row(blk, seen, sid, role, 0, master=is_master)
         # 2) **所有** off_controls 的信号都列出（2.2：多门块不能只显第一个；也兜底 2.1 空表达式）
-        for o in n["off_controls"]:
+        for o in n.get("off_controls") or []:
             sid = o.get("signal_ref")
             add_row(blk, seen, sid, "本级使能" + ("★总闸" if sid in desig else ""), o.get("off_value", 0))
         if not blk["expr"]:
-            sigs = [o.get("signal_ref") for o in n["off_controls"] if o.get("signal_ref")]
+            sigs = [o.get("signal_ref") for o in (n.get("off_controls") or []) if o.get("signal_ref")]
             show = [s for s in sigs if s in desig] or sigs
-            blk["expr"] = " & ".join(show) + "  (未过逻辑门 / 直接控制)"
+            blk["expr"] = (" & ".join(show) + "  (未过逻辑门 / 直接控制)") if show \
+                else "（无独立关断使能——门在外部/特殊寄存器或经复位脚，见模式表）"
         # 3) 电源域总闸：若本 block 由 power switch 供电（关它=整域掉电）
         psw = node_by_id.get(powered_by.get(n["id"]))
         if psw and psw["id"] != n["id"]:
@@ -694,6 +779,18 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
                 add_row(blk, seen, o.get("signal_ref"),
                         "电源域总闸(power switch %s)" % (psw.get("inst_name") or ""),
                         o.get("off_value", 0), pwr=True)
+        # 4) 其余控制脚：SEL/ICTRL/TUNE/RSTN + 未作关断门的 enable —— 按 inst 列全套控制寄存器。
+        #    只列能解析到寄存器位的（ADPLL 环路驱动的 ct/mt/ft 频率码无寄存器位，不列）；关断值列留空（非开关量）。
+        extras = []
+        for c in n.get("controls", []):
+            sid = c.get("signal_ref")
+            if not sid or sid in seen or not _resolvable(sid):
+                continue
+            role = c.get("role") or ""
+            extras.append((ROLE_ORD.get(role, 9), sid,
+                           "%s(脚 %s)" % (ROLE_LBL.get(role, role or "控制"), c.get("pin") or "?")))
+        for _o, sid, label in sorted(extras):
+            add_row(blk, seen, sid, label, "")
         blocks.append(blk)
     # 位定义（per-signal，含 lo/width）+ per-bit 展开（供位编辑器逐 bit 标注）
     bit_defs, bit_lookup = [], []
@@ -712,7 +809,7 @@ def build_reference(flowgraph, regmap, gate_override=None, group=None, logic_exp
     return {"group": group, "blocks": blocks, "bit_defs": bit_defs, "bit_lookup": bit_lookup}
 
 
-def render_xlsx(testcases, path, reference=None):
+def render_xlsx(testcases, path, reference=None, mode_inits=None, base_by_group=None, internal_base=None):
     """testcases = [(mode_id, tc), ...] -> 一个 .xlsx，**每个模式一张 sheet(tab)**；
     reference（可选）= build_reference 输出，会加一张 Reference sheet 放最前。
     需 openpyxl（延迟导入，只在导出 Excel 时用；核心生成仍 stdlib）。"""
@@ -728,10 +825,23 @@ def render_xlsx(testcases, path, reference=None):
     in_fill = PatternFill("solid", fgColor="FFF2CC")     # 输入格黄
     out_fill = PatternFill("solid", fgColor="C6E0B4")    # 输出格绿
 
+    # 按 reg_group 把内部基址窗口前缀(regmap base 高5位hex)换成该域真实交付基址；无 --base 则原样。
+    # 用于聚合簿：BT/WIFI 共用寄存器(DCO_CTRL2/3, offset 同)按各自 CPU 窗口出不同真实地址、初始值 sheet 各出一行。
+    base_by_group = base_by_group or {}
+    _iprefix = ("%05X" % (internal_base >> 12)) if (base_by_group and internal_base) else None
+    def rb_addr(s, group):
+        if not _iprefix or not s:
+            return s
+        base = base_by_group.get(group)
+        if base is None:
+            return s
+        return re.sub(_iprefix, "%05X" % (base >> 12), str(s), flags=re.I)
+    ref_group = reference.get("group") if reference else None
+
     if reference:
         pwr_fill = PatternFill("solid", fgColor="DDEBF7")   # 电源域总闸行浅蓝
         ws = wb.create_sheet("Reference")
-        ws.cell(1, 1, "Reference — 底层 EN 脚 → 顶层信号布尔式(含 glue 门) → 寄存器  (reg_group=%s；唯一标识=模块+实例路径，非 CELL 类型；★=指定总闸；绿=主DCO使能；蓝=电源域总闸)" % reference["group"]).font = bold
+        ws.cell(1, 1, "Reference — 每实例(inst)全套控制寄存器：底层 EN 脚 → 顶层信号布尔式(含 glue 门) → 寄存器，另列 SEL/ICTRL/TUNE/RSTN 等控制脚  (reg_group=%s；唯一标识=模块+实例路径，非 CELL 类型；★=指定总闸；绿=主DCO使能；蓝=电源域总闸；关断值空=非开关量)" % reference["group"]).font = bold
         cols2 = ["模块", "实例路径(唯一标识)", "CELL类型(可重复)", "device", "EN脚", "EN映射(= 顶层布尔式)", "顶层信号", "地址 ADDR", "bit", "关断值", "角色/说明", "寄存器"]
         for c, h in enumerate(cols2, 1):
             cell = ws.cell(3, c, h); cell.font = bold; cell.fill = hdr_fill
@@ -739,7 +849,7 @@ def render_xlsx(testcases, path, reference=None):
         for blk in reference["blocks"]:
             r0 = r
             for row in blk["rows"]:
-                ws.cell(r, 7, row["sig"]); ws.cell(r, 8, row["addr"]); ws.cell(r, 9, row["bit"])
+                ws.cell(r, 7, row["sig"]); ws.cell(r, 8, rb_addr(row["addr"], ref_group)); ws.cell(r, 9, row["bit"])
                 ws.cell(r, 10, row["off"]); ws.cell(r, 11, row["role"]); ws.cell(r, 12, row["reg"])
                 fill = pwr_fill if row.get("pwr") else (base_fill if row.get("master") else None)
                 if fill:
@@ -764,7 +874,7 @@ def render_xlsx(testcases, path, reference=None):
         wsd = wb.create_sheet("位定义")     # VLOOKUP 用，隐藏
         wsd.cell(1, 1, "key").font = bold; wsd.cell(1, 2, "信号").font = bold
         for i, x in enumerate(blk_lookup, 2):
-            wsd.cell(i, 1, x["key"]); wsd.cell(i, 2, x["sig"])
+            wsd.cell(i, 1, rb_addr(x["key"], ref_group)); wsd.cell(i, 2, x["sig"])
         wsd.sheet_state = "hidden"
 
         we = wb.create_sheet("位编辑器")
@@ -813,7 +923,7 @@ def render_xlsx(testcases, path, reference=None):
         for i, x in enumerate(bd, 3):
             key = 'UPPER(SUBSTITUTE(SUBSTITUTE(F%d,"0x",""),"0X",""))' % i
             lo, wid = x["lo"], x["width"]
-            wx.cell(i, 5, x["sig"]); wx.cell(i, 6, x["addr"]); wx.cell(i, 7, x["bit_str"]); wx.cell(i, 8, x["reg"])
+            wx.cell(i, 5, x["sig"]); wx.cell(i, 6, rb_addr(x["addr"], ref_group)); wx.cell(i, 7, x["bit_str"]); wx.cell(i, 8, x["reg"])
             wx.cell(i, 9, '=IFERROR(INDEX($B:$B,MATCH(%s,$C:$C,0)),"")' % key)
             wx.cell(i, 10, '=IFERROR(IF(I%d="","",MOD(INT(HEX2DEC(SUBSTITUTE(SUBSTITUTE(I%d,"0x",""),"0X",""))/2^%d),2^%d)),"?")' % (i, i, lo, wid))
             if wid == 1:
@@ -827,8 +937,9 @@ def render_xlsx(testcases, path, reference=None):
     # ---- 初始值(RMW)：用户填每个被影响寄存器的真实初始值 → 各模式值按 (init AND keep) OR our 自动重算 ----
     def touched_regs(tc):
         info = {}
+        _grp = tc.get("reg_group")
         def acc(w):
-            e = info.setdefault(w["addr"], {"reg": w.get("reg") or "", "reset": w.get("reset") or "", "mask": 0})
+            e = info.setdefault(rb_addr(w["addr"], _grp), {"reg": w.get("reg") or "", "reset": w.get("reset") or "", "mask": 0})
             if not e["reg"]:
                 e["reg"] = w.get("reg") or ""
             if not e["reset"]:
@@ -851,46 +962,101 @@ def render_xlsx(testcases, path, reference=None):
         return info
 
     all_regs = {}
+    touched_by = {}   # real_addr -> set(mode_id)：该(域)地址被哪些模式实际触及 → 初始值只填这些格
     for _mid, tc in testcases:
         for a, e in touched_regs(tc).items():
             g = all_regs.setdefault(a, {"reg": e["reg"], "reset": e["reset"], "mask": 0})
             g["mask"] |= e["mask"]
             g["reg"] = g["reg"] or e["reg"]
             g["reset"] = g["reset"] or e["reset"]
+            touched_by.setdefault(a, set()).add(_mid)
+    # 模式 sheet 名(去重)——初始值列与模式 tab 用同一名
+    mode_inits = mode_inits or {}
+    _used = set(); mode_names = []
+    for _mid2, _tc2 in testcases:
+        nm = re.sub(r"[\[\]:*?/\\]", "_", str(_mid2 or _tc2.get("mode") or "mode"))[:31] or "mode"
+        _b = nm; _k = 1
+        while nm in _used:
+            nm = (_b[:28] + "_%d" % _k); _k += 1
+        _used.add(nm); mode_names.append(nm)
+
     wi = wb.create_sheet("初始值")
-    wi.cell(1, 1, "初始值设定 — 填每个被影响寄存器的**真实初始值**(默认=复位值)。各模式的「值」= (初始值 AND 保留位) OR 本工具使能位，"
-                  "只覆盖我们控制的 bit、保留你的其它 bit；填完各模式自动重算成可用序列。").font = bold
-    for j, h in enumerate(["key", "地址", "寄存器", "我们控制的bit(mask)", "初始值(hex,填这列)", "说明"], 1):
+    wi.cell(1, 1, "初始值设定 — 逐寄存器、**逐模式**填真实初始值(默认=复位值)。各模式「值」= (该模式初始值 AND 保留位) OR 使能位，"
+                  "只覆盖我们控制的 bit、保留你其它 bit。BT/WIFI 有共用寄存器也有专用寄存器，故各模式列可不同。").font = bold
+    _fixed = ["key", "地址", "寄存器", "我们控制的bit(mask)", "复位值"]
+    for j, h in enumerate(_fixed, 1):
         cc = wi.cell(2, j, h); cc.font = bold; cc.fill = hdr_fill
+    _bc = len(_fixed)
+    mode_init_col = {}
+    for _ki, nm in enumerate(mode_names):
+        _col = _bc + 1 + _ki
+        cc = wi.cell(2, _col, nm); cc.font = bold; cc.fill = base_fill
+        mode_init_col[nm] = _col
+    _notec = _bc + 1 + len(mode_names)
+    wi.cell(2, _notec, "说明").font = bold
+    _mids = [m[0] for m in testcases]
     for i, (a, e) in enumerate(sorted(all_regs.items()), 3):
         wi.cell(i, 1, re.sub(r'(?i)^0x', '', a).upper())
         wi.cell(i, 2, a); wi.cell(i, 3, e["reg"]); wi.cell(i, 4, "0x%04X" % e["mask"])
-        c = wi.cell(i, 5, e["reset"] or "0x0000"); c.fill = in_fill; c.number_format = "@"
-        wi.cell(i, 6, "默认=复位值；改成实际初始值后各模式自动重算")
+        wi.cell(i, 5, e["reset"] or "0x0000")
+        _rn = (e["reg"] or "").upper(); _rst = e["reset"] or "0x0000"
+        for _mid2, nm in zip(_mids, mode_names):
+            if _mid2 not in touched_by.get(a, ()):   # 该模式不碰这个(域)地址 → 留空，避免跨域误填
+                continue
+            _mi = mode_inits.get(_mid2, {}) or {}
+            _iv = _mi.get(_rn) or _mi.get(e["reg"] or "") or _rst
+            _cc = wi.cell(i, mode_init_col[nm], _iv); _cc.fill = in_fill; _cc.number_format = "@"
+        wi.cell(i, _notec, "各模式列=该模式真实初始值(默认复位)，改后该模式自动重算")
     wi.column_dimensions["A"].hidden = True
-    for cc2, w in {"B": 13, "C": 18, "D": 20, "E": 18, "F": 42}.items():
-        wi.column_dimensions[cc2].width = w
+    wi.column_dimensions["B"].width = 13; wi.column_dimensions["C"].width = 18
+    wi.column_dimensions["D"].width = 20; wi.column_dimensions["E"].width = 11
+    for _ki in range(len(mode_names)):
+        wi.column_dimensions[get_column_letter(_bc + 1 + _ki)].width = 15
+    wi.column_dimensions[get_column_letter(_notec)].width = 40
     wi.freeze_panes = "A3"
 
-    cols = ["步骤", "操作", "地址 ADDR", "值 VALUE(按初始值重算)", "寄存器/模块", "信号变化(bit:前→后)"]
-    widths = [9, 22, 13, 22, 22, 44]
-    used = set()
-    for mode_id, tc in testcases:
-        nm = re.sub(r"[\[\]:*?/\\]", "_", str(mode_id or tc.get("mode") or "mode"))[:31] or "mode"
-        base = nm
-        k = 1
-        while nm in used:
-            nm = (base[:28] + "_%d" % k); k += 1
-        used.add(nm)
+    cols = ["步骤", "操作", "别名(架构图编号)", "地址 ADDR", "值 VALUE(按初始值重算)", "寄存器/模块", "信号变化(bit:前→后)"]
+    widths = [14, 22, 16, 13, 22, 20, 44]
+    for (mode_id, tc), nm in zip(testcases, mode_names):
         ws = wb.create_sheet(nm)
-        minfo = touched_regs(tc)
+        _icol = get_column_letter(mode_init_col[nm])
+        _grp = tc.get("reg_group")
+        # RMW 只"控制"本模式真正会动的 bit（关断步骤清的位 + baseline 的 override/mux_sel）；
+        # 其余位一律从该模式初始值(真实配置)保留 —— 保证 baseline == 你配置表的真值。
+        rmw_mask = {}
+        def _accbits(addr, fields):
+            for f in fields or []:
+                bs = str(f.get("bit", ""))
+                if not bs:
+                    continue
+                if ":" in bs:
+                    hi, lo = (int(x) for x in bs.split(":", 1))
+                else:
+                    hi = lo = int(bs)
+                for p in range(min(lo, hi), max(lo, hi) + 1):
+                    rmw_mask[addr] = rmw_mask.get(addr, 0) | (1 << p)
+        for w in tc["baseline"]["writes"]:
+            _accbits(rb_addr(w["addr"], _grp), [f for f in w.get("fields", []) if f.get("role") in ("override", "mux_sel")])
+        for st in tc["steps"]:
+            for w in st["writes"]:
+                _accbits(rb_addr(w["addr"], _grp), w.get("fields", []))
 
-        def rmw(row_i, addr, val_hex):
-            mask = minfo.get(addr, {}).get("mask", 0)
+        def rmw(row_i, addr, val_hex, _icol=_icol):
+            mask = rmw_mask.get(addr, 0)
             keep = 0xFFFF ^ mask
             ourval = int(str(val_hex).replace("0x", "").replace("0X", ""), 16) & mask
-            ws.cell(row_i, 8, '=IFERROR(INDEX(\'初始值\'!$E:$E,MATCH(UPPER(SUBSTITUTE(SUBSTITUTE(C%d,"0x",""),"0X","")),\'初始值\'!$A:$A,0)),"")' % row_i)
-            ws.cell(row_i, 4, '=IF($H%d="","(填初始值)","0x"&DEC2HEX(BITOR(BITAND(HEX2DEC(SUBSTITUTE(SUBSTITUTE($H%d,"0x",""),"0X","")),%d),%d),4))' % (row_i, row_i, keep, ourval))
+            ws.cell(row_i, 8, '=IFERROR(INDEX(\'初始值\'!$%s:$%s,MATCH(UPPER(SUBSTITUTE(SUBSTITUTE(D%d,"0x",""),"0X","")),\'初始值\'!$A:$A,0)),"")' % (_icol, _icol, row_i))
+            # RMW 不用 BITAND/BITOR（部分 Excel/WPS 不支持→#NAME?），改用 MOD/INT 逐位；取项数少的等价形式
+            iv = 'HEX2DEC(SUBSTITUTE(SUBSTITUTE($H%d,"0x",""),"0X",""))' % row_i
+            mask_bits = [b for b in range(16) if mask >> b & 1]
+            keep_bits = [b for b in range(16) if keep >> b & 1]
+            if len(mask_bits) <= len(keep_bits):        # init 减去受控位 再加 our
+                expr = iv + "".join('-MOD(INT(%s/%d),2)*%d' % (iv, 1 << b, 1 << b) for b in mask_bits)
+                if ourval:
+                    expr += "+%d" % ourval
+            else:                                       # our 加上保留位
+                expr = str(ourval) + "".join('+MOD(INT(%s/%d),2)*%d' % (iv, 1 << b, 1 << b) for b in keep_bits)
+            ws.cell(row_i, 5, '=IF($H%d="","(填初始值)","0x"&DEC2HEX(%s,4))' % (row_i, expr))
 
         ws.cell(1, 1, "%s  %s  |  reg_group=%s" % (tc.get("mode"), tc.get("mode_name") or "", tc.get("reg_group"))).font = bold
         ws.cell(2, 1, "累积逐级关闭：每步先发本段写、再测总电流；相邻步电流差 = 该级功耗。「值」按『初始值』sheet 自动重算(RMW)。")
@@ -908,45 +1074,90 @@ def render_xlsx(testcases, path, reference=None):
                 elif f.get("on"):
                     seg.append("%s=on" % f["signal"])
             ws.cell(r, 1, "baseline" if i == 0 else ""); ws.cell(r, 2, "建立全开起始态" if i == 0 else "")
-            ws.cell(r, 3, w["addr"]); ws.cell(r, 5, w.get("reg") or ""); ws.cell(r, 6, ", ".join(seg))
-            rmw(r, w["addr"], w["value"])
+            ws.cell(r, 4, rb_addr(w["addr"], _grp)); ws.cell(r, 6, w.get("reg") or ""); ws.cell(r, 7, ", ".join(seg))
+            if w.get("virtual"):
+                # virtual step 地址的基线行：初始态=用户填的初始值本身，直接回显(不走 RMW mask)
+                ws.cell(r, 8, '=IFERROR(INDEX(\'初始值\'!$%s:$%s,MATCH(UPPER(SUBSTITUTE(SUBSTITUTE(D%d,"0x",""),"0X","")),\'初始值\'!$A:$A,0)),"")' % (_icol, _icol, r))
+                ws.cell(r, 5, '=IF($H%d="","(填初始值)",$H%d)' % (r, r))
+            else:
+                rmw(r, rb_addr(w["addr"], _grp), w["value"])
             if i == 0:
-                for c in range(1, 7):
+                for c in range(1, 8):
                     ws.cell(r, c).fill = base_fill
             r += 1
+        _plat = []   # 平台格式行: (Register_Name, Register_Address, 主表值所在行, 信号变化描述)
         for st in tc["steps"]:
             node = (st.get("off_node") or "").split("/")[-1]
             hlabel, hop = "step %d" % st["index"], "OFF %s" % st["off_label"]
+            alias = st.get("alias") or ""
             tail = "；".join(list(st.get("warnings") or []) + ([st["note"]] if st.get("note") else []))
             if not st["writes"]:
                 # 空步骤：门已被前面共用位提前关，仍是一个测量点 —— 必须保留(1.8)
-                for c, v in enumerate([hlabel, hop, "", "", node, "（本级门已被前面共用位提前关，仍是测量点）" + ("；" + tail if tail else "")], 1):
+                for c, v in enumerate([hlabel, hop, alias, "", "", node, "（本级门已被前面共用位提前关，仍是测量点）" + ("；" + tail if tail else "")], 1):
                     ws.cell(r, c, v).fill = step_fill
                 r += 1
                 continue
             for i, w in enumerate(st["writes"]):
-                ftxt = ", ".join("%s[%s]:%d→%d" % (f["signal"], f["bit"], f["before"], f["after"])
-                                 for f in w.get("fields", []))
+                _sigchg = ", ".join("%s[%s]:%d→%d" % (f["signal"], f["bit"], f["before"], f["after"])
+                                    for f in w.get("fields", []))
+                ftxt = _sigchg
                 if i == 0 and tail:
                     ftxt = (ftxt + "   ⚠ " + tail) if ftxt else ("⚠ " + tail)
                 ws.cell(r, 1, hlabel if i == 0 else ""); ws.cell(r, 2, hop if i == 0 else "")
-                ws.cell(r, 3, w["addr"]); ws.cell(r, 5, node); ws.cell(r, 6, ftxt)
-                rmw(r, w["addr"], w["value"])
+                ws.cell(r, 3, alias if i == 0 else ""); ws.cell(r, 4, rb_addr(w["addr"], _grp)); ws.cell(r, 6, node); ws.cell(r, 7, ftxt)
+                rmw(r, rb_addr(w["addr"], _grp), w["value"])
+                _plat.append((w.get("reg") or "", rb_addr(w["addr"], _grp), r, _sigchg))
                 if i == 0:
-                    for c in range(1, 7):
+                    for c in range(1, 8):
                         ws.cell(r, c).fill = step_fill
                 r += 1
-        if tc["diagnostics"].get("uncovered_off_gates"):
+        # 未覆盖门诊断不渲染到交付 Excel：用户的关断列表本身即权威(要关什么用户自己列)；
+        # 且已知个别 uncovered 门经用户查电路确认 en 悬空/历史遗留，非真门。
+
+        # ▼ 平台格式：逐级关闭写序列 —— Register_Name / Register_Address / Register_Value / Description
+        #   一行=逐级关闭的一步寄存器写；Register_Value 引用上表该步值(随初始值 sheet 联动)；
+        #   Description=本模式在该寄存器动的位/信号。导入平台时可整块复制、按需「选择性粘贴-值」。
+        if _plat:
+            r += 2
+            ws.cell(r, 1, "▼ 平台格式（逐级关闭写序列，按关断顺序；值引用上表随初始值联动）").font = bold
             r += 1
-            ws.cell(r, 1, "⚠ 未覆盖门（需人工补写）:").font = bold; r += 1
-            for u in tc["diagnostics"]["uncovered_off_gates"]:
-                ws.cell(r, 1, "%s : %s" % (u["signal"], u.get("note", ""))); r += 1
+            for c, h in enumerate(["Register_Name", "Register_Address", "Register_Value", "Description"], 1):
+                cell = ws.cell(r, c, h); cell.font = bold; cell.fill = hdr_fill
+            r += 1
+            for pname, paddr, pvrow, pdesc in _plat:
+                ws.cell(r, 1, pname); ws.cell(r, 2, paddr)
+                ws.cell(r, 3, "=E%d" % pvrow); ws.cell(r, 4, pdesc)
+                r += 1
+
         for c, wd in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(c)].width = wd
         ws.column_dimensions["H"].hidden = True
         ws.freeze_panes = "A5"
     wb.save(path)
     return len(testcases)
+
+
+def rebase_workbook(path, pairs):
+    """交付地址改基址：把 xlsx 里所有单元格字符串中的 OLD 十六进制片段替换成 NEW（大小写不敏感）。
+    pairs=[(old,new),...]。工具内部用通用/占位基址，真实交付基址由调用方(数据侧)在命令行给，代码不含真实字面量。
+    地址与 INDEX/MATCH 的 key 会被一致替换（都过这里），故公式仍能匹配。"""
+    if not pairs:
+        return 0
+    import openpyxl, re as _re
+    rxs = [(_re.compile(_re.escape(o), _re.I), n) for o, n in pairs if o]
+    wb = openpyxl.load_workbook(path)   # 不用 data_only，保留公式字符串
+    n = 0
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if isinstance(c.value, str):
+                    v = c.value
+                    for rx, new in rxs:
+                        v = rx.sub(new, v)
+                    if v != c.value:
+                        c.value = v; n += 1
+    wb.save(path)
+    return n
 
 
 def render_debug_html(tc, flowgraph=None):
@@ -1067,6 +1278,10 @@ def main(argv=None):
     ap.add_argument("--out-ate", help="写 ate.txt")
     ap.add_argument("--out-html", help="写 debug.html")
     ap.add_argument("--xlsx", help="导出 Excel：**每个模式一张 sheet**。--project X --xlsx out.xlsx（默认导所有模式；配 --mode a,b 只导指定的）")
+    ap.add_argument("--rebase", action="append", default=[], metavar="OLD=NEW",
+                    help="交付时改基址：把地址里的 OLD 十六进制片段换成 NEW（大小写不敏感，可多次）。例 --rebase 5980D=59025。真实基址由此传入，代码不含。")
+    ap.add_argument("--base", action="append", default=[], metavar="GROUP=HEXBASE",
+                    help="聚合簿按 reg_group 分域改交付基址：例 --base GRPA=0x40010000 --base GRPB=0x40020000。比 --rebase 更适合多域聚合(多组共用寄存器各按 CPU 窗口出不同地址、初始值 sheet 各出一行)。给了 --base 就不走 --rebase。")
     ap.add_argument("--print", dest="do_print", action="store_true", help="打印 ate.txt 到控制台")
     args = ap.parse_args(argv)
 
@@ -1090,7 +1305,34 @@ def main(argv=None):
         lep = os.path.join(args.project, "dco_logic_expr.json")   # 门级布尔式（可选，用于 EN 映射列）
         logic_expr = load_json(lep) if os.path.exists(lep) else None
         ref = build_reference(fg, rm, go, logic_expr=logic_expr)   # block→EN布尔式→寄存器 参考表
-        render_xlsx(tcs, args.xlsx, reference=ref)
+        mip = os.path.join(args.project, "mode_inits.json")        # 每模式真实初始值(reg_name→hex)，来自芯片配置表
+        mode_inits = load_json(mip) if os.path.exists(mip) else {}
+        base_by_group = {}
+        for spec in (args.base or []):
+            if "=" in spec:
+                g, b = spec.split("=", 1)
+                try:
+                    base_by_group[g.strip()] = int(b.strip(), 16)
+                except ValueError:
+                    sys.exit("--base 值需十六进制：%s" % spec)
+        internal_base = None
+        try:
+            internal_base = int(str(rm.get("base_addr")), 16)
+        except (TypeError, ValueError):
+            pass
+        render_xlsx(tcs, args.xlsx, reference=ref, mode_inits=mode_inits,
+                    base_by_group=base_by_group or None, internal_base=internal_base)
+        if base_by_group:
+            print("已按域改基址：%s（内部基址 0x%X）"
+                  % (", ".join("%s→0x%X" % (g, b) for g, b in base_by_group.items()), internal_base or 0))
+        else:
+            pairs = []
+            for spec in (args.rebase or []):
+                if "=" in spec:
+                    o, nw = spec.split("=", 1); pairs.append((o.strip(), nw.strip()))
+            if pairs:
+                n = rebase_workbook(args.xlsx, pairs)
+                print("已 rebase 地址 %s（改了 %d 个单元格）" % (", ".join("%s→%s" % p for p in pairs), n))
         print("Excel 已写: %s  (Reference + %d 个模式 sheet: %s)" % (args.xlsx, len(tcs), ", ".join(ids)))
         return
 
