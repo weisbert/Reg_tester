@@ -688,6 +688,54 @@ def rnd(v, n=3):
     return round(v, n) if isinstance(v, float) else v
 
 
+def _inject_cached_values(xlsx_path, cache_by_sheet):
+    """给 openpyxl 写出的公式单元格补上缓存值 <v>，让不自动重算的查看器也能显示结果。
+    openpyxl 只写 <f> 不写 <v>，公式格在预览器/未重算的 Excel 里会空白——这里按坐标
+    注入预算好的数值（保留公式，改数据后 Excel 仍会重算覆盖）。纯 stdlib（zipfile+re）。
+    cache_by_sheet: {sheet标题: {坐标: 数值}}；数值为 None 的跳过（本就该显示空）。"""
+    import zipfile
+    if not any(cache_by_sheet.values()):
+        return
+    with zipfile.ZipFile(xlsx_path) as z:
+        order = z.namelist()
+        blob = {n: z.read(n) for n in order}
+    wbxml = blob["xl/workbook.xml"].decode("utf-8")
+    rels = blob["xl/_rels/workbook.xml.rels"].decode("utf-8")
+    rid_target = {}   # Id 与 Target 在标签里顺序不定，分别抓；Target 可能是 /xl/.. 绝对路径
+    for rel in re.findall(r"<Relationship\b[^>]*/>", rels):
+        idm = re.search(r'Id="([^"]+)"', rel)
+        tm = re.search(r'Target="([^"]+)"', rel)
+        if idm and tm:
+            t = tm.group(1)
+            rid_target[idm.group(1)] = t[1:] if t.startswith("/") else "xl/" + t.lstrip("./")
+    title_file = {}
+    for tag in re.findall(r"<sheet\b[^>]*/>", wbxml):
+        nm = re.search(r'name="([^"]+)"', tag)
+        rid = re.search(r'r:id="([^"]+)"', tag)
+        if nm and rid and rid.group(1) in rid_target:
+            title_file[nm.group(1)] = rid_target[rid.group(1)]
+    for title, cache in cache_by_sheet.items():
+        fn = title_file.get(title)
+        if not fn or not cache or fn not in blob:
+            continue
+        xml = blob[fn].decode("utf-8")
+        for coord, val in cache.items():
+            if val is None:
+                continue
+            vs = ("%.10g" % val) if isinstance(val, float) else str(val)
+            pat = re.compile(r'(<c r="%s"[^>]*>)(<f[^>]*>.*?</f>)(?:<v>.*?</v>)?(</c>)'
+                             % re.escape(coord), re.DOTALL)
+            xml, _n = pat.subn(
+                lambda m: m.group(1) + m.group(2) + "<v>" + vs + "</v>" + m.group(3),
+                xml, count=1)
+        blob[fn] = xml.encode("utf-8")
+    tmp = xlsx_path + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        for n in order:
+            z.writestr(n, blob[n])
+    os.replace(tmp, xlsx_path)
+
+
 def sim_lookup(conn, mode, ids, stage, tier=""):
     """返回 (合计uA, 缺失ID列表, trim集合, tier集合)。
     tier 非空时只取该档位；该档位没有但有无档位('')的旧数据时退回旧数据（兼容旧仿真表）。
@@ -1026,6 +1074,13 @@ def cmd_summary_export(conn, out_path, config):
     n_label = sum(1 for k in row_keys if parse_ids(str(k[0]).replace("+", ",")) is None)
 
     wb = openpyxl.Workbook()
+    fcache = {}   # {sheet标题: {坐标: 缓存值}}，写公式时记录，保存后注入 <v>
+
+    def fcell(ws_, r, c, formula, value, **kw):
+        """写公式并记录其缓存值（保存后注入，使不重算的查看器也能显示）。"""
+        _cell(ws_, r, c, formula, **kw)
+        fcache.setdefault(ws_.title, {})[f"{get_column_letter(c)}{r}"] = value
+        return value
 
     # ================= 说明 =================
     ws = wb.active
@@ -1056,7 +1111,8 @@ def cmd_summary_export(conn, out_path, config):
         f"{'也求和' if config.get('ldo_reparent_sim_add_child') else '不计子模块'}。",
         "  多 run 时每个 模式×芯片×温度 取时间最新一次。",
         "",
-        "偏差%、Σ 合计均为直接算好的数值（非公式，任何软件打开都能看到，不依赖 Excel 重算）。",
+        "偏差%、Σ 合计是 Excel 公式（改动实测/仿真数值会自动重算），同时已写入当前计算",
+        "结果的缓存值，任何软件（含不自动重算的预览器）打开都能立即看到数字。",
     ]
     for i, line in enumerate(lines, 2):
         ws.cell(row=i, column=1, value=line).font = Font(name=FONT_NAME, size=10)
@@ -1064,7 +1120,7 @@ def cmd_summary_export(conn, out_path, config):
 
     # ================= 总览 =================
     ws = wb.create_sheet("总览")
-    FIX = 4                                  # 编号/模块/仿真模块名/单位
+    FIX = 3                                  # 编号/模块/单位
     grp_w = n_t + 2                          # 每模式：温度列 + 仿真 + 偏差%
     note_col = FIX + len(col_keys) * grp_w + 1
 
@@ -1075,8 +1131,8 @@ def cmd_summary_export(conn, out_path, config):
     for r in range(1, 4):
         for c in range(1, note_col + 1):
             _cell(ws, r, c, fill=C_HEADER)
-    for c, (title, w) in enumerate(zip(["编号", "模块 (OFF 步)", "仿真模块名", "单位"],
-                                       [9, 24, 32, 6]), 1):
+    for c, (title, w) in enumerate(zip(["编号", "模块 (OFF 步)", "单位"],
+                                       [9, 30, 6]), 1):
         ws.merge_cells(start_row=1, start_column=c, end_row=3, end_column=c)
         _cell(ws, 1, c, title, bold=True, fill=C_HEADER)
         ws.column_dimensions[get_column_letter(c)].width = w
@@ -1106,17 +1162,34 @@ def cmd_summary_export(conn, out_path, config):
     r_mod0 = 7
     r_sum = r_mod0 + len(row_keys)          # Σ LO 模块行（不含末尾标签行）
     r_all = r_sum + 1 if n_label else None  # Σ 总合计行（含 DCO 等标签行，只有实测）
+    r_lo_last = r_sum - 1 - n_label         # 最后一个 LO 模块行（SUM 范围用）
     lo_keys = row_keys[:len(row_keys) - n_label]  # LO 模块行（标签行排最后 n_label 个）
 
-    # 偏差%/Σ 都用 Python 预计算静态值写入——openpyxl 写的公式不带缓存值，
-    # 不自动重算的查看器会显示空白（本机无 LibreOffice 可重算）。
+    # 编号交叠提示：同一物理编号在不同模式被分到不同关断组（如 25 单独 vs 25,24,23），
+    # 合并矩阵里就会出现两行含该编号——但各模式列错开填充、互不冲突，加注说明防误读。
+    id_sets = {k: set(parse_ids(str(k[0]).replace("+", ",")) or []) for k in row_keys}
+    overlap = {}
+    for k in row_keys:
+        if not id_sets[k]:
+            continue
+        partners = sorted({str(j[0]) for j in row_keys if j is not k and id_sets[j] & id_sets[k]})
+        if partners:
+            overlap[k] = "编号与「%s」重叠：不同模式的不同关断组，各模式列互不冲突" \
+                % "、".join(partners)
+
+    # 偏差%/Σ 都写公式；缓存值由 fcell 记录、保存后注入，使不重算的查看器也能显示。
+    def has_meas(key, mode, chip):
+        return any((mode, chip, t) in matrix[key] for t in temps)
+
     def col_sum(keys, mode, chip, t):
         vals = [matrix[k].get((mode, chip, t)) for k in keys
                 if matrix[k].get((mode, chip, t)) is not None]
         return sum(vals) if vals else None
 
-    def sim_col_sum(keys, mode):
-        vals = [sim_val.get((k, mode)) for k in keys if sim_val.get((k, mode)) is not None]
+    def sim_col_sum(keys, mode, chip):
+        # 只统计该模式实际测了的行的仿真——否则 25,24,23 与单独 25 都命中 ID=25 会双算
+        vals = [sim_val.get((k, mode)) for k in keys
+                if has_meas(k, mode, chip) and sim_val.get((k, mode)) is not None]
         return sum(vals) if vals else None
 
     def dev_of(m, s):
@@ -1128,8 +1201,7 @@ def cmd_summary_export(conn, out_path, config):
                            (r_end, "全关残留电流", "mA")):
         _cell(ws, rr, 1, fill=C_SETTING)
         _cell(ws, rr, 2, name, bold=True, fill=C_SETTING, align="left")
-        _cell(ws, rr, 3, "", fill=C_SETTING)
-        _cell(ws, rr, 4, unit, fill=C_SETTING)
+        _cell(ws, rr, 3, unit, fill=C_SETTING)
     for gi, (mode, chip) in enumerate(col_keys):
         c0 = FIX + 1 + gi * grp_w
         for cc in range(c0, c0 + grp_w):     # 频率行整组打底再合并
@@ -1163,18 +1235,23 @@ def cmd_summary_export(conn, out_path, config):
         disp, step_name = key
         _cell(ws, rr, 1, disp)
         _cell(ws, rr, 2, step_name, align="left")
-        _cell(ws, rr, 3, sim_names.get(key, ""), align="left")
-        _cell(ws, rr, 4, "µA")
+        _cell(ws, rr, 3, "µA")
         for gi, (mode, chip) in enumerate(col_keys):
             c0 = FIX + 1 + gi * grp_w
             for ti, t in enumerate(temps):
                 v = matrix[key].get((mode, chip, t))
                 _cell(ws, rr, c0 + ti, rnd(v, 1) if v is not None else "", fmt=FMT_UA)
-            sv = sim_val.get((key, mode))
+            # 仿真只在该模式实际测了这行时显示（防 25/25,24,23 交叠重复计入）
+            sv = sim_val.get((key, mode)) if has_meas(key, mode, chip) else None
             _cell(ws, rr, c0 + n_t, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
+            ci_ref = c0 + (temps.index(ref_temp) if ref_temp in temps else 0)
+            mr, sr = ref(rr, ci_ref), ref(rr, c0 + n_t)
             dv = dev_of(matrix[key].get((mode, chip, ref_temp)), sv)
-            _cell(ws, rr, c0 + n_t + 1, rnd(dv, 4) if dv is not None else "", fmt=FMT_PCT)
+            fcell(ws, rr, c0 + n_t + 1, f'=IF(OR({mr}="",{sr}=""),"",({mr}-{sr})/{sr})',
+                  rnd(dv, 4) if dv is not None else None, fmt=FMT_PCT)
         note_parts = sorted(notes.get(key, ()))
+        if key in overlap:
+            note_parts.append(overlap[key])
         if key not in siminfo and parse_ids(str(disp).replace("+", ",")) is None:
             note_parts.append("仿真无对应项（标签未映射，config.label_groups 可配）")
         _cell(ws, rr, note_col, "；".join(note_parts), align="left")
@@ -1183,33 +1260,36 @@ def cmd_summary_export(conn, out_path, config):
     _cell(ws, r_sum, 1, fill=C_SEP)
     _cell(ws, r_sum, 2, "Σ LO 模块合计" if n_label else "Σ 模块合计",
           bold=True, fill=C_SEP, align="left")
-    _cell(ws, r_sum, 3, fill=C_SEP)
-    _cell(ws, r_sum, 4, "µA", bold=True, fill=C_SEP)
+    _cell(ws, r_sum, 3, "µA", bold=True, fill=C_SEP)
     for gi, (mode, chip) in enumerate(col_keys):
         c0 = FIX + 1 + gi * grp_w
         for ti, t in enumerate(temps):
+            col = c0 + ti
             v = col_sum(lo_keys, mode, chip, t)
-            _cell(ws, r_sum, c0 + ti, rnd(v, 1) if v is not None else "",
-                  bold=True, fill=C_SEP, fmt=FMT_UA)
-        sv = sim_col_sum(lo_keys, mode)
-        _cell(ws, r_sum, c0 + n_t, rnd(sv, 1) if sv is not None else "",
-              bold=True, fill=C_SEP, fmt=FMT_UA)
+            fcell(ws, r_sum, col, f"=SUM({ref(r_mod0, col)}:{ref(r_lo_last, col)})",
+                  rnd(v, 1) if v is not None else None, bold=True, fill=C_SEP, fmt=FMT_UA)
+        col = c0 + n_t
+        sv = sim_col_sum(lo_keys, mode, chip)
+        fcell(ws, r_sum, col, f"=SUM({ref(r_mod0, col)}:{ref(r_lo_last, col)})",
+              rnd(sv, 1) if sv is not None else None, bold=True, fill=C_SEP, fmt=FMT_UA)
+        ci_ref = c0 + (temps.index(ref_temp) if ref_temp in temps else 0)
+        mr, sr = ref(r_sum, ci_ref), ref(r_sum, c0 + n_t)
         dv = dev_of(col_sum(lo_keys, mode, chip, ref_temp), sv)
-        _cell(ws, r_sum, c0 + n_t + 1, rnd(dv, 4) if dv is not None else "",
-              bold=True, fill=C_SEP, fmt=FMT_PCT)
+        fcell(ws, r_sum, c0 + n_t + 1, f'=IF(OR({mr}=0,{sr}=0),"",({mr}-{sr})/{sr})',
+              rnd(dv, 4) if dv is not None else None, bold=True, fill=C_SEP, fmt=FMT_PCT)
     _cell(ws, r_sum, note_col, "不含下方标签行（DCO 等），口径与仿真一致" if n_label else "",
           fill=C_SEP, align="left")
     if r_all:
         _cell(ws, r_all, 1, fill=C_SEP)
         _cell(ws, r_all, 2, "Σ 总合计（含 DCO 等标签行）", bold=True, fill=C_SEP, align="left")
-        _cell(ws, r_all, 3, fill=C_SEP)
-        _cell(ws, r_all, 4, "µA", bold=True, fill=C_SEP)
+        _cell(ws, r_all, 3, "µA", bold=True, fill=C_SEP)
         for gi, (mode, chip) in enumerate(col_keys):
             c0 = FIX + 1 + gi * grp_w
             for ti, t in enumerate(temps):
+                col = c0 + ti
                 v = col_sum(row_keys, mode, chip, t)
-                _cell(ws, r_all, c0 + ti, rnd(v, 1) if v is not None else "",
-                      bold=True, fill=C_SEP, fmt=FMT_UA)
+                fcell(ws, r_all, col, f"=SUM({ref(r_mod0, col)}:{ref(r_sum - 1, col)})",
+                      rnd(v, 1) if v is not None else None, bold=True, fill=C_SEP, fmt=FMT_UA)
             _cell(ws, r_all, c0 + n_t, "", fill=C_SEP)
             _cell(ws, r_all, c0 + n_t + 1, "", fill=C_SEP)
         _cell(ws, r_all, note_col, "仿真未覆盖标签行，无对比", fill=C_SEP, align="left")
@@ -1278,9 +1358,9 @@ def cmd_summary_export(conn, out_path, config):
 
     # ================= 对比明细 =================
     ws = wb.create_sheet("对比明细")
-    hdrs = ["模式", "芯片", "温度", "编号", "模块 (OFF 步)", "仿真模块名",
+    hdrs = ["模式", "芯片", "温度", "编号", "模块 (OFF 步)",
             "实测_µA", "仿真pre_µA", "仿真post_µA", "Δ_µA", "Δ%", "备注"]
-    widths = [20, 7, 8, 9, 24, 32, 11, 11, 11, 10, 8, 40]
+    widths = [20, 7, 8, 9, 30, 11, 11, 11, 10, 8, 40]
     for c, (h, w) in enumerate(zip(hdrs, widths), 1):
         _cell(ws, 1, c, h, bold=True, fill=C_HEADER)
         ws.column_dimensions[get_column_letter(c)].width = w
@@ -1300,29 +1380,31 @@ def cmd_summary_export(conn, out_path, config):
                 _cell(ws, rr, 3, t if t is not None else "")
                 _cell(ws, rr, 4, disp)
                 _cell(ws, rr, 5, step_name, align="left")
-                _cell(ws, rr, 6, sim_names.get(key, ""), align="left")
                 mv = matrix[key][k3]
-                _cell(ws, rr, 7, rnd(mv, 1), fmt=FMT_UA)
+                _cell(ws, rr, 6, rnd(mv, 1), fmt=FMT_UA)
                 pv, sv = sim_pre_val.get((key, mode)), sim_val.get((key, mode))
-                _cell(ws, rr, 8, rnd(pv, 1) if pv is not None else "", fmt=FMT_UA)
-                _cell(ws, rr, 9, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
+                _cell(ws, rr, 7, rnd(pv, 1) if pv is not None else "", fmt=FMT_UA)
+                _cell(ws, rr, 8, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
                 diff = (mv - sv) if sv is not None else None
-                _cell(ws, rr, 10, rnd(diff, 1) if diff is not None else "", fmt=FMT_UA)
+                fcell(ws, rr, 9, f'=IF(H{rr}="","",F{rr}-H{rr})',
+                      rnd(diff, 1) if diff is not None else None, fmt=FMT_UA)
                 dv = dev_of(mv, sv)
-                _cell(ws, rr, 11, rnd(dv, 4) if dv is not None else "", fmt=FMT_PCT)
-                _cell(ws, rr, 12, "；".join(sorted(notes.get(key, ()))), align="left")
+                fcell(ws, rr, 10, f'=IF(H{rr}="","",(F{rr}-H{rr})/H{rr})',
+                      rnd(dv, 4) if dv is not None else None, fmt=FMT_PCT)
+                _cell(ws, rr, 11, "；".join(sorted(notes.get(key, ()))), align="left")
                 rr += 1
     if rr > 2:
-        ws.auto_filter.ref = f"A1:L{rr - 1}"
-        ws.conditional_formatting.add(f"K2:K{rr - 1}", ColorScaleRule(
+        ws.auto_filter.ref = f"A1:K{rr - 1}"
+        ws.conditional_formatting.add(f"J2:J{rr - 1}", ColorScaleRule(
             start_type="num", start_value=-0.5, start_color="63BE7B",
             mid_type="num", mid_value=0, mid_color="FFFFFF",
             end_type="num", end_value=0.5, end_color="F8696B"))
-        ws.conditional_formatting.add(f"K2:K{rr - 1}", CellIsRule(
+        ws.conditional_formatting.add(f"J2:J{rr - 1}", CellIsRule(
             operator="notBetween", formula=[str(-thr), str(thr)], font=red))
     ws.freeze_panes = "A2"
 
     wb.save(out_path)
+    _inject_cached_values(out_path, fcache)   # 给公式补缓存值，不重算的查看器也能显示
     return len(runs), len(row_keys), n_charts
 
 
