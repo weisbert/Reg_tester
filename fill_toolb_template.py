@@ -29,6 +29,7 @@ data JSON 结构:
 设计: 只写单元格 .value, 不动模板样式/下拉/其它 sheet(填写说明等), 保留原厂格式。
 """
 import argparse, json, os, re, sys
+from copy import copy
 import openpyxl
 from openpyxl.utils import get_column_letter
 try: sys.stdout.reconfigure(encoding="utf-8")
@@ -103,6 +104,9 @@ def main():
     ap.add_argument("-o","--out",default=None)
     ap.add_argument("--sheet",default=None)
     ap.add_argument("--header-row",type=int,default=None)
+    ap.add_argument("--style-row",type=int,default=None,
+                    help="拿哪一行当'数据行格式'模板往下套(默认=表头下第一行)")
+    ap.add_argument("--no-style",action="store_true",help="不复制模板数据行格式")
     ap.add_argument("--dry-run",action="store_true")
     args=ap.parse_args()
 
@@ -142,6 +146,24 @@ def main():
     for r in range(start,start+400):
         if ws.cell(r,no_col).value not in (None,""): existing_last=r
 
+    # 抓"数据行格式"模板(默认表头下第一行): 每列的填充/字体/边框/对齐/数字格式,
+    # 写完值后套到我写的每一行——否则超出模板已有格式区的行是裸单元格(格式丢失)。
+    style_by_col=None
+    if not args.no_style:
+        srow=args.style_row or start
+        style_by_col={}
+        for c in range(1,maxc+1):
+            s=ws.cell(srow,c)
+            if s.has_style:
+                style_by_col[c]=(copy(s.font),copy(s.fill),copy(s.border),
+                                 copy(s.alignment),s.number_format,copy(s.protection))
+    def apply_style(rr):
+        if not style_by_col: return
+        for c,(fo,fi,bo,al,nf,pr) in style_by_col.items():
+            cell=ws.cell(rr,c)
+            cell.font=copy(fo); cell.fill=copy(fi); cell.border=copy(bo)
+            cell.alignment=copy(al); cell.number_format=nf; cell.protection=copy(pr)
+
     r=start
     for row in rows:
         def put(field,val):
@@ -163,6 +185,7 @@ def main():
             if k<len(regs):
                 a,v=regs[k]; ws.cell(r,ac,fmt_addr(a,bare)); ws.cell(r,ac+1,fmt_val(v))
             else: ws.cell(r,ac,None); ws.cell(r,ac+1,None)
+        apply_style(r)
         r+=1
     my_last=r-1
     cleared=0
