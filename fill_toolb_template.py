@@ -184,13 +184,14 @@ def main():
             ac=reg_cols[k]
             if k<len(regs):
                 a,v=regs[k]; ws.cell(r,ac,fmt_addr(a,bare)); ws.cell(r,ac+1,fmt_val(v))
-            else: ws.cell(r,ac,None); ws.cell(r,ac+1,None)
+            else:  # 清空多余 reg 对 —— 必须 .value=None; ws.cell(r,c,None) 传 None 是空操作不清!
+                ws.cell(r,ac).value=None; ws.cell(r,ac+1).value=None
         apply_style(r)
         r+=1
     my_last=r-1
     cleared=0
     for rr in range(my_last+1,existing_last+1):
-        for c in managed: ws.cell(rr,c,None)
+        for c in managed: ws.cell(rr,c).value=None   # 同上: 必须 .value=None
         cleared+=1
 
     out=args.out or os.path.splitext(args.template)[0]+"_filled"+os.path.splitext(args.template)[1]
