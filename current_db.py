@@ -77,8 +77,11 @@ DEFAULT_CONFIG = {
         "exclude_globs": "扫描时按文件名跳过的通配符（本工具自己的输出必须在内，防自吞）",
         "sim_tier": "参与对比的仿真电流档位（如 Tier2，与实测一致）；空=不过滤（多档共存会重复求和！）",
         "sim_temp_note": "仿真数据的温度/corner 标注，只用于表头展示（如 55C/TT/0.9V）",
-        "delta_flag_pct": "汇总簿里 |偏差%| 超过该值标红（默认 20）",
-        "delta_ref_temp": "汇总簿偏差列用哪个实测温度对仿真（null=自动取离 55℃ 最近的温度点）",
+        "delta_flag_pct": "汇总簿标红：|偏差%| 超过该值才可能标红（默认 20）",
+        "delta_flag_abs_ua": "汇总簿标红的绝对偏差下限 µA（默认 40）：|偏差%| 与 |ΔµA| 双双"
+                             "超阈才标红，避免小电流模块被百分比放大成假红",
+        "sim_temp_c": "仿真数据的温度（℃，默认从 sim_temp_note 解析数字）；偏差列把实测线性"
+                      "插值到该温度再对仿真，消除单点仿真 vs 多温实测的系统性温差",
         "mode_freq": "汇总簿测试频率条件行：模式名 -> 显示文本；不在表里的按名字推断"
                      "（含 2G -> 2.5GHz，含 5G -> 5.8GHz）",
     },
@@ -95,7 +98,9 @@ DEFAULT_CONFIG = {
     "sim_tier": "Tier2",
     "sim_temp_note": "55C",
     "delta_flag_pct": 20,
+    "delta_flag_abs_ua": 40,
     "delta_ref_temp": None,
+    "sim_temp_c": None,
     "mode_freq": {},
 }
 
@@ -988,6 +993,7 @@ def cmd_summary_export(conn, out_path, config):
     tier = config.get("sim_tier") or ""
     sim_note = config.get("sim_temp_note") or ""
     thr = float(config.get("delta_flag_pct") or 20) / 100.0
+    abs_thr = float(config.get("delta_flag_abs_ua") or 0)   # 双阈值绝对下限 µA
 
     runs = latest_runs(conn)
     if not runs:
@@ -997,10 +1003,27 @@ def cmd_summary_export(conn, out_path, config):
     temps = sorted({r[3] for r in runs if r[3] is not None})
     if not temps:
         temps = [None]
-    ref_temp = config.get("delta_ref_temp")
-    if ref_temp is None:
-        ref_temp = min(temps, key=lambda t: abs((t if t is not None else 25) - 55))
     n_t = len(temps)
+    # 仿真温度：偏差把实测线性插值到该温度再对仿真，消除单点仿真 vs 多温实测的系统温差
+    sim_temp_c = config.get("sim_temp_c")
+    if sim_temp_c is None:
+        m = re.search(r"-?\d+(?:\.\d+)?", str(config.get("sim_temp_note") or ""))
+        sim_temp_c = float(m.group(0)) if m else (temps[0] if temps[0] is not None else 25)
+
+    def interp_to(pairs, target):
+        """线性插值到 target 温度；范围外取最近端点（不外推）；单点直接返回。"""
+        pts = sorted((t, v) for t, v in pairs if t is not None and v is not None)
+        if not pts:
+            return None
+        if len(pts) == 1 or target <= pts[0][0]:
+            return pts[0][1]
+        if target >= pts[-1][0]:
+            return pts[-1][1]
+        for i in range(1, len(pts)):
+            (t0, v0), (t1, v1) = pts[i - 1], pts[i]
+            if t0 <= target <= t1:
+                return v0 + (v1 - v0) * (target - t0) / (t1 - t0)
+        return pts[-1][1]
 
     # 列组 = (mode, chip)，按首个 run_id 排（=入库顺序=测试顺序）
     first_id = {}
@@ -1037,6 +1060,7 @@ def cmd_summary_export(conn, out_path, config):
 
     # 行 universe：(disp, step_name)，按平均步序排
     matrix, order_sum, order_cnt, notes, siminfo = {}, {}, {}, {}, {}
+    caliber_keys = set()   # LDO 归并父行：实测含子模块、仿真不含 -> 口径不可比，不标红
     for (mode, chip, temp), groups in per_groups.items():
         for step_order, disp, step_name, sim_ids_j, sim_mode, ua, note in groups:
             key = (disp, step_name)
@@ -1046,6 +1070,8 @@ def cmd_summary_export(conn, out_path, config):
             if sim_ids_j and key not in siminfo:
                 siminfo[key] = (json.loads(sim_ids_j), sim_mode)
             if note:
+                if "不在被测LDO" in note:
+                    caliber_keys.add(key)
                 keep = "；".join(x for x in note.split("；")
                                  if "不在被测LDO" in x or ("映射" in x and "未映射" not in x))
                 if keep:
@@ -1097,18 +1123,20 @@ def cmd_summary_export(conn, out_path, config):
         "【总览页】行=模块（按 buffer 编号从低到高，组合组取组内最小号，DCO 标签行在最后），",
         "  列=模式×温度的实测电流 + 仿真参考 + 偏差%。顶部条件行：测试频率（2G=2.5GHz/5G=5.8GHz）、",
         "  锁定后总电流（做差基线）、全关残留电流（末个 OFF 步实测=全部关断后的末态）。",
-        f"  偏差% = (实测@{_t(ref_temp) if ref_temp is not None else '?'} − 仿真post) / 仿真post，"
-        f"|偏差%| > {thr * 100:.0f}% 标红（阈值在 current_config.json 的 delta_flag_pct 改）。",
-        f"  注意：仿真是 {sim_note or '单温度'} 单点，与各实测温度直接对比含系统性温差。",
+        f"  偏差% = (实测插值到{'%g' % sim_temp_c}℃ − 仿真post) / 仿真post。仿真是{'%g' % sim_temp_c}℃"
+        "单点，故把实测按 −40/25/105 三点线性插值到该温度再比（偏差列表头带 * 标注），",
+        "  消除单点仿真 vs 多温实测的系统性温差；三温实测原值仍分列可见。",
+        f"  标红=双阈值：|偏差%|>{thr * 100:.0f}% 且 |绝对偏差|>{abs_thr:.0f}µA 才红——避免小电流"
+        "模块被百分比放大成假红（阈值 delta_flag_pct / delta_flag_abs_ua 可改）。",
         "",
-        "【颜色】黄=表头；米色=条件/汇总行（mA）；白=模块行（µA）；蓝=Σ合计；红粗=超阈值偏差。",
+        "【颜色】黄=表头；米色=条件/汇总行（mA）；白=模块行（µA）；蓝=Σ合计；红粗=双阈值超标偏差。",
         "",
         "【计算规则】",
         "  基线 = 每模式段第一个 OFF 前最后一行（末个 Lock_step）；模块电流 = 上一行 − 本行。",
         "  底部 Σ 分两行：Σ LO 模块合计（不含 DCO 等标签行，口径与仿真一致、带偏差%）；",
         "  Σ 总合计（含标签行，只有实测）。锁定后总电流是整机电流，不与仿真直接对比。",
-        f"  LDO 归并 {config.get('ldo_reparent')}：子模块实测并入父组，仿真侧"
-        f"{'也求和' if config.get('ldo_reparent_sim_add_child') else '不计子模块'}。",
+        f"  LDO 归并 {config.get('ldo_reparent')}：子模块实测并入父组、仿真侧不计子模块，"
+        "故父组(如 6/26)实测含子、仿真不含=口径不可比，偏差仅供参考、不标红（见该行备注）。",
         "  多 run 时每个 模式×芯片×温度 取时间最新一次。",
         "",
         "偏差%、Σ 合计是 Excel 公式（改动实测/仿真数值会自动重算），同时已写入当前计算",
@@ -1148,8 +1176,7 @@ def cmd_summary_export(conn, out_path, config):
         for ti, t in enumerate(temps):
             _cell(ws, 3, c0 + ti, _t(t) if t is not None else "?", bold=True, fill=C_HEADER)
         _cell(ws, 3, c0 + n_t, (f"{sim_note} {tier}".strip() or "post"), bold=True, fill=C_HEADER)
-        _cell(ws, 3, c0 + n_t + 1,
-              f"vs{_t(ref_temp) if ref_temp is not None else ''}", bold=True, fill=C_HEADER)
+        _cell(ws, 3, c0 + n_t + 1, f"vs{'%g' % sim_temp_c}℃*", bold=True, fill=C_HEADER)
         for ti in range(n_t):
             ws.column_dimensions[get_column_letter(c0 + ti)].width = 9.5
         ws.column_dimensions[get_column_letter(c0 + n_t)].width = 10
@@ -1194,6 +1221,38 @@ def cmd_summary_export(conn, out_path, config):
 
     def dev_of(m, s):
         return (m - s) / s if (m is not None and s not in (None, 0)) else None
+
+    def meas_at_sim(key, mode, chip):
+        """该行实测插值到仿真温度（sim_temp_c）。"""
+        return interp_to([(t, matrix[key].get((mode, chip, t))) for t in temps], sim_temp_c)
+
+    def lo_meas_at_sim(mode, chip):
+        return interp_to([(t, col_sum(lo_keys, mode, chip, t)) for t in temps], sim_temp_c)
+
+    def flag_red(dev, meas, sim, key):
+        """双阈值 + 口径守卫：|偏差%|>thr 且 |ΔµA|>abs_thr，且非 LDO 口径不可比行。"""
+        if dev is None or meas is None or sim is None or key in caliber_keys:
+            return False
+        return abs(dev) > thr and abs(meas - sim) > abs_thr
+
+    def interp_expr(rr, c0):
+        """该行实测插值到 sim_temp_c 的 Excel 表达式（引用温度列单元格，随实测联动）。"""
+        pts = sorted((t, i) for i, t in enumerate(temps) if t is not None)
+        if not pts:
+            return None
+        if len(pts) == 1 or sim_temp_c <= pts[0][0]:
+            return ref(rr, c0 + pts[0][1])
+        if sim_temp_c >= pts[-1][0]:
+            return ref(rr, c0 + pts[-1][1])
+        for i in range(1, len(pts)):
+            (t0, i0), (t1, i1) = pts[i - 1], pts[i]
+            if t0 <= sim_temp_c <= t1:
+                w = (sim_temp_c - t0) / (t1 - t0)
+                a, b = ref(rr, c0 + i0), ref(rr, c0 + i1)
+                return f"({a}+{w:g}*({b}-{a}))"
+        return ref(rr, c0 + pts[-1][1])
+
+    red_font = Font(name=FONT_NAME, size=10, bold=True, color=C_FLAG)
 
     # -- 条件/汇总行（米色）：测试频率 / 锁定后总电流 / 全关残留
     for rr, name, unit in ((r_freq, "测试频率", ""),
@@ -1244,11 +1303,17 @@ def cmd_summary_export(conn, out_path, config):
             # 仿真只在该模式实际测了这行时显示（防 25/25,24,23 交叠重复计入）
             sv = sim_val.get((key, mode)) if has_meas(key, mode, chip) else None
             _cell(ws, rr, c0 + n_t, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
-            ci_ref = c0 + (temps.index(ref_temp) if ref_temp in temps else 0)
-            mr, sr = ref(rr, ci_ref), ref(rr, c0 + n_t)
-            dv = dev_of(matrix[key].get((mode, chip, ref_temp)), sv)
-            fcell(ws, rr, c0 + n_t + 1, f'=IF(OR({mr}="",{sr}=""),"",({mr}-{sr})/{sr})',
-                  rnd(dv, 4) if dv is not None else None, fmt=FMT_PCT)
+            dc = c0 + n_t + 1
+            mv = meas_at_sim(key, mode, chip)   # 实测插值到仿真温度再比
+            dv = dev_of(mv, sv)
+            if dv is not None:
+                sr = ref(rr, c0 + n_t)
+                fcell(ws, rr, dc, f'=IF({sr}="","",({interp_expr(rr, c0)}-{sr})/{sr})',
+                      rnd(dv, 4), fmt=FMT_PCT)
+                if flag_red(dv, mv, sv, key):
+                    ws.cell(row=rr, column=dc).font = red_font
+            else:
+                _cell(ws, rr, dc, "", fmt=FMT_PCT)
         note_parts = sorted(notes.get(key, ()))
         if key in overlap:
             note_parts.append(overlap[key])
@@ -1272,11 +1337,17 @@ def cmd_summary_export(conn, out_path, config):
         sv = sim_col_sum(lo_keys, mode, chip)
         fcell(ws, r_sum, col, f"=SUM({ref(r_mod0, col)}:{ref(r_lo_last, col)})",
               rnd(sv, 1) if sv is not None else None, bold=True, fill=C_SEP, fmt=FMT_UA)
-        ci_ref = c0 + (temps.index(ref_temp) if ref_temp in temps else 0)
-        mr, sr = ref(r_sum, ci_ref), ref(r_sum, c0 + n_t)
-        dv = dev_of(col_sum(lo_keys, mode, chip, ref_temp), sv)
-        fcell(ws, r_sum, c0 + n_t + 1, f'=IF(OR({mr}=0,{sr}=0),"",({mr}-{sr})/{sr})',
-              rnd(dv, 4) if dv is not None else None, bold=True, fill=C_SEP, fmt=FMT_PCT)
+        dc = c0 + n_t + 1
+        lo_mv = lo_meas_at_sim(mode, chip)
+        dv = dev_of(lo_mv, sv)
+        if dv is not None:
+            sr = ref(r_sum, c0 + n_t)
+            fcell(ws, r_sum, dc, f'=IF({sr}=0,"",({interp_expr(r_sum, c0)}-{sr})/{sr})',
+                  rnd(dv, 4), bold=True, fill=C_SEP, fmt=FMT_PCT)
+            if flag_red(dv, lo_mv, sv, None):
+                ws.cell(row=r_sum, column=dc).font = red_font
+        else:
+            _cell(ws, r_sum, dc, "", bold=True, fill=C_SEP, fmt=FMT_PCT)
     _cell(ws, r_sum, note_col, "不含下方标签行（DCO 等），口径与仿真一致" if n_label else "",
           fill=C_SEP, align="left")
     if r_all:
@@ -1294,14 +1365,9 @@ def cmd_summary_export(conn, out_path, config):
             _cell(ws, r_all, c0 + n_t + 1, "", fill=C_SEP)
         _cell(ws, r_all, note_col, "仿真未覆盖标签行，无对比", fill=C_SEP, align="left")
 
-    # 偏差%列条件格式：|Δ| 超阈值红粗（含条件行与 Σ 行）
-    red = Font(name=FONT_NAME, size=10, bold=True, color=C_FLAG)
-    for gi in range(len(col_keys)):
-        cd = FIX + 1 + gi * grp_w + n_t + 1
-        rng = f"{ref(r_base, cd)}:{ref(r_sum, cd)}"
-        ws.conditional_formatting.add(rng, CellIsRule(
-            operator="notBetween", formula=[str(-thr), str(thr)], font=red))
-    ws.freeze_panes = ws.cell(row=r_base, column=FIX + 1)
+    # 偏差红标改为写单元格时的双阈值静态染色（见 flag_red）——绝对偏差不在表内，
+    # 条件格式无法做「|Δ%|>阈 且 |ΔµA|>阈」的联合判断，故用 Python 直接染红粗。
+    ws.freeze_panes = ws.cell(row=r_freq, column=FIX + 1)
 
     # ================= 温度趋势 =================
     n_charts = 0
@@ -1364,7 +1430,6 @@ def cmd_summary_export(conn, out_path, config):
     for c, (h, w) in enumerate(zip(hdrs, widths), 1):
         _cell(ws, 1, c, h, bold=True, fill=C_HEADER)
         ws.column_dimensions[get_column_letter(c)].width = w
-    red = Font(name=FONT_NAME, size=10, bold=True, color=C_FLAG)
     rr = 2
     for mode, chip in col_keys:
         for t in temps:
@@ -1391,16 +1456,12 @@ def cmd_summary_export(conn, out_path, config):
                 dv = dev_of(mv, sv)
                 fcell(ws, rr, 10, f'=IF(H{rr}="","",(F{rr}-H{rr})/H{rr})',
                       rnd(dv, 4) if dv is not None else None, fmt=FMT_PCT)
+                if flag_red(dv, mv, sv, key):   # 双阈值 + 口径守卫，同总览
+                    ws.cell(row=rr, column=10).font = red_font
                 _cell(ws, rr, 11, "；".join(sorted(notes.get(key, ()))), align="left")
                 rr += 1
     if rr > 2:
         ws.auto_filter.ref = f"A1:K{rr - 1}"
-        ws.conditional_formatting.add(f"J2:J{rr - 1}", ColorScaleRule(
-            start_type="num", start_value=-0.5, start_color="63BE7B",
-            mid_type="num", mid_value=0, mid_color="FFFFFF",
-            end_type="num", end_value=0.5, end_color="F8696B"))
-        ws.conditional_formatting.add(f"J2:J{rr - 1}", CellIsRule(
-            operator="notBetween", formula=[str(-thr), str(thr)], font=red))
     ws.freeze_panes = "A2"
 
     wb.save(out_path)
