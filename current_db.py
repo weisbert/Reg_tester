@@ -1056,7 +1056,7 @@ def cmd_summary_export(conn, out_path, config):
         f"{'也求和' if config.get('ldo_reparent_sim_add_child') else '不计子模块'}。",
         "  多 run 时每个 模式×芯片×温度 取时间最新一次。",
         "",
-        "偏差% 与 Σ 合计是公式，改动数值后 Excel 会自动重算。",
+        "偏差%、Σ 合计均为直接算好的数值（非公式，任何软件打开都能看到，不依赖 Excel 重算）。",
     ]
     for i, line in enumerate(lines, 2):
         ws.cell(row=i, column=1, value=line).font = Font(name=FONT_NAME, size=10)
@@ -1106,7 +1106,21 @@ def cmd_summary_export(conn, out_path, config):
     r_mod0 = 7
     r_sum = r_mod0 + len(row_keys)          # Σ LO 模块行（不含末尾标签行）
     r_all = r_sum + 1 if n_label else None  # Σ 总合计行（含 DCO 等标签行，只有实测）
-    r_lo_last = r_sum - 1 - n_label         # 最后一个 LO 模块行
+    lo_keys = row_keys[:len(row_keys) - n_label]  # LO 模块行（标签行排最后 n_label 个）
+
+    # 偏差%/Σ 都用 Python 预计算静态值写入——openpyxl 写的公式不带缓存值，
+    # 不自动重算的查看器会显示空白（本机无 LibreOffice 可重算）。
+    def col_sum(keys, mode, chip, t):
+        vals = [matrix[k].get((mode, chip, t)) for k in keys
+                if matrix[k].get((mode, chip, t)) is not None]
+        return sum(vals) if vals else None
+
+    def sim_col_sum(keys, mode):
+        vals = [sim_val.get((k, mode)) for k in keys if sim_val.get((k, mode)) is not None]
+        return sum(vals) if vals else None
+
+    def dev_of(m, s):
+        return (m - s) / s if (m is not None and s not in (None, 0)) else None
 
     # -- 条件/汇总行（米色）：测试频率 / 锁定后总电流 / 全关残留
     for rr, name, unit in ((r_freq, "测试频率", ""),
@@ -1158,10 +1172,8 @@ def cmd_summary_export(conn, out_path, config):
                 _cell(ws, rr, c0 + ti, rnd(v, 1) if v is not None else "", fmt=FMT_UA)
             sv = sim_val.get((key, mode))
             _cell(ws, rr, c0 + n_t, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
-            ci_ref = c0 + temps.index(ref_temp) if ref_temp in temps else c0
-            m_ref, s_ref = ref(rr, ci_ref), ref(rr, c0 + n_t)
-            _cell(ws, rr, c0 + n_t + 1,
-                  f'=IF(OR({m_ref}="",{s_ref}=""),"",({m_ref}-{s_ref})/{s_ref})', fmt=FMT_PCT)
+            dv = dev_of(matrix[key].get((mode, chip, ref_temp)), sv)
+            _cell(ws, rr, c0 + n_t + 1, rnd(dv, 4) if dv is not None else "", fmt=FMT_PCT)
         note_parts = sorted(notes.get(key, ()))
         if key not in siminfo and parse_ids(str(disp).replace("+", ",")) is None:
             note_parts.append("仿真无对应项（标签未映射，config.label_groups 可配）")
@@ -1175,15 +1187,15 @@ def cmd_summary_export(conn, out_path, config):
     _cell(ws, r_sum, 4, "µA", bold=True, fill=C_SEP)
     for gi, (mode, chip) in enumerate(col_keys):
         c0 = FIX + 1 + gi * grp_w
-        for ti in range(n_t + 1):        # 温度列 + 仿真列都求和（标签行仿真为空不影响）
-            col = c0 + ti
-            _cell(ws, r_sum, col,
-                  f"=SUM({ref(r_mod0, col)}:{ref(r_lo_last, col)})",
+        for ti, t in enumerate(temps):
+            v = col_sum(lo_keys, mode, chip, t)
+            _cell(ws, r_sum, c0 + ti, rnd(v, 1) if v is not None else "",
                   bold=True, fill=C_SEP, fmt=FMT_UA)
-        ci_ref = c0 + temps.index(ref_temp) if ref_temp in temps else c0
-        m_ref, s_ref = ref(r_sum, ci_ref), ref(r_sum, c0 + n_t)
-        _cell(ws, r_sum, c0 + n_t + 1,
-              f'=IF(OR({m_ref}=0,{s_ref}=0),"",({m_ref}-{s_ref})/{s_ref})',
+        sv = sim_col_sum(lo_keys, mode)
+        _cell(ws, r_sum, c0 + n_t, rnd(sv, 1) if sv is not None else "",
+              bold=True, fill=C_SEP, fmt=FMT_UA)
+        dv = dev_of(col_sum(lo_keys, mode, chip, ref_temp), sv)
+        _cell(ws, r_sum, c0 + n_t + 1, rnd(dv, 4) if dv is not None else "",
               bold=True, fill=C_SEP, fmt=FMT_PCT)
     _cell(ws, r_sum, note_col, "不含下方标签行（DCO 等），口径与仿真一致" if n_label else "",
           fill=C_SEP, align="left")
@@ -1194,10 +1206,9 @@ def cmd_summary_export(conn, out_path, config):
         _cell(ws, r_all, 4, "µA", bold=True, fill=C_SEP)
         for gi, (mode, chip) in enumerate(col_keys):
             c0 = FIX + 1 + gi * grp_w
-            for ti in range(n_t):
-                col = c0 + ti
-                _cell(ws, r_all, col,
-                      f"=SUM({ref(r_mod0, col)}:{ref(r_sum - 1, col)})",
+            for ti, t in enumerate(temps):
+                v = col_sum(row_keys, mode, chip, t)
+                _cell(ws, r_all, c0 + ti, rnd(v, 1) if v is not None else "",
                       bold=True, fill=C_SEP, fmt=FMT_UA)
             _cell(ws, r_all, c0 + n_t, "", fill=C_SEP)
             _cell(ws, r_all, c0 + n_t + 1, "", fill=C_SEP)
@@ -1290,13 +1301,15 @@ def cmd_summary_export(conn, out_path, config):
                 _cell(ws, rr, 4, disp)
                 _cell(ws, rr, 5, step_name, align="left")
                 _cell(ws, rr, 6, sim_names.get(key, ""), align="left")
-                _cell(ws, rr, 7, rnd(matrix[key][k3], 1), fmt=FMT_UA)
+                mv = matrix[key][k3]
+                _cell(ws, rr, 7, rnd(mv, 1), fmt=FMT_UA)
                 pv, sv = sim_pre_val.get((key, mode)), sim_val.get((key, mode))
                 _cell(ws, rr, 8, rnd(pv, 1) if pv is not None else "", fmt=FMT_UA)
                 _cell(ws, rr, 9, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
-                _cell(ws, rr, 10, f'=IF(OR(G{rr}="",I{rr}=""),"",G{rr}-I{rr})', fmt=FMT_UA)
-                _cell(ws, rr, 11, f'=IF(OR(G{rr}="",I{rr}=""),"",(G{rr}-I{rr})/I{rr})',
-                      fmt=FMT_PCT)
+                diff = (mv - sv) if sv is not None else None
+                _cell(ws, rr, 10, rnd(diff, 1) if diff is not None else "", fmt=FMT_UA)
+                dv = dev_of(mv, sv)
+                _cell(ws, rr, 11, rnd(dv, 4) if dv is not None else "", fmt=FMT_PCT)
                 _cell(ws, rr, 12, "；".join(sorted(notes.get(key, ()))), align="left")
                 rr += 1
     if rr > 2:
