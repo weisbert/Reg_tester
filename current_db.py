@@ -728,14 +728,23 @@ def sim_lookup(conn, mode, ids, stage, tier=""):
     return (total if found_any else None), missing, trims, tiers
 
 
-def module_names(conn, ids):
-    names = []
+def module_names(conn, ids, skip_missing=False):
+    """ids -> 仿真模块名串。skip_missing=True 时略过仿真表没有的 ID（组值整组记在首
+    编号上时，其余成员没有独立行，人读表里不该出现 ID15 这类噪音）；全缺才回退 IDn。"""
+    names, fallback = [], []
     for mid in ids or []:
         rows = conn.execute(
             "SELECT DISTINCT module_name FROM sim_current WHERE module_id=? AND module_name!=''"
             " ORDER BY module_name", (mid,)).fetchall()
-        names.append("/".join(r[0] for r in rows) if rows else f"ID{mid}")
-    return " + ".join(names)
+        if rows:
+            n = "/".join(r[0] for r in rows)
+            if n not in names:
+                names.append(n)
+        else:
+            fallback.append(f"ID{mid}")
+    if not skip_missing:
+        names += fallback
+    return " + ".join(names or fallback)
 
 
 def latest_runs(conn, all_runs=False):
@@ -1006,17 +1015,15 @@ def cmd_summary_export(conn, out_path, config):
     sim_val, sim_pre_val, sim_names = {}, {}, {}
     for key in row_keys:
         ids, override = siminfo.get(key, (None, None))
-        sim_names[key] = module_names(conn, [i for i in (ids or []) if str(i) != "*"]) \
-            if ids else ""
+        sim_names[key] = module_names(conn, [i for i in (ids or []) if str(i) != "*"],
+                                      skip_missing=True) if ids else ""
         for mode, chip in col_keys:
             lk_mode = override or mode
             if ids and lk_mode in sim_modes:
                 sim_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, "post", tier)
                 sim_pre_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, "pre", tier)
-    sim_total = {}   # 模式锁定总电流的仿真参考：该 Mode 全模块合计
-    for mode, _chip in col_keys:
-        if mode in sim_modes:
-            sim_total[mode], _, _, _ = sim_lookup(conn, mode, ["*"], "post", tier)
+    # 标签行（DCO 等）排在末尾——Σ 分两段：LO 模块（可与仿真对）/ 总合计（含标签行，只有实测）
+    n_label = sum(1 for k in row_keys if parse_ids(str(k[0]).replace("+", ",")) is None)
 
     wb = openpyxl.Workbook()
 
@@ -1043,7 +1050,8 @@ def cmd_summary_export(conn, out_path, config):
         "",
         "【计算规则】",
         "  基线 = 每模式段第一个 OFF 前最后一行（末个 Lock_step）；模块电流 = 上一行 − 本行。",
-        "  锁定后总电流的仿真参考 = 该模式仿真表全部模块合计（口径略宽，仅供参考）。",
+        "  底部 Σ 分两行：Σ LO 模块合计（不含 DCO 等标签行，口径与仿真一致、带偏差%）；",
+        "  Σ 总合计（含标签行，只有实测）。锁定后总电流是整机电流，不与仿真直接对比。",
         f"  LDO 归并 {config.get('ldo_reparent')}：子模块实测并入父组，仿真侧"
         f"{'也求和' if config.get('ldo_reparent_sim_add_child') else '不计子模块'}。",
         "  多 run 时每个 模式×芯片×温度 取时间最新一次。",
@@ -1096,7 +1104,9 @@ def cmd_summary_export(conn, out_path, config):
 
     r_freq, r_base, r_end = 4, 5, 6
     r_mod0 = 7
-    r_sum = r_mod0 + len(row_keys)
+    r_sum = r_mod0 + len(row_keys)          # Σ LO 模块行（不含末尾标签行）
+    r_all = r_sum + 1 if n_label else None  # Σ 总合计行（含 DCO 等标签行，只有实测）
+    r_lo_last = r_sum - 1 - n_label         # 最后一个 LO 模块行
 
     # -- 条件/汇总行（米色）：测试频率 / 锁定后总电流 / 全关残留
     for rr, name, unit in ((r_freq, "测试频率", ""),
@@ -1104,7 +1114,7 @@ def cmd_summary_export(conn, out_path, config):
                            (r_end, "全关残留电流", "mA")):
         _cell(ws, rr, 1, fill=C_SETTING)
         _cell(ws, rr, 2, name, bold=True, fill=C_SETTING, align="left")
-        _cell(ws, rr, 3, "仿真=该模式全模块合计" if rr == r_base else "", fill=C_SETTING)
+        _cell(ws, rr, 3, "", fill=C_SETTING)
         _cell(ws, rr, 4, unit, fill=C_SETTING)
     for gi, (mode, chip) in enumerate(col_keys):
         c0 = FIX + 1 + gi * grp_w
@@ -1120,19 +1130,15 @@ def cmd_summary_export(conn, out_path, config):
             v = end_ma.get((mode, chip, t))
             _cell(ws, r_end, c0 + ti, rnd(v, 3) if v is not None else "",
                   fill=C_SETTING, fmt=FMT_MA)
-        st = sim_total.get(mode)
-        _cell(ws, r_base, c0 + n_t, rnd(st / 1000.0, 3) if st is not None else "",
-              fill=C_SETTING, fmt=FMT_MA)
+        # 基线/末态是含 DCO 与杂项的整机电流，仿真只覆盖 LO 模块——不做行内对比，
+        # 仿真对比见底部「Σ LO 模块合计」行
+        _cell(ws, r_base, c0 + n_t, "", fill=C_SETTING)
         _cell(ws, r_end, c0 + n_t, "", fill=C_SETTING)
-        ci_ref = c0 + temps.index(ref_temp) if ref_temp in temps else c0
-        m_ref, s_ref = ref(r_base, ci_ref), ref(r_base, c0 + n_t)
-        _cell(ws, r_base, c0 + n_t + 1,
-              f'=IF(OR({m_ref}="",{s_ref}=""),"",({m_ref}-{s_ref})/{s_ref})',
-              fill=C_SETTING, fmt=FMT_PCT)
+        _cell(ws, r_base, c0 + n_t + 1, "", fill=C_SETTING)
         _cell(ws, r_end, c0 + n_t + 1, "", fill=C_SETTING)
     _cell(ws, r_freq, note_col, "2G 模式=2.5GHz，5G 模式=5.8GHz（config.mode_freq 可改）",
           fill=C_SETTING, align="left")
-    _cell(ws, r_base, note_col, "基线=末个 Lock_step；仿真口径略宽，仅供参考",
+    _cell(ws, r_base, note_col, "基线=末个 Lock_step（含 DCO 及未列模块，仿真对比看 Σ LO 行）",
           fill=C_SETTING, align="left")
     _cell(ws, r_end, note_col, "末个 OFF 步实测=全部关断后仍在流的电流（≈基线−Σ模块）",
           fill=C_SETTING, align="left")
@@ -1161,24 +1167,41 @@ def cmd_summary_export(conn, out_path, config):
             note_parts.append("仿真无对应项（标签未映射，config.label_groups 可配）")
         _cell(ws, rr, note_col, "；".join(note_parts), align="left")
 
-    # -- Σ合计（蓝）
+    # -- Σ合计（蓝）：LO 模块行（可与仿真对）+ 总合计行（含 DCO 等标签行，只有实测）
     _cell(ws, r_sum, 1, fill=C_SEP)
-    _cell(ws, r_sum, 2, "Σ 模块合计", bold=True, fill=C_SEP, align="left")
+    _cell(ws, r_sum, 2, "Σ LO 模块合计" if n_label else "Σ 模块合计",
+          bold=True, fill=C_SEP, align="left")
     _cell(ws, r_sum, 3, fill=C_SEP)
     _cell(ws, r_sum, 4, "µA", bold=True, fill=C_SEP)
     for gi, (mode, chip) in enumerate(col_keys):
         c0 = FIX + 1 + gi * grp_w
-        for ti in range(n_t + 1):        # 温度列 + 仿真列都求和
+        for ti in range(n_t + 1):        # 温度列 + 仿真列都求和（标签行仿真为空不影响）
             col = c0 + ti
             _cell(ws, r_sum, col,
-                  f"=SUM({ref(r_mod0, col)}:{ref(r_sum - 1, col)})",
+                  f"=SUM({ref(r_mod0, col)}:{ref(r_lo_last, col)})",
                   bold=True, fill=C_SEP, fmt=FMT_UA)
         ci_ref = c0 + temps.index(ref_temp) if ref_temp in temps else c0
         m_ref, s_ref = ref(r_sum, ci_ref), ref(r_sum, c0 + n_t)
         _cell(ws, r_sum, c0 + n_t + 1,
               f'=IF(OR({m_ref}=0,{s_ref}=0),"",({m_ref}-{s_ref})/{s_ref})',
               bold=True, fill=C_SEP, fmt=FMT_PCT)
-    _cell(ws, r_sum, note_col, fill=C_SEP)
+    _cell(ws, r_sum, note_col, "不含下方标签行（DCO 等），口径与仿真一致" if n_label else "",
+          fill=C_SEP, align="left")
+    if r_all:
+        _cell(ws, r_all, 1, fill=C_SEP)
+        _cell(ws, r_all, 2, "Σ 总合计（含 DCO 等标签行）", bold=True, fill=C_SEP, align="left")
+        _cell(ws, r_all, 3, fill=C_SEP)
+        _cell(ws, r_all, 4, "µA", bold=True, fill=C_SEP)
+        for gi, (mode, chip) in enumerate(col_keys):
+            c0 = FIX + 1 + gi * grp_w
+            for ti in range(n_t):
+                col = c0 + ti
+                _cell(ws, r_all, col,
+                      f"=SUM({ref(r_mod0, col)}:{ref(r_sum - 1, col)})",
+                      bold=True, fill=C_SEP, fmt=FMT_UA)
+            _cell(ws, r_all, c0 + n_t, "", fill=C_SEP)
+            _cell(ws, r_all, c0 + n_t + 1, "", fill=C_SEP)
+        _cell(ws, r_all, note_col, "仿真未覆盖标签行，无对比", fill=C_SEP, align="left")
 
     # 偏差%列条件格式：|Δ| 超阈值红粗（含条件行与 Σ 行）
     red = Font(name=FONT_NAME, size=10, bold=True, color=C_FLAG)
