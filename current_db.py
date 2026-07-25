@@ -1868,7 +1868,14 @@ def cmd_inspect(args):
                                   key=lambda kv: (-kv[1], kv[0])):
                 src = "自动" if nm in auto else "config.sim_label_ids"
                 print(f"      {nm!r:<28} -> 编号 {lm.get(nm)}   {cnt} 行  ({src})")
-            print("      ↑ 实测侧的非数字标签要参与对比，需在 config.label_groups 里指到这些编号")
+            tot = [nm for nm in info["no_prefix_names"]
+                   if re.search(r"(?i)total|sum|合计", nm)]
+            if tot:
+                print("      ⚠ 名字带 total/sum 的是**合计行**：通常是对上面已逐项列出的模块求和。"
+                      "把实测标签指到它 = 拿单项测量值去对一整片的合计，会造出巨大的假偏差"
+                      "（本项目真实事故：DCO 标签行被对到 buffer 合计，假偏差 -25~-49% 追查了两轮）。"
+                      "除非确认它对应实测里某个独立测量步，否则保持不映射。")
+            print("      不映射的行只是躺在库里，不进任何对比，也不会影响 Σ 合计。")
         print(f"  Mode       ({len(info['modes'])}): {_fmt_counts(info['modes'])}")
         print(f"  Tier       ({len(info['tiers'])}): {_fmt_counts(info['tiers'])}")
         print(f"  simulation ({len(info['stages'])}): {_fmt_counts(info['stages'])}")
