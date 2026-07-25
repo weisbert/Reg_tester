@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
                         "或跨模式 {\"DCO2G\": {\"mode\": \"CK_ADPLL_DCO2G\", \"ids\": \"*\"}}",
         "exclude_globs": "扫描时按文件名跳过的通配符（本工具自己的输出必须在内，防自吞）",
         "sim_label_ids": "仿真表里 Module 无数字前缀的合计/标签行 名->指派编号；留空则从 901 起按名排序自动指派（实测侧用 label_groups 把非数字标签指到该编号）",
+        "sim_stage": "主对比列取哪个仿真阶段：post(后仿，默认) 或 pre(前仿)；若某阶段整片为 0，inspect 的零值审计会指出来",
         "sim_tier": "参与对比的仿真电流档位（如 Tier2，与实测一致）；空=不过滤（多档共存会重复求和！）",
         "sim_temp_note": "仿真数据的温度/corner 标注，只用于表头展示（如 55C/TT/0.9V）",
         "delta_flag_pct": "汇总簿标红：|偏差%| 超过该值才可能标红（默认 20）",
@@ -99,6 +100,7 @@ DEFAULT_CONFIG = {
     "label_groups": {},
     "exclude_globs": ["Current_compare_pivot*.xlsx", "probe_dump*", "*功耗表*.xlsx"],
     "sim_label_ids": {},
+    "sim_stage": "post",
     "sim_tier": "Tier2",
     "sim_temp_note": "55C",
     "delta_flag_pct": 20,
@@ -1133,6 +1135,7 @@ def _chart_title(text, sz=1100, bold=True):
 def cmd_summary_export(conn, out_path, config):
     """人直接读的汇总簿：说明 / 总览(模块×模式×温度 + 仿真对比) / 温度趋势(图) / 对比明细。"""
     tier = config.get("sim_tier") or ""
+    stage_main = (config.get("sim_stage") or "post").strip().lower()
     sim_note = config.get("sim_temp_note") or ""
     thr = float(config.get("delta_flag_pct") or 20) / 100.0
     abs_thr = float(config.get("delta_flag_abs_ua") or 0)   # 双阈值绝对下限 µA
@@ -1236,8 +1239,11 @@ def cmd_summary_export(conn, out_path, config):
         for mode, chip in col_keys:
             lk_mode = override or mode
             if ids and lk_mode in sim_modes:
-                sim_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, "post", tier)
-                sim_pre_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, "pre", tier)
+                # 主对比列取哪个阶段由 config.sim_stage 定（默认 post=后仿）；另一个阶段
+                # 仍算出来放明细页。两者差别很大时(某阶段整片为 0)靠 inspect 的零值审计发现。
+                other = "pre" if stage_main == "post" else "post"
+                sim_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, stage_main, tier)
+                sim_pre_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, other, tier)
     # 标签行（DCO 等）排在末尾——Σ 分两段：LO 模块（可与仿真对）/ 总合计（含标签行，只有实测）
     n_label = sum(1 for k in row_keys if parse_ids(str(k[0]).replace("+", ",")) is None)
 
@@ -1796,10 +1802,11 @@ def cmd_inspect(args):
         raise SystemExit(f"[错误] 根目录不存在: {root}")
     config, cfg_path, _ = load_config(root, args.config, create=False)
     tier = config.get("sim_tier") or ""
+    stage_main = (config.get("sim_stage") or "post").strip().lower()
     print(f"根目录: {root}")
     print(f"配置:   {cfg_path}"
           f"{'' if os.path.exists(cfg_path) else '   ← 不存在，本次用内置默认值（build 时才会生成）'}")
-    print(f"        sim_tier={tier or '(不过滤——多档共存会重复求和!)'}  "
+    print(f"        sim_tier={tier or '(不过滤——多档共存会重复求和!)'}  sim_stage={stage_main}  "
           f"sim_sheet={config.get('sim_sheet')!r}  result_glob={config.get('result_glob')!r}")
 
     problems = []
@@ -1901,6 +1908,31 @@ def cmd_inspect(args):
             continue
         sim_ids_by_mode.setdefault(r["mode"], set()).add(r["module_id"])
 
+    # (模式,编号,档位,阶段) -> 合计值。summary 的仿真列固定取 post×sim_tier 这一格；
+    # 零值审计要看另外 7 格有没有值，才能分清"簿里本来就是 0(该模式不工作)"
+    # 和"取错格子(值在别的 Tier/stage 上)"。同前缀的子块(7_1/7_2)求和，与 sim_lookup 一致。
+    sim_cell = {}
+    for r in recs:
+        if r["module_id"] is None:
+            continue
+        k = (r["mode"], r["module_id"], r["tier"], r["stage"])
+        sim_cell[k] = sim_cell.get(k, 0.0) + r["current_ua"]
+    all_tiers = sorted(t for t in info["tiers"]) if info else []
+    all_stages = sorted(s for s in info["stages"]) if info else []
+
+    def zero_audit(mode, mid):
+        """返回 (报告用格子的值, [其他非零格子描述])。"""
+        target = sim_cell.get((mode, mid, tier, stage_main))
+        others = []
+        for t in all_tiers:
+            for st in all_stages:
+                if (t, st) == (tier, stage_main):
+                    continue
+                v = sim_cell.get((mode, mid, t, st))
+                if v:
+                    others.append(f"{t}/{st}={v:.1f}")
+        return target, others
+
     # ---------------------------------------------------------- ③ 实测对不对得上
     print("\n" + "=" * 72)
     print("② 实测 Result 文件 / 分段 / 与仿真的对应")
@@ -1966,6 +1998,25 @@ def cmd_inspect(args):
                       f"仿真表缺 {len(miss)} 个" + (f": {_ranges(miss)}" if miss else ""))
                 if miss:
                     problems.append(f"{mode}: {len(miss)}/{len(ids_used)} 个 NO. 编号仿真表里没有")
+                # 零值审计：报告只用 post×sim_tier 一格，为 0 时把其他 7 格摊开
+                zeros = [(i, zero_audit(mode, i)) for i in ids_used
+                         if not sim_cell.get((mode, i, tier, stage_main))]
+                if zeros:
+                    n_elsewhere = sum(1 for _i, (_v, o) in zeros if o)
+                    print(f"        ⚠ 仿真为 0/空的编号 {len(zeros)}/{len(ids_used)} 个"
+                          f"（报告取 {tier or '不限'}×{stage_main} 这一格）:")
+                    for i, (_v, others) in zeros:
+                        if others:
+                            print(f"            编号 {i:<4} 本格=0，但别的档位有值: {' '.join(others)}")
+                        else:
+                            print(f"            编号 {i:<4} 全 8 个档位×阶段皆为 0/无值"
+                                  f" -> 簿里认为该模块在此模式不工作")
+                    if n_elsewhere:
+                        problems.append(f"{mode}: {n_elsewhere} 个编号在 {tier}×{stage_main} 为 0 但"
+                                        f"别的 Tier/stage 有值 -> 可能取错档位")
+                    else:
+                        problems.append(f"{mode}: {len(zeros)} 个编号仿真全档位皆 0，"
+                                        f"而实测有值 -> Σ 仿真与偏差% 不可信")
             if labels:
                 print(f"        非数字标签 {len(labels)} 个: {', '.join(labels[:8])}"
                       + (" …" if len(labels) > 8 else ""))
