@@ -79,6 +79,7 @@ DEFAULT_CONFIG = {
         "exclude_globs": "扫描时按文件名跳过的通配符（本工具自己的输出必须在内，防自吞）",
         "sim_label_ids": "仿真表里 Module 无数字前缀的合计/标签行 名->指派编号；留空则从 901 起按名排序自动指派（实测侧用 label_groups 把非数字标签指到该编号）",
         "sim_stage": "主对比列取哪个仿真阶段：post(后仿，默认) 或 pre(前仿)；若某阶段整片为 0，inspect 的零值审计会指出来",
+        "sim_stage_fallback": "主阶段(sim_stage)某模块为 0/缺失时，是否改用另一阶段的值补上(逐模块判断，两边都是 0 则保持 0)；补过的格子在报告里标出",
         "sim_tier": "参与对比的仿真电流档位（如 Tier2，与实测一致）；空=不过滤（多档共存会重复求和！）",
         "sim_temp_note": "仿真数据的温度/corner 标注，只用于表头展示（如 55C/TT/0.9V）",
         "delta_flag_pct": "汇总簿标红：|偏差%| 超过该值才可能标红（默认 20）",
@@ -101,6 +102,7 @@ DEFAULT_CONFIG = {
     "exclude_globs": ["Current_compare_pivot*.xlsx", "probe_dump*", "*功耗表*.xlsx"],
     "sim_label_ids": {},
     "sim_stage": "post",
+    "sim_stage_fallback": True,
     "sim_tier": "Tier2",
     "sim_temp_note": "55C",
     "delta_flag_pct": 20,
@@ -885,10 +887,15 @@ def _inject_cached_values(xlsx_path, cache_by_sheet):
     os.replace(tmp, xlsx_path)
 
 
-def sim_lookup(conn, mode, ids, stage, tier=""):
-    """返回 (合计uA, 缺失ID列表, trim集合, tier集合)。
+def sim_lookup(conn, mode, ids, stage, tier="", fallback_stage=None):
+    """返回 (合计uA, 缺失ID列表, trim集合, tier集合, 用回退阶段取值的ID列表)。
     tier 非空时只取该档位；该档位没有但有无档位('')的旧数据时退回旧数据（兼容旧仿真表）。
-    ids 含 "*" = 该 Mode 全部模块合计（跨模式 label_groups 用）。"""
+    ids 含 "*" = 该 Mode 全部模块合计（跨模式 label_groups 用）。
+
+    fallback_stage：主阶段（通常 post=后仿）某模块为 0 或无行时，改用该阶段（pre=前仿）
+    的值。**逐模块判断**——一个组里只补后仿为 0 的那几个成员，其余仍用后仿。
+    用户侧前提：前仿已做 back annotate，多数情况下前仿≈后仿，两者可比。
+    补过的 ID 会返回给调用方，报告里要标出来（口径可追溯）。"""
     def rows_of(where, params):
         if tier:
             rows = conn.execute(f"SELECT current_ua,trim,tier FROM sim_current WHERE {where}"
@@ -900,16 +907,32 @@ def sim_lookup(conn, mode, ids, stage, tier=""):
         return conn.execute(f"SELECT current_ua,trim,tier FROM sim_current WHERE {where}",
                             params).fetchall()
 
-    total, missing, trims, tiers = 0.0, [], set(), set()
+    def total_of(rows):
+        return sum(r[0] for r in rows)
+
+    total, missing, trims, tiers, fell_back = 0.0, [], set(), set(), []
     found_any = False
     if ids and any(str(x) == "*" for x in ids):
-        buckets = [rows_of("mode=? AND stage=?", (mode, stage))]
-        if not buckets[0]:
-            return None, ["*"], set(), set()
+        rows = rows_of("mode=? AND stage=?", (mode, stage))
+        if (not rows or not total_of(rows)) and fallback_stage:
+            alt = rows_of("mode=? AND stage=?", (mode, fallback_stage))
+            if alt and total_of(alt):
+                rows, _ = alt, fell_back.append("*")
+        if not rows:
+            return None, ["*"], set(), set(), []
+        buckets = [rows]
     else:
         buckets = []
         for mid in ids:
             rows = rows_of("mode=? AND module_id=? AND stage=?", (mode, mid, stage))
+            # 后仿该模块为 0（或整个没有行）时用前仿补——前仿有非零值才补，
+            # 否则保持 0/缺失（"两边都是 0"是真结论，不该被掩盖）
+            if (not rows or not total_of(rows)) and fallback_stage:
+                alt = rows_of("mode=? AND module_id=? AND stage=?",
+                              (mode, mid, fallback_stage))
+                if alt and total_of(alt):
+                    rows = alt
+                    fell_back.append(mid)
             if not rows:
                 missing.append(mid)
             else:
@@ -922,7 +945,7 @@ def sim_lookup(conn, mode, ids, stage, tier=""):
                 trims.add(trim)
             if t:
                 tiers.add(t)
-    return (total if found_any else None), missing, trims, tiers
+    return (total if found_any else None), missing, trims, tiers, fell_back
 
 
 def module_names(conn, ids, skip_missing=False):
@@ -959,6 +982,7 @@ def latest_runs(conn, all_runs=False):
 
 def export_xlsx(conn, out_path, all_runs=False, config=None):
     tier = (config or {}).get("sim_tier") or ""
+    fb_stage = bool((config or {}).get("sim_stage_fallback", True))
     runs = latest_runs(conn, all_runs)
 
     wb = openpyxl.Workbook()
@@ -1016,8 +1040,11 @@ def export_xlsx(conn, out_path, all_runs=False, config=None):
             trims, tiers = set(), set()
             lk_mode = sim_mode or mode  # 跨模式 label_groups 的步查它指定的仿真 Mode
             if sim_ids and lk_mode in sim_modes:
-                sim_pre, miss_pre, t1, r1 = sim_lookup(conn, lk_mode, sim_ids, "pre", tier)
-                sim_post, miss_post, t2, r2 = sim_lookup(conn, lk_mode, sim_ids, "post", tier)
+                sim_pre, miss_pre, t1, r1, _fb1 = sim_lookup(conn, lk_mode, sim_ids, "pre", tier)
+                sim_post, miss_post, t2, r2, fb2 = sim_lookup(
+                    conn, lk_mode, sim_ids, "post", tier, fb_stage and "pre")
+                if fb2:
+                    notes.append(f"仿真 {','.join(str(x) for x in fb2)} 后仿为0，用前仿补")
                 trims, tiers = t1 | t2, r1 | r2
                 miss = sorted(set(miss_pre) & set(miss_post))
                 if miss:
@@ -1136,6 +1163,7 @@ def cmd_summary_export(conn, out_path, config):
     """人直接读的汇总簿：说明 / 总览(模块×模式×温度 + 仿真对比) / 温度趋势(图) / 对比明细。"""
     tier = config.get("sim_tier") or ""
     stage_main = (config.get("sim_stage") or "post").strip().lower()
+    fb_stage = bool(config.get("sim_stage_fallback", True))
     sim_note = config.get("sim_temp_note") or ""
     thr = float(config.get("delta_flag_pct") or 20) / 100.0
     abs_thr = float(config.get("delta_flag_abs_ua") or 0)   # 双阈值绝对下限 µA
@@ -1231,7 +1259,7 @@ def cmd_summary_export(conn, out_path, config):
     row_keys = sorted(matrix, key=_row_sort_key)
 
     # 仿真值缓存：行×模式 -> pre/post 合计 µA（tier 过滤）；行名
-    sim_val, sim_pre_val, sim_names = {}, {}, {}
+    sim_val, sim_pre_val, sim_names, sim_fb = {}, {}, {}, {}
     for key in row_keys:
         ids, override = siminfo.get(key, (None, None))
         sim_names[key] = module_names(conn, [i for i in (ids or []) if str(i) != "*"],
@@ -1242,8 +1270,11 @@ def cmd_summary_export(conn, out_path, config):
                 # 主对比列取哪个阶段由 config.sim_stage 定（默认 post=后仿）；另一个阶段
                 # 仍算出来放明细页。两者差别很大时(某阶段整片为 0)靠 inspect 的零值审计发现。
                 other = "pre" if stage_main == "post" else "post"
-                sim_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, stage_main, tier)
-                sim_pre_val[(key, mode)], _, _, _ = sim_lookup(conn, lk_mode, ids, other, tier)
+                sim_val[(key, mode)], _, _, _, fb = sim_lookup(
+                    conn, lk_mode, ids, stage_main, tier, fb_stage and other)
+                sim_pre_val[(key, mode)], _, _, _, _ = sim_lookup(conn, lk_mode, ids, other, tier)
+                if fb:
+                    sim_fb[(key, mode)] = fb
     # 标签行（DCO 等）排在末尾——Σ 分两段：LO 模块（可与仿真对）/ 总合计（含标签行，只有实测）
     n_label = sum(1 for k in row_keys if parse_ids(str(k[0]).replace("+", ",")) is None)
 
@@ -1266,7 +1297,13 @@ def cmd_summary_export(conn, out_path, config):
         f"导出时间 {now_iso()}；数据源 current.db（current_db.py summary 生成）",
         f"实测：{len(runs)} 个 run（模式×温度），温度点 {', '.join(_t(t) for t in temps if t is not None) or '未知'}；"
         f"源文件 {', '.join(sorted(src_files))}",
-        f"仿真：档位 {tier or '未过滤'} / post-sim（pre-sim 在「对比明细」页）/ 温度 {sim_note or '未标注'}",
+        f"仿真：档位 {tier or '未过滤'} / {stage_main}-sim"
+        f"（{'pre' if stage_main == 'post' else 'post'}-sim 在「对比明细」页）/ 温度 {sim_note or '未标注'}",
+        (f"  ★仿真列里【蓝色斜体】的格子 = {stage_main} 仿真该模块为 0/缺项，改用另一阶段的值补上"
+         f"（逐模块判断，两阶段都为 0 则保持空）。前仿已做 back annotate，多数情况下两者接近，"
+         f"故可比；但口径不同，看偏差时留意。共 {len(sim_fb)} 处，关掉改 config.sim_stage_fallback。"
+         if (fb_stage and sim_fb) else
+         "  仿真列全部取自同一阶段，无跨阶段补值。"),
         "",
         "【总览页】行=模块（按 buffer 编号从低到高，组合组取组内最小号，DCO 标签行在最后），",
         "  列=模式×温度的实测电流 + 仿真参考 + 偏差%。顶部条件行：测试频率（2G=2.5GHz/5G=5.8GHz）、",
@@ -1451,6 +1488,9 @@ def cmd_summary_export(conn, out_path, config):
             # 仿真只在该模式实际测了这行时显示（防 25/25,24,23 交叠重复计入）
             sv = sim_val.get((key, mode)) if has_meas(key, mode, chip) else None
             _cell(ws, rr, c0 + n_t, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
+            if sv is not None and sim_fb.get((key, mode)):
+                # 后仿为 0、用前仿补上的格子：斜体+蓝色，口径可追溯（说明页有注解）
+                ws.cell(row=rr, column=c0 + n_t).font = Font(italic=True, color="1F4E79")
             dc = c0 + n_t + 1
             mv = meas_at_sim(key, mode, chip)   # 实测插值到仿真温度再比
             dv = dev_of(mv, sv)
