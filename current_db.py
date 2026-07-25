@@ -179,7 +179,10 @@ def load_config(root, path=None, create=True):
     """create=False：配置不存在时只返回默认值，不落盘（inspect 是只读体检，不该留痕）。"""
     cfg_path = path or os.path.join(root, "current_config.json")
     if os.path.exists(cfg_path):
-        with open(cfg_path, "r", encoding="utf-8") as f:
+        # utf-8-sig：这个文件是给人在 Windows 上手改的，PowerShell 5.1 的
+        # `Set-Content -Encoding utf8`、记事本"UTF-8"另存都会写 BOM，严格 utf-8 会直接抛
+        # "Unexpected UTF-8 BOM"。utf-8-sig 有 BOM 吃掉、没 BOM 也照常读。
+        with open(cfg_path, "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
         merged = dict(DEFAULT_CONFIG)
         merged.update(cfg)
@@ -756,7 +759,7 @@ def _ingest_raw(conn, raw, factor_to_ma, src, run_ts, chip, config, sim_modes, f
 def ingest_probe_json(conn, json_path, chip, config):
     """probe_allmode_result.py --json 的产物入库（黄区只带 JSON 回来时的开发机路径）。
     行流按原行号重排后走与 xlsx 完全相同的分段/分类管线。"""
-    with open(json_path, "r", encoding="utf-8") as f:
+    with open(json_path, "r", encoding="utf-8-sig") as f:  # BOM 容错，同 load_config
         d = json.load(f)
     recs = []
     for seg in (d.get("segments") or []):
