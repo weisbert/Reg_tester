@@ -315,8 +315,9 @@ def read_sim_rows(xlsx, sheet_name):
                 "cols": dict(cols), "n_data_rows": 0,
                 "skip_no_current": 0, "skip_no_mode": 0,
                 "id_from_prefix": 0, "id_from_idcol": 0, "id_missing": 0,
-                "id_col_vals": [], "prefix_conflicts": [], "unknown_units": {},
+                "prefix_conflicts": [], "unknown_units": {}, "no_prefix_names": {},
                 "modes": {}, "tiers": {}, "stages": {}, "units": {}}
+        id_col_vals = []
 
         def bump(d, k):
             d[k] = d.get(k, 0) + 1
@@ -341,25 +342,19 @@ def read_sim_rows(xlsx, sheet_name):
             name = str(cell(row, cols.get("module")) or "")
             tier = str(cell(row, cols.get("tier")) or "")
 
-            mid_i = module_id_from_name(name)          # ★ 模块编号首选 Module 前缀
-            if mid_i is not None:
-                info["id_from_prefix"] += 1
-            else:                                       # 无前缀才回退 ID 列
-                try:
-                    mid_i = int(mid_raw)
-                    info["id_from_idcol"] += 1
-                except (TypeError, ValueError):
-                    mid_i = None
-                    info["id_missing"] += 1
             try:
                 id_col_i = int(mid_raw)
-                info["id_col_vals"].append(id_col_i)
-                if mid_i is not None and id_col_i != mid_i and len(info["prefix_conflicts"]) < 5:
-                    info["prefix_conflicts"].append((id_col_i, name, str(mode).strip()))
+                id_col_vals.append(id_col_i)
             except (TypeError, ValueError):
-                pass
+                id_col_i = None
+            mid_i = module_id_from_name(name)          # ★ 模块编号只认 Module 前缀
+            if mid_i is None:
+                bump(info["no_prefix_names"], name)    # 合计/标签行：靠 label_groups 按名对应
+            elif id_col_i is not None and id_col_i != mid_i \
+                    and len(info["prefix_conflicts"]) < 5:
+                info["prefix_conflicts"].append((id_col_i, name, str(mode).strip()))
 
-            recs.append(dict(module_id=mid_i, module_name=name,
+            recs.append(dict(module_id=mid_i, id_col=id_col_i, module_name=name,
                              trim=str(cell(row, cols.get("trim")) or ""),
                              mode=str(mode).strip(), stage=stage, tier=tier,
                              current_ua=cur * factor, unit_raw=unit))
@@ -369,9 +364,21 @@ def read_sim_rows(xlsx, sheet_name):
             bump(info["stages"], stage)
             bump(info["units"], unit)
 
-        ids = info.pop("id_col_vals")
-        # ID 列是「全表行流水号」的判据：值全表互不重复且行数级别一致（真簿 4400 行 4400 个值）
-        info["id_col_is_serial"] = bool(ids) and len(set(ids)) == len(ids) and len(ids) > 1
+        # ID 列是「全表行流水号」的判据：值全表互不重复且不止一行（真簿 4400 行 4400 个值）
+        info["id_col_is_serial"] = (len(id_col_vals) > 1
+                                    and len(set(id_col_vals)) == len(id_col_vals))
+        # 无前缀行怎么办：ID 列是流水号时**绝不回退**——回退只会造出 521-550 这种
+        # 凭空的"模块编号"（真簿实测：240 行合计/标签行会被编成 8 段假编号）。
+        # 这些行的身份在名字里，由 config.label_groups 按名映射。
+        for r in recs:
+            if r["module_id"] is not None:
+                info["id_from_prefix"] += 1
+            elif not info["id_col_is_serial"] and r["id_col"] is not None:
+                r["module_id"] = r["id_col"]
+                info["id_from_idcol"] += 1
+            else:
+                info["id_missing"] += 1
+            r.pop("id_col")
         info["module_ids"] = sorted({r["module_id"] for r in recs if r["module_id"] is not None})
         return recs, info
     finally:
@@ -384,14 +391,13 @@ def sim_warnings(info):
     if info["id_col_is_serial"]:
         w.append(f"[提示] 仿真表 ID 列是全表行流水号（{info['n_data_rows']} 行值互不重复），"
                  f"不是模块编号——模块编号已改取自 Module 列数字前缀")
-    if info["id_from_idcol"] and info["id_col_is_serial"]:
-        w.append(f"[警告] {info['id_from_idcol']} 行 Module 列没有数字前缀 -> 退回用 ID 列，"
-                 f"而 ID 列又是流水号——这些行的模块编号必然是错的，需人工核对")
-    elif info["id_from_idcol"]:
+    if info["id_from_idcol"]:
         w.append(f"[提示] {info['id_from_idcol']} 行 Module 列没有数字前缀，退回用 ID 列当模块编号"
                  f"（ID 列不是流水号，可用）")
     if info["id_missing"]:
-        w.append(f"[警告] {info['id_missing']} 行既无 Module 前缀也无法从 ID 列取整数 -> 模块编号为空")
+        n_names = len(info["no_prefix_names"])
+        w.append(f"[提示] {info['id_missing']} 行没有模块编号（{n_names} 种 Module 名无数字前缀，"
+                 f"多半是合计/标签行）——不回退 ID 列，靠 config.label_groups 按名映射")
     if info["unknown_units"]:
         u = " / ".join(f"{k or '(空)'}×{v}" for k, v in sorted(info["unknown_units"].items()))
         w.append(f"[警告] 未知单位按 uA 处理（可能差 1000 倍）：{u}")
@@ -583,7 +589,10 @@ def build_groups(rows, config):
             reparent[int(c)] = int(p)
         except (TypeError, ValueError):
             pass
-    label_groups = {str(k): list(v) for k, v in (config.get("label_groups") or {}).items()}
+    # dict 形式 {"mode":..,"ids":..}（跨模式映射）必须原样留着——早先的 list(v) 会把它
+    # 拍成 ["mode","ids"]，下游 isinstance(mapped, dict) 永远为假，跨模式映射从未生效过。
+    label_groups = {str(k): (v if isinstance(v, dict) else list(v))
+                    for k, v in (config.get("label_groups") or {}).items()}
 
     steps = []
     for r in rows:
@@ -1593,7 +1602,7 @@ def walk_xlsx(root, skip_dirs, exclude_globs=()):
             yield os.path.join(dirpath, f)
 
 
-def find_sim_candidates(root, config):
+def find_sim_candidates(root, config, verbose=False):
     """扫 root 下所有工作簿，返回**全部**疑似仿真长表 [(mtime, path, sheet, how)]，
     how ∈ name/header。刻意不 break——同一个簿里可能有多个页命中，inspect 要把落选的
     也列出来给人看（选错仿真快照是静默事故，已经发生过一次）。
@@ -1601,23 +1610,35 @@ def find_sim_candidates(root, config):
     sim_sheet = norm(config.get("sim_sheet", "Current_data"))
     skip = set(config.get("skip_dirs") or [])
     excl = list(config.get("exclude_globs") or [])
+    result_glob = config.get("result_glob", "Result*.xlsx")
     out = []
     for path in walk_xlsx(root, skip, excl):
+        # 实测文件不会是仿真长表；跳过省一次开簿（openpyxl 开一个大 xlsm 很贵，
+        # 且这些文件稍后还要再开一次读数据）
+        if fnmatch.fnmatch(os.path.basename(path), result_glob):
+            continue
+        if verbose:
+            print(f"  [扫描] {os.path.relpath(path, root)}", flush=True)
         try:
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         except Exception:
             continue
         try:
-            for sn in wb.sheetnames:
-                by_name = norm(sn) == sim_sheet
-                try:
-                    by_hdr = any(match_sim_header(r) for r in
-                                 wb[sn].iter_rows(min_row=1, max_row=30, values_only=True))
-                except Exception:
-                    by_hdr = False
-                if by_name or by_hdr:
-                    out.append((os.path.getmtime(path), path, sn,
-                                "按名" if by_name else "按表头"))
+            mt = os.path.getmtime(path)
+            # 先只比 sheet 名（不碰单元格）——名字命中就定案，不再逐页解析表头。
+            # 真簿有 30 个页，逐页扫前 30 行是这条命令最慢的一步。
+            hit = [sn for sn in wb.sheetnames if norm(sn) == sim_sheet]
+            if hit:
+                out.append((mt, path, hit[0], "按名"))
+            else:
+                for sn in wb.sheetnames:
+                    try:
+                        by_hdr = any(match_sim_header(r) for r in
+                                     wb[sn].iter_rows(min_row=1, max_row=30, values_only=True))
+                    except Exception:
+                        by_hdr = False
+                    if by_hdr:
+                        out.append((mt, path, sn, "按表头"))
         except Exception:
             pass
         finally:
@@ -1764,7 +1785,8 @@ def cmd_inspect(args):
         sim_sheet = config.get("sim_sheet")
         print(f"  选用（config.sim_workbook 指定）: {sim_wb}")
     else:
-        cands = find_sim_candidates(root, config)
+        print("  正在扫描工作簿（大簿较慢）…", flush=True)
+        cands = find_sim_candidates(root, config, verbose=True)
         if not cands:
             print("  ⚠ 一个候选都没扫到（需要某页表头含 ID+Module+Mode+Current*，"
                   "且有 simulation 或 Unit 列）")
@@ -1805,6 +1827,12 @@ def cmd_inspect(args):
             print("  ID 列 vs Module 前缀不一致的样例（前 5 条，证明 ID 列不是模块编号）:")
             for idv, name, md in info["prefix_conflicts"]:
                 print(f"      ID={idv:<6} Module={name:<24} Mode={md}")
+        if info["no_prefix_names"]:
+            print(f"  无数字前缀的 Module 名 {len(info['no_prefix_names'])} 种"
+                  f"（合计/标签行，需要 config.label_groups 按名映射才能参与对比）:")
+            for nm, cnt in sorted(info["no_prefix_names"].items(),
+                                  key=lambda kv: (-kv[1], kv[0])):
+                print(f"      {nm!r:<40} {cnt} 行")
         print(f"  Mode       ({len(info['modes'])}): {_fmt_counts(info['modes'])}")
         print(f"  Tier       ({len(info['tiers'])}): {_fmt_counts(info['tiers'])}")
         print(f"  simulation ({len(info['stages'])}): {_fmt_counts(info['stages'])}")
@@ -1838,7 +1866,7 @@ def cmd_inspect(args):
     skip = set(config.get("skip_dirs") or [])
     excl = list(config.get("exclude_globs") or [])
     result_glob = config.get("result_glob", "Result*.xlsx")
-    how_disp = {"config": "config 指定", "auto": "自动匹配",
+    how_disp = {"config": "config 指定", "auto": "自动匹配", "folder": "⚠ 按文件夹名",
                 "ambig": "⚠ 多个候选未映射", "none": "⚠ 仿真表无此模式"}
     n_files = 0
     for f in walk_xlsx(root, skip, excl):
@@ -1860,11 +1888,19 @@ def cmd_inspect(args):
         print(f"    页={ws.title} 表头行={hdr} 单位列={cols['unit'] or '(空,按mA)'}  原始行 {len(raw)}")
         factor_to_ma = UNIT_TO_UA.get(cols["unit"], 1000.0) / 1000.0
         segs = split_allmode(raw) or [{"mode": folder, "raw": raw, "temp": None}]
+        # 与 _ingest_raw 保持同一条规则：旧单模式文件（整文件一段）段内标签与文件夹不符时
+        # 文件夹名优先（见过模板复制错名）。体检必须复刻它，否则 inspect 与 build 结论会打架。
+        single_legacy = (len(segs) == 1 and folder
+                         and canon_mode(folder) != canon_mode(segs[0]["mode"]))
         for s in segs:
             rows, temp0 = classify_raw(s["raw"], factor_to_ma)
             temp = s["temp"] if s.get("temp") is not None else temp0
             steps, _absorbed = build_groups(rows, config)
-            mode, how = resolve_mode(s["mode"], sim_modes, mode_map, folder=folder)
+            if single_legacy:
+                mode, _how0 = resolve_mode(folder, sim_modes, mode_map)
+                how = "folder"
+            else:
+                mode, how = resolve_mode(s["mode"], sim_modes, mode_map, folder=folder)
             ids_used = sorted({i for st in steps for i in (st["ids"] or [])})
             labels = sorted({st["disp"] for st in steps if not st["ids"]})
             arrow = "=" if s["mode"] == mode else "->"
@@ -1872,7 +1908,11 @@ def cmd_inspect(args):
                   f"{how_disp.get(how, how):<12} {temp if temp is not None else '?'}°C  "
                   f"{len(steps)} 组")
             if how in ("ambig", "none"):
-                problems.append(f"模式 {s['mode']!r} 匹配不到仿真 Mode（{how}）")
+                problems.append(f"模式 {s['mode']!r} 匹配不到仿真 Mode（{how}）"
+                                f" -> 在 config.mode_map 里指定")
+            elif how == "folder":
+                problems.append(f"{os.path.basename(os.path.dirname(f))} 目录里段内标签写的是"
+                                f" {s['mode']!r}（模板复制错名？）-> 已按文件夹名当 {mode}")
             have = sim_ids_by_mode.get(mode)
             if have is None:
                 if sim_modes:
