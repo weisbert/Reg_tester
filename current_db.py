@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
         "label_groups": "NO. 列非数字标签 -> 仿真模块ID列表如 {\"DCO5G\": [21]}，"
                         "或跨模式 {\"DCO2G\": {\"mode\": \"CK_ADPLL_DCO2G\", \"ids\": \"*\"}}",
         "exclude_globs": "扫描时按文件名跳过的通配符（本工具自己的输出必须在内，防自吞）",
+        "sim_label_ids": "仿真表里 Module 无数字前缀的合计/标签行 名->指派编号；留空则从 901 起按名排序自动指派（实测侧用 label_groups 把非数字标签指到该编号）",
         "sim_tier": "参与对比的仿真电流档位（如 Tier2，与实测一致）；空=不过滤（多档共存会重复求和！）",
         "sim_temp_note": "仿真数据的温度/corner 标注，只用于表头展示（如 55C/TT/0.9V）",
         "delta_flag_pct": "汇总簿标红：|偏差%| 超过该值才可能标红（默认 20）",
@@ -97,6 +98,7 @@ DEFAULT_CONFIG = {
     "ldo_reparent_sim_add_child": False,
     "label_groups": {},
     "exclude_globs": ["Current_compare_pivot*.xlsx", "probe_dump*", "*功耗表*.xlsx"],
+    "sim_label_ids": {},
     "sim_tier": "Tier2",
     "sim_temp_note": "55C",
     "delta_flag_pct": 20,
@@ -286,7 +288,7 @@ def find_sim_header(ws):
     return None, None
 
 
-def read_sim_rows(xlsx, sheet_name):
+def read_sim_rows(xlsx, sheet_name, label_ids=None):
     """读仿真长表 -> (records, info)，**只读不写**。
     ingest_sim 与 inspect 共用这一个解析器，保证「体检看到的」就是「入库的」。"""
     wb = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)
@@ -383,6 +385,33 @@ def read_sim_rows(xlsx, sheet_name):
                 info["id_missing"] += 1
             r.pop("id_col")
         info["module_ids"] = sorted({r["module_id"] for r in recs if r["module_id"] is not None})
+
+        # 合计/标签行（无数字前缀，如 I_xxx_total）指派一个稳定编号：优先 config.sim_label_ids，
+        # 其余从 901 起按名字排序自动指派（可复现、不与真实编号 1..N 冲突）。指派之后它们走
+        # 与普通模块**完全相同**的对比通路，实测侧只需在 config.label_groups 里把非数字标签
+        # （如 "DCO2G"）指到这个编号即可——不必为"按名查"另开一条支路。
+        explicit = {}
+        for k, v in (label_ids or {}).items():
+            try:
+                explicit[str(k)] = int(v)
+            except (TypeError, ValueError):
+                pass
+        used, auto, nxt = set(info["module_ids"]) | set(explicit.values()), {}, 901
+        for nm in sorted(info["no_prefix_names"]):
+            if nm in explicit:
+                continue
+            while nxt in used:
+                nxt += 1
+            auto[nm] = nxt
+            used.add(nxt)
+        label_map = dict(explicit)
+        label_map.update(auto)
+        info["label_id_map"] = label_map
+        info["label_id_auto"] = sorted(auto)
+        if label_map:
+            for r in recs:
+                if r["module_id"] is None:
+                    r["module_id"] = label_map.get(r["module_name"])
         return recs, info
     finally:
         wb.close()
@@ -410,9 +439,9 @@ def sim_warnings(info):
     return w
 
 
-def ingest_sim(conn, xlsx, sheet_name):
+def ingest_sim(conn, xlsx, sheet_name, label_ids=None):
     """返回 (入库行数, info)。"""
-    recs, info = read_sim_rows(xlsx, sheet_name)
+    recs, info = read_sim_rows(xlsx, sheet_name, label_ids)
     src = os.path.abspath(xlsx)
     conn.execute("DELETE FROM sim_current WHERE src_file=?", (src,))
     conn.executemany(
@@ -1685,7 +1714,7 @@ def cmd_build(args):
     else:
         sim_wb, sim_sheet = find_sim_workbook(root, config)
     if sim_wb and os.path.exists(sim_wb):
-        n, sim_info = ingest_sim(conn, sim_wb, sim_sheet)
+        n, sim_info = ingest_sim(conn, sim_wb, sim_sheet, config.get("sim_label_ids"))
         print(f"[仿真] {os.path.relpath(sim_wb, root)} / {sim_info['sheet']} -> {n} 行，"
               f"{len(sim_info['module_ids'])} 个模块编号")
     else:
@@ -1809,7 +1838,7 @@ def cmd_inspect(args):
     # ---------------------------------------------------------- ② 认出了什么
     recs, info = [], None
     if sim_wb and os.path.exists(sim_wb):
-        recs, info = read_sim_rows(sim_wb, sim_sheet)
+        recs, info = read_sim_rows(sim_wb, sim_sheet, config.get("sim_label_ids"))
         colmap = "  ".join(f"{k}={get_column_letter(v + 1)}"
                            for k, v in sorted(info["cols"].items(), key=lambda kv: kv[1]))
         print(f"\n  页={info['sheet']}  表头行={info['header_row']}")
@@ -1831,11 +1860,15 @@ def cmd_inspect(args):
             for idv, name, md in info["prefix_conflicts"]:
                 print(f"      ID={idv:<6} Module={name:<24} Mode={md}")
         if info["no_prefix_names"]:
-            print(f"  无数字前缀的 Module 名 {len(info['no_prefix_names'])} 种"
-                  f"（合计/标签行，需要 config.label_groups 按名映射才能参与对比）:")
+            lm = info["label_id_map"]
+            auto = set(info["label_id_auto"])
+            print(f"  无数字前缀的 Module 名 {len(info['no_prefix_names'])} 种（合计/标签行），"
+                  f"已指派编号:")
             for nm, cnt in sorted(info["no_prefix_names"].items(),
                                   key=lambda kv: (-kv[1], kv[0])):
-                print(f"      {nm!r:<40} {cnt} 行")
+                src = "自动" if nm in auto else "config.sim_label_ids"
+                print(f"      {nm!r:<28} -> 编号 {lm.get(nm)}   {cnt} 行  ({src})")
+            print("      ↑ 实测侧的非数字标签要参与对比，需在 config.label_groups 里指到这些编号")
         print(f"  Mode       ({len(info['modes'])}): {_fmt_counts(info['modes'])}")
         print(f"  Tier       ({len(info['tiers'])}): {_fmt_counts(info['tiers'])}")
         print(f"  simulation ({len(info['stages'])}): {_fmt_counts(info['stages'])}")
