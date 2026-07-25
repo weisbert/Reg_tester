@@ -1159,7 +1159,7 @@ def _chart_title(text, sz=1100, bold=True):
     return Title(tx=Text(rich=RichText(p=[p])))
 
 
-def cmd_summary_export(conn, out_path, config):
+def cmd_summary_export(conn, out_path, config, mark_fb=False):
     """人直接读的汇总簿：说明 / 总览(模块×模式×温度 + 仿真对比) / 温度趋势(图) / 对比明细。"""
     tier = config.get("sim_tier") or ""
     stage_main = (config.get("sim_stage") or "post").strip().lower()
@@ -1299,11 +1299,12 @@ def cmd_summary_export(conn, out_path, config):
         f"源文件 {', '.join(sorted(src_files))}",
         f"仿真：档位 {tier or '未过滤'} / {stage_main}-sim"
         f"（{'pre' if stage_main == 'post' else 'post'}-sim 在「对比明细」页）/ 温度 {sim_note or '未标注'}",
-        (f"  ★仿真列里【蓝色斜体】的格子 = {stage_main} 仿真该模块为 0/缺项，改用另一阶段的值补上"
-         f"（逐模块判断，两阶段都为 0 则保持空）。前仿已做 back annotate，多数情况下两者接近，"
-         f"故可比；但口径不同，看偏差时留意。共 {len(sim_fb)} 处，关掉改 config.sim_stage_fallback。"
+        ((f"  仿真取值：优先 {stage_main}-sim；个别模块该阶段为 0/缺项时取"
+          f"{'pre' if stage_main == 'post' else 'post'}-sim（前仿已做 back annotate，两者可比），"
+          f"逐模块判断，两阶段都为 0 则留空。本簿共 {len(sim_fb)} 处，逐项见「对比明细」页备注列。")
          if (fb_stage and sim_fb) else
-         "  仿真列全部取自同一阶段，无跨阶段补值。"),
+         "  仿真列全部取自同一阶段，无跨阶段补值。")
+        + ("  【本簿为自查版：补过的格子标成蓝色斜体】" if (mark_fb and sim_fb) else ""),
         "",
         "【总览页】行=模块（按 buffer 编号从低到高，组合组取组内最小号，DCO 标签行在最后），",
         "  列=模式×温度的实测电流 + 仿真参考 + 偏差%。顶部条件行：测试频率（2G=2.5GHz/5G=5.8GHz）、",
@@ -1488,8 +1489,9 @@ def cmd_summary_export(conn, out_path, config):
             # 仿真只在该模式实际测了这行时显示（防 25/25,24,23 交叠重复计入）
             sv = sim_val.get((key, mode)) if has_meas(key, mode, chip) else None
             _cell(ws, rr, c0 + n_t, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
-            if sv is not None and sim_fb.get((key, mode)):
-                # 后仿为 0、用前仿补上的格子：斜体+蓝色，口径可追溯（说明页有注解）
+            if mark_fb and sv is not None and sim_fb.get((key, mode)):
+                # 跨阶段补过的格子标成蓝色斜体。**默认不标**——总览是给别人 review 的，
+                # 没解释的颜色只会让人停下来问；要自查用 summary --mark-fallback 单出一份。
                 ws.cell(row=rr, column=c0 + n_t).font = Font(italic=True, color="1F4E79")
             dc = c0 + n_t + 1
             mv = meas_at_sim(key, mode, chip)   # 实测插值到仿真温度再比
@@ -1661,7 +1663,8 @@ def cmd_summary(args):
     root = os.path.dirname(os.path.abspath(args.db))
     config, _, _ = load_config(root, args.config)
     conn = open_db(args.db)
-    n_runs, n_rows, n_charts = cmd_summary_export(conn, args.out, config)
+    n_runs, n_rows, n_charts = cmd_summary_export(conn, args.out, config,
+                                                  mark_fb=args.mark_fallback)
     conn.close()
     print(f"[完成] 功耗汇总簿: {args.out}（{n_runs} 个 run，矩阵 {n_rows} 行，{n_charts} 张趋势图）")
 
@@ -2169,6 +2172,9 @@ def main():
     m.add_argument("--db", required=True)
     m.add_argument("--out", required=True)
     m.add_argument("--config", help="配置文件路径（默认取 db 同目录 current_config.json）")
+    m.add_argument("--mark-fallback", action="store_true",
+                   help="把跨阶段补值的仿真格标成蓝色斜体（自查版用；默认不标，"
+                        "保持给人 review 的总览干净）")
     m.set_defaults(func=cmd_summary)
 
     args = ap.parse_args()
