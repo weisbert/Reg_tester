@@ -4,25 +4,32 @@
 summarize_pll_sweep.py — 性能扫描簿 → 带汇总页的 Excel
 
 输入：一份仪器/脚本导出的性能扫描宽表（一行 = 一个测试项，列里有条件也有结果）。
-输出：一份新的 .xlsx——
+输出：一份新的 .xlsx，**是拿去 review 的成品**——
     第 1 页    原始数据（原封不动，就是输入那一页）
     汇总       compliance 表：上半「条件行」说明这组数在什么条件下取的，
                下半「结果行」一行一个指标 × MIN/TYP/MAX，Spec 与 limit 留空给人填，
                填完 PASS/FAIL 与超规标红由 Excel 公式+条件格式自动出
     温巡过程   按实际测试顺序摊平的全表 + 过程图（重锁点标出来）
-    温度明细   指标 × 温度矩阵（按段分列），既能翻数也是图表的数据源
+    温度明细   指标 × 温度矩阵（按段分列），汇总的数就是对它取 MIN/MAX/MEDIAN
     图表       关键指标的 值-vs-温度 图（每段一条线）
     相噪-offset 相噪曲线，图和数据同页
-    重锁对比   每次重锁的 前 / 锁定点 / 后 三态对照
+    _审计      排除了哪些行、有哪些告警。**默认隐藏**
 
 这份簿要回答的问题，以及各页的分工
     一颗锁定的 PLL 走完一整趟温度（中途不重锁，只在端点重锁）：
       ① 各项性能的全温最坏值满不满足 spec        -> 汇总页（这是它唯一的职责）
       ② 不重锁跑完全温，还锁着吗、压控走到轨没    -> 温巡过程页 + 图
-      ③ 重锁有没有效、复位一致不一致              -> 重锁对比页
+      ③ 重锁有没有效、复位一致不一致              -> 温巡过程图的重锁点 + 页顶那两句结论
     ★ 「锁在哪、锁了几次」是取数的**条件**，不是被考核的性能：
       它在汇总页里只占一行条件行，重锁点本身不计入性能统计。
       按温度段切分只用来看回滞（温度明细/图表），不进 compliance 表的骨架。
+
+两条出稿纪律
+    · **正表里不写使用说明、不写告警。** 这份簿要给人 review，翻到"怎么用""⚠ 告警"
+      只会招来"这是什么"的追问。这些进隐藏的 _审计 页，控制台每次也完整打印。
+    · **格子里不写死数。** 明细页每格是 ='原始页'!XX 引用，汇总页是对明细取
+      MIN/MAX/MEDIAN 的公式。原始数据改了汇总跟着变，也不会有人怀疑
+      "这个数是手敲的"。代价是 openpyxl 读不到算好的值，只有 Excel 打开才算。
 
 依赖：只用 openpyxl。   pip install openpyxl
 
@@ -96,6 +103,17 @@ def fmt_num(x, nd=3):
     if abs(x - round(x)) < 1e-12:
         return int(round(x))
     return round(x, nd)
+
+
+def sref(title, col_idx0, xl_row):
+    """指向原始页某个格子的引用串，如 ='Sheet1'!CD5。
+
+    汇总里的每个数都做成引用而不是写死：原始页改了值，汇总跟着变；
+    也免得 review 的人怀疑"这个数是不是手敲进去的"。
+    ⚠ 只在源格子确实有值时才引用——Excel 里引用空格子会显示成 0。
+    """
+    from openpyxl.utils import get_column_letter
+    return f"='{str(title).replace(chr(39), chr(39) * 2)}'!{get_column_letter(col_idx0 + 1)}{xl_row}"
 
 
 def fmt_hz(mhz):
@@ -431,7 +449,7 @@ def build_conditions(legs, cols, rows, items, room_t):
     return conds
 
 
-def write_summary(wb, legs, items, meta, st, room_t):
+def write_summary(wb, legs, items, meta, st, room_t, dref):
     """compliance 版式的汇总页：上半条件行、下半结果行，轴 = MIN / TYP / MAX。
 
     照 report-forge 的 compliance table 来：
@@ -451,8 +469,9 @@ def write_summary(wb, legs, items, meta, st, room_t):
             ("sep", "", 2),
             ("s_min", "MIN", 10), ("s_typ", "TYP", 10), ("s_max", "MAX", 10),
             ("limit", "limit", 8), ("sep", "", 2),
-            ("m_min", "MIN", 11), ("m_typ", "TYP", 11), ("m_max", "MAX", 11),
-            ("m_d", "Δ", 10), ("m_at", "极值@℃", 12), ("sep", "", 2),
+            ("m_min", "MIN", 11), ("m_lo_at", "@℃", 7), ("m_typ", "TYP", 11),
+            ("m_max", "MAX", 11), ("m_hi_at", "@℃", 7), ("m_d", "Δ", 10),
+            ("sep", "", 2),
             ("judge", "判定 / 备注", 26)]
     C = {k: i + 1 for i, (k, _l, _w) in enumerate(plan) if k != "sep"}
     for i, (_k, _l, w) in enumerate(plan):
@@ -460,12 +479,13 @@ def write_summary(wb, legs, items, meta, st, room_t):
 
     n_pts = sum(len(leg_series(lg, items[0])) for lg in legs) if items else 0
     temps = sorted({t for lg in legs for t in lg.temps})
-    groups = [("Spec（自己填）", "限值方向 le / ge / range",
+    groups = [("Spec", "MIN / TYP / MAX　判据 limit",
                [C["s_min"], C["s_typ"], C["s_max"], C["limit"]]),
               ("实测（全温）",
                f"{fmt_num(temps[0])} ~ {fmt_num(temps[-1])}℃，{n_pts} 点"
                if temps else "",
-               [C["m_min"], C["m_typ"], C["m_max"], C["m_d"], C["m_at"]])]
+               [C["m_min"], C["m_lo_at"], C["m_typ"],
+                C["m_max"], C["m_hi_at"], C["m_d"]])]
 
     for r in range(1, 4):
         for c in range(1, len(plan) + 1):
@@ -502,7 +522,7 @@ def write_summary(wb, legs, items, meta, st, room_t):
                 put(ws, r, ci, fmt_num(v), st, st["f_group"], bold=True)
         else:
             ws.merge_cells(start_row=r, start_column=C["m_min"],
-                           end_row=r, end_column=C["m_at"])
+                           end_row=r, end_column=C["m_d"])
             put(ws, r, C["m_min"], val, st, st["f_group"], bold=True, align="left")
         if note:
             put(ws, r, C["judge"], note, st, st["f_group"], size=8, align="left")
@@ -516,14 +536,24 @@ def write_summary(wb, legs, items, meta, st, room_t):
                 st["f_sep"] if k == "sep" else st["f_res"])
         put(ws, r, C["item"], it.label, st, st["f_res"], align="left")
         put(ws, r, C["unit"], it.unit, st, st["f_res"])
-        s = stats_all(legs, it, room_t)
-        if s:
-            put(ws, r, C["m_min"], fmt_num(s["min"]), st, st["f_res"])
-            put(ws, r, C["m_typ"], fmt_num(s.get("typ")), st, st["f_res"])
-            put(ws, r, C["m_max"], fmt_num(s["max"]), st, st["f_res"])
-            put(ws, r, C["m_d"], fmt_num(s["delta"]), st, st["f_res"])
-            put(ws, r, C["m_at"],
-                f"{fmt_num(s['min_t'])} / {fmt_num(s['max_t'])}", st, st["f_res"], size=9)
+        b = dref.get(it.label)
+        if b:
+            D, f0, f1 = b["sheet"], b["first"], b["last"]
+            lo = f"{D}!${L(b['c_lo'])}${f0}:${L(b['c_lo'])}${f1}"
+            hi = f"{D}!${L(b['c_hi'])}${f0}:${L(b['c_hi'])}${f1}"
+            tcol = f"{D}!$A${f0}:$A${f1}"
+            put(ws, r, C["m_min"], f"=MIN({lo})", st, st["f_res"])
+            put(ws, r, C["m_lo_at"],
+                f"=INDEX({tcol},MATCH(MIN({lo}),{lo},0))", st, st["f_res"], size=9)
+            put(ws, r, C["m_max"], f"=MAX({hi})", st, st["f_res"])
+            put(ws, r, C["m_hi_at"],
+                f"=INDEX({tcol},MATCH(MAX({hi}),{hi},0))", st, st["f_res"], size=9)
+            put(ws, r, C["m_d"], f"={L(C['m_max'])}{r}-{L(C['m_min'])}{r}",
+                st, st["f_res"])
+            if b["room_row"]:
+                rr = f"{D}!${L(2)}${b['room_row']}:${L(1 + b['n_legs'])}${b['room_row']}"
+                put(ws, r, C["m_typ"], f"=IF(COUNT({rr})=0,\"\",MEDIAN({rr}))",
+                    st, st["f_res"])
         mn, mx = f"{L(C['m_min'])}{r}", f"{L(C['m_max'])}{r}"
         sn, sx, lim = f"${L(C['s_min'])}{r}", f"${L(C['s_max'])}{r}", f"${L(C['limit'])}{r}"
         put(ws, r, C["judge"],
@@ -580,87 +610,107 @@ def write_summary(wb, legs, items, meta, st, room_t):
         fill=PatternFill("solid", fgColor=FILL_PASS, bgColor=FILL_PASS), stopIfTrue=False))
     ws.freeze_panes = f"D{4}"
 
-    # ---- 表下方：怎么用 / 排除的行 / 告警 ----
-    r = res_last + 2
-    put(ws, r, 1, "怎么用", st, st["f_group"], bold=True, align="left")
-    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
-    for line in [
-        "① 填 Spec 的 MIN / TYP / MAX（只关心的那几格填就行），再在 limit 列选方向：",
-        "     le = 实测要 ≤ Spec MAX（相噪、杂散、电流这类）；"
-        "ge = 实测要 ≥ Spec MIN；range = 两头都卡。",
-        "② 填完「判定」列自动出 PASS / FAIL，超规的实测格自动标红加粗，不用重跑脚本。",
-        f"③ 实测 MIN / MAX = 全温 {n_pts} 个测量点里的极值；TYP = 常温 {fmt_num(room_t)}℃ "
-        f"各次测量的中位数（常温在温巡里被经过多次）。极值出现的温度在「极值@℃」列。",
-        "④ 每个极值都能在「温度明细」页原样查到；曲线看「图表」页。",
-        "⑤ 重锁点不计入上面的统计——重锁是取数的条件不是被考核的性能，"
-        "它的三态对照在「重锁对比」页。",
-    ]:
-        r += 1
-        put(ws, r, 1, line, st, None, align="left")
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(plan))
-
-    r += 2
-    put(ws, r, 1, "没算进汇总的行（逐行列出，不做静默丢弃）", st, st["f_group"],
-        bold=True, align="left")
-    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
-    r += 1
-    put(ws, r, 1, "原表行号", st, st["f_head"], bold=True)
-    put(ws, r, 2, "原因", st, st["f_head"], bold=True)
-    ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=6)
-    for xl, why in meta["excluded"]:
-        r += 1
-        put(ws, r, 1, xl, st)
-        put(ws, r, 2, why, st, align="left")
-        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=6)
-    if meta["warnings"]:
-        r += 2
-        put(ws, r, 1, "⚠ 探查告警", st, st["f_group"], bold=True, align="left")
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
-        for w in meta["warnings"]:
-            r += 1
-            put(ws, r, 1, w, st, None, align="left", color=COLOR_FLAG)
-            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(plan))
+    # 汇总页到此为止：给 review 看的东西不掺任何使用说明/告警，
+    # 那些进独立的隐藏审计页（见 write_audit）。
     return ws
 
 
 # ---------------------------------------------------------------- 温度明细
 
-def write_detail(wb, legs, items, st):
-    """每个指标一块：行=温度（所有段的温度并集，升序），列=段。图表就吃这个。"""
-    from openpyxl.utils import get_column_letter
+def write_detail(wb, legs, items, st, src_title, room_t):
+    """每个指标一块：行=温度（所有段的温度并集，升序），列=段。图表和汇总都吃这个。
+
+    格子里放的是**指向原始页的引用**，不是抄过来的数。
+    右边两列「各段最小/最大」是同一温度下各段之间的散布（回滞有多大），
+    汇总页的全温极值就是对这两列取 MIN/MAX——这样汇总也不写死。
+    """
+    from openpyxl.utils import get_column_letter as L
     ws = wb.create_sheet("温度明细")
     ws.column_dimensions["A"].width = 12
-    for i in range(len(legs)):
-        ws.column_dimensions[get_column_letter(2 + i)].width = 13
+    for i in range(len(legs) + 2):
+        ws.column_dimensions[L(2 + i)].width = 13
 
     temps = sorted({t for lg in legs for t in lg.temps})
-    blocks = []                       # (item, 首行, 末行)
+    c_lo, c_hi = 2 + len(legs), 3 + len(legs)          # 两列辅助
+    blocks = []
     r = 1
     for it in items:
         put(ws, r, 1, f"{it.label}  [{it.unit}]", st, st["f_group"], bold=True, align="left")
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1 + len(legs))
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=c_hi)
         r += 1
         put(ws, r, 1, "温度℃", st, st["f_head"], bold=True)
         for i, lg in enumerate(legs):
             put(ws, r, 2 + i, f"{lg.title} {lg.direction}", st, st["f_head"], bold=True, size=9)
+        put(ws, r, c_lo, "各段最小", st, st["f_head"], bold=True, size=9)
+        put(ws, r, c_hi, "各段最大", st, st["f_head"], bold=True, size=9)
         head = r
         r += 1
         first = r
-        series = [leg_series(lg, it) for lg in legs]
+        # 温度 -> 该段里取到这个值的那一行在原始页的行号
+        srcs = []
+        for lg in legs:
+            m = OrderedDict()
+            for row in lg.rows:
+                if row.kind == "lock":
+                    continue
+                if row.temp is not None and row.vals.get(it.col) is not None:
+                    m[row.temp] = row.xl
+            srcs.append(m)
+        room_row = None
         for t in temps:
             put(ws, r, 1, fmt_num(t), st, st["f_res"])
+            if t == room_t:
+                room_row = r
             for i, _lg in enumerate(legs):
-                put(ws, r, 2 + i, fmt_num(series[i].get(t)), st, st["f_res"])
+                xl = srcs[i].get(t)
+                put(ws, r, 2 + i, sref(src_title, it.col, xl) if xl else None,
+                    st, st["f_res"])
+            rng = f"{L(2)}{r}:{L(1 + len(legs))}{r}"
+            put(ws, r, c_lo, f"=IF(COUNT({rng})=0,\"\",MIN({rng}))", st, st["f_res"], size=9)
+            put(ws, r, c_hi, f"=IF(COUNT({rng})=0,\"\",MAX({rng}))", st, st["f_res"], size=9)
             r += 1
-        blocks.append((it, head, first, r - 1))
+        blocks.append({"item": it, "head": head, "first": first, "last": r - 1,
+                       "c_lo": c_lo, "c_hi": c_hi, "room_row": room_row})
         r += 1
     ws.freeze_panes = "B1"
     return ws, blocks, temps
 
 
+def write_audit(wb, meta, st):
+    """审计页：排除了哪些行、有哪些告警。默认隐藏。
+
+    这份簿是要拿去 review 的，正表里不能掺"怎么用""⚠ 告警"这类给写脚本的人
+    看的东西——老板翻到会问这是什么。但也不能真丢掉：哪些行没算进来必须留痕，
+    所以单开一页并 hidden，需要时右键取消隐藏。控制台每次都会完整打印一份。
+    """
+    ws = wb.create_sheet("_审计")
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 100
+    put(ws, 1, 1, "本页仅供数据核对，不属于报告正文", st, st["f_group"],
+        bold=True, align="left")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
+    r = 3
+    put(ws, r, 1, "原表行号", st, st["f_head"], bold=True)
+    put(ws, r, 2, "未计入汇总的原因", st, st["f_head"], bold=True)
+    for xl, why in meta["excluded"]:
+        r += 1
+        put(ws, r, 1, xl, st)
+        put(ws, r, 2, why, st, align="left")
+    if meta["warnings"]:
+        r += 2
+        put(ws, r, 1, "告警", st, st["f_head"], bold=True)
+        put(ws, r, 2, "说明", st, st["f_head"], bold=True)
+        for w in meta["warnings"]:
+            r += 1
+            put(ws, r, 1, "⚠", st)
+            put(ws, r, 2, w, st, align="left")
+    ws.sheet_state = "hidden"
+    return ws
+
+
 # ---------------------------------------------------------------- 温巡过程
 
-def write_journey(wb, legs, items, st, yranges):
+def write_journey(wb, legs, items, st, yranges, src_title):
     """按实际测试顺序把整趟温巡摊平成一张表，作为过程图的数据源。
 
     汇总页和温度明细都是「按温度」看的，那一维把先后顺序压没了。
@@ -696,12 +746,12 @@ def write_journey(wb, legs, items, st, yranges):
             14 if i > 2 else 8
 
     seq = [(lg, r) for lg in legs for r in lg.rows]
-    f0 = None
+    f0, f0_row = None, None
     if fq:
         for _lg, r in seq:
             v = r.vals.get(fq.col)
             if v is not None:
-                f0 = v
+                f0, f0_row = v, r.xl
                 break
 
     r0 = 3
@@ -718,16 +768,27 @@ def write_journey(wb, legs, items, st, yranges):
             bold=is_lock, color=COLOR_FLAG if is_lock else None)
         if vt:
             v = row.vals.get(vt.col)
-            put(ws, r, cols["vt"], fmt_num(v, 5), st, fill)
-            put(ws, r, cols["vt"] + 1, fmt_num(v, 5) if is_lock else None, st, fill)
+            ref = sref(src_title, vt.col, row.xl) if v is not None else None
+            put(ws, r, cols["vt"], ref, st, fill)
+            put(ws, r, cols["vt"] + 1, ref if (is_lock and ref) else None, st, fill)
         if fq:
             v = row.vals.get(fq.col)
             df = None if (v is None or f0 is None) else round((v - f0) * 1000.0, 3)
             if df is not None:
                 dfs.append(abs(df))
-            put(ws, r, cols["fq"], df, st, fill)
-            put(ws, r, cols["fq"] + 1, df if is_lock else None, st, fill)
-            put(ws, r, cols["fq"] + 2, fmt_num(v, 6), st, fill, size=9)
+            # Δf 也做成公式：(本行频率 - 首点频率) × 1000
+            if v is not None and f0_row:
+                a = sref(src_title, fq.col, row.xl)[1:]      # 去掉开头的 '='
+                b = sref(src_title, fq.col, f0_row)[1:]
+                dformula = f"=({a}-{b})*1000"
+            else:
+                dformula = None
+            put(ws, r, cols["fq"], dformula, st, fill)
+            put(ws, r, cols["fq"] + 1,
+                dformula if (is_lock and dformula) else None, st, fill)
+            put(ws, r, cols["fq"] + 2,
+                sref(src_title, fq.col, row.xl) if v is not None else None,
+                st, fill, size=9)
 
     note = ("整趟温巡按测试顺序排；米色行 = 重锁点。"
             + (f"  Δf = 相对第 1 个测点（{fmt_num(f0, 6)}）的偏差，"
@@ -827,8 +888,9 @@ def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
         row = _journey_charts(ws, ws_j, jinfo, st, row)
 
     # 值 vs 温度：只画点名的几个
-    wanted = [b for b in blocks if b[0].label in chart_items]
-    for n, (it, head, first, last) in enumerate(wanted):
+    wanted = [b for b in blocks if b["item"].label in chart_items]
+    for n, blk in enumerate(wanted):
+        it, head, first, last = blk["item"], blk["head"], blk["first"], blk["last"]
         ch = ScatterChart()
         ch.title = f"{it.label} vs 温度"
         ch.style = 13
@@ -846,10 +908,9 @@ def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
             color, sym = LEG_STYLE[i % len(LEG_STYLE)]
             _style(s, color, sym)
             ch.series.append(s)
-            vals += [ws_detail.cell(row=r, column=2 + i).value
-                     for r in range(first, last + 1)]
-        _apply_y(ch, yranges.get(it.label)
-                 or axis_bounds([v for v in vals if isinstance(v, (int, float))]))
+        # 明细页现在放的是公式，openpyxl 读不到算完的值，纵轴范围直接用内存里的数
+        vals = [v for lg in legs for v in leg_series(lg, it).values()]
+        _apply_y(ch, yranges.get(it.label) or axis_bounds(vals))
         _legend_bottom(ch)
         ws.add_chart(ch, f"{'A' if n % 2 == 0 else 'K'}{row + (n // 2) * 19}")
     row += ((len(wanted) + 1) // 2) * 19
@@ -1008,69 +1069,6 @@ def _pn_offset_chart(wb, legs, pn_items, st, yranges):
     ws.add_chart(ch, "F2")
 
 
-# ---------------------------------------------------------------- 重锁对比
-
-def write_relock(wb, legs, items, st):
-    """每次重锁：锁定前最后一点 / 锁定点 / 锁定后下一点，三态对照。
-
-    重锁前后一般是同一个温度（在端点停下来重锁），所以差值基本就是
-    「不重锁跑了一整趟温度之后，重锁能把指标拉回多少」。
-    """
-    ws = wb.create_sheet("重锁对比")
-    events = []
-    for k, lg in enumerate(legs):
-        if not lg.rows:
-            continue
-        lock_row = lg.rows[0]
-        before = legs[k - 1].rows[-1] if k > 0 and legs[k - 1].rows else None
-        after = lg.rows[1] if len(lg.rows) > 1 else None
-        if before is None:
-            continue
-        events.append((lg, before, lock_row, after))
-    if not events:
-        put(ws, 1, 1, "只有一段，没有重锁事件可比。", st, None, align="left")
-        return ws
-
-    ws.column_dimensions["A"].width = 16
-    ws.column_dimensions["B"].width = 22
-    ws.column_dimensions["C"].width = 9
-    put(ws, 1, 1, "每次重锁的前 / 锁定点 / 后：差值 = 重锁把指标拉回了多少",
-        st, st["f_group"], bold=True, align="left")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=3 + 4 * len(events))
-
-    for j, (lg, b, l, a) in enumerate(events):
-        c0 = 4 + j * 4
-        ws.merge_cells(start_row=2, start_column=c0, end_row=2, end_column=c0 + 3)
-        put(ws, 2, c0, f"{lg.title}（{fmt_num(l.temp)}℃）", st, st["f_head"], bold=True)
-        for i, h in enumerate(["锁前", "锁定点", "锁后", "Δ(锁定点-锁前)"]):
-            put(ws, 3, c0 + i, h, st, st["f_head"], bold=True, size=9)
-            ws.column_dimensions[ws.cell(row=3, column=c0 + i).column_letter].width = 12
-        put(ws, 4, c0, f"行{b.xl} @{fmt_num(b.temp)}℃", st, st["f_group"], size=8)
-        put(ws, 4, c0 + 1, f"行{l.xl}", st, st["f_group"], size=8)
-        put(ws, 4, c0 + 2, f"行{a.xl}" if a else "-", st, st["f_group"], size=8)
-        put(ws, 4, c0 + 3, "", st, st["f_group"])
-    for h, c in (("Category", 1), ("Item", 2), ("Unit", 3)):
-        ws.merge_cells(start_row=2, start_column=c, end_row=4, end_column=c)
-        put(ws, 2, c, h, st, st["f_head"], bold=True)
-
-    for n, it in enumerate(items):
-        r = 5 + n
-        put(ws, r, 1, it.cat, st, st["f_res"], align="left")
-        put(ws, r, 2, it.label, st, st["f_res"], align="left")
-        put(ws, r, 3, it.unit, st, st["f_res"])
-        for j, (lg, b, l, a) in enumerate(events):
-            c0 = 4 + j * 4
-            vb, vl = b.vals.get(it.col), l.vals.get(it.col)
-            va = a.vals.get(it.col) if a else None
-            put(ws, r, c0, fmt_num(vb), st, st["f_res"])
-            put(ws, r, c0 + 1, fmt_num(vl), st, st["f_res"])
-            put(ws, r, c0 + 2, fmt_num(va), st, st["f_res"])
-            d = (vl - vb) if (vb is not None and vl is not None) else None
-            put(ws, r, c0 + 3, fmt_num(d), st, st["f_res"], bold=True)
-    ws.freeze_panes = "D5"
-    return ws
-
-
 # ---------------------------------------------------------------- main
 
 def main():
@@ -1097,6 +1095,8 @@ def main():
                     help="手工钉死某张图的纵轴，如 \"Vtune_V=0.1:0.8,IPN_SSB=-60:-40\"；"
                          "键还可用 Δf（频率漂移图）/ PN（相噪-offset 图）。"
                          "不给就按数据自动算范围")
+    ap.add_argument("--no-audit", action="store_true",
+                    help="连隐藏的「_审计」页都不要（排除行/告警只留在控制台输出）")
     ap.add_argument("--dry-run", action="store_true", help="只打印识别结果，不写文件")
     args = ap.parse_args()
 
@@ -1258,9 +1258,14 @@ def main():
             sys.exit(f"--y-range 格式应为 指标名=下限:上限，逗号分隔；解析不了: {part!r}")
 
     st = _styles()
-    write_summary(wb, legs, items, meta, st, room_t)
-    ws_j, jinfo = write_journey(wb, legs, items, st, yranges)
-    ws_detail, blocks, _temps = write_detail(wb, legs, items, st)
+    # 明细页要先建：汇总页的实测列是对它取 MIN/MAX/MEDIAN 的公式，不是写死的数
+    ws_detail, blocks, _temps = write_detail(wb, legs, items, st, ws.title, room_t)
+    dref = {b["item"].label: {"sheet": f"'{ws_detail.title}'", "first": b["first"],
+                              "last": b["last"], "c_lo": b["c_lo"], "c_hi": b["c_hi"],
+                              "room_row": b["room_row"], "n_legs": len(legs)}
+            for b in blocks}
+    write_summary(wb, legs, items, meta, st, room_t, dref)
+    ws_j, jinfo = write_journey(wb, legs, items, st, yranges, ws.title)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     if args.chart_items.strip().lower() == "all":
         chart_items = [it.label for it in items]
@@ -1270,14 +1275,20 @@ def main():
         chart_items = []
     write_charts(wb, ws_detail, blocks, legs, items, pn_items,
                  ws_j, jinfo, chart_items, yranges, st)
-    write_relock(wb, legs, items, st)
+    if not args.no_audit:
+        write_audit(wb, meta, st)
+
+    # 按阅读顺序排页：原始 → 结论 → 过程 → 明细 → 图
+    order = [ws.title, "汇总", "温巡过程", "温度明细", "图表", "相噪-offset", "_审计"]
+    wb._sheets.sort(key=lambda s: order.index(s.title)
+                    if s.title in order else len(order))
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
     wb.save(out)
     print(f"\n已写出: {os.path.abspath(out)}")
     print(f"  第 1 页「{ws.title}」= 原始数据原样保留；新增 "
           + " / ".join(n for n in wb.sheetnames if n != ws.title))
-    print("  汇总页的 Spec Min/Max 两列留空，填进去 PASS/FAIL 自动出、超规自动标红。")
+    print("  汇总页的 Spec MIN/TYP/MAX 与 limit 列留空，填进去判定自动出、超规自动标红。")
 
 
 if __name__ == "__main__":
