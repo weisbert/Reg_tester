@@ -1207,8 +1207,14 @@ def main():
     }
 
     # ---- 打印识别结果 ----
-    print("源文件 : %s   sheet=%s  %d 行 × %d 列"
-          % (os.path.basename(args.path), ws.title, ws.max_row, ws.max_column))
+    # ws.max_row/max_column 是「声明尺寸」——模板预设过格式的空区域也算进去，
+    # 常见到 10000 行 × 205 列这种数字。真正有内容的行才是要报的。
+    n_filled = sum(1 for r in data if any(not is_blank(v) for v in r))
+    print("源文件 : %s   sheet=%s" % (os.path.basename(args.path), ws.title))
+    print("规模   : 有内容的数据行 %d（表头第 %d 行，表头列 %d 个；"
+          "工作表声明尺寸 %d 行 × %d 列，其余是模板预留的空区域）"
+          % (n_filled, args.header_row, sum(1 for h in header if txt(h)),
+             ws.max_row, ws.max_column))
     print("温度列 : %s" % (tname or "(没有)"))
     print("Vtune  : %s   %s" % (vt_name, vt_why))
     if ct_name:
