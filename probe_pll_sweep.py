@@ -494,26 +494,52 @@ def analyse_sheet(ws, level, reveal, hide, max_groups=25):
     return out
 
 
-def classify_only(ws, reveal, hide):
-    """最小输出：每种块只报一次 表头 -> 分类，先核对脱敏边界对不对。"""
+def classify_only(ws, reveal, hide, max_patterns=4, max_empty_names=20):
+    """最小输出：每种块只报一次 表头 -> 分类 -> 非空计数，先核对脱敏边界对不对。
+
+    表头后面的数字＝该列有几行非空。计数不是数值，不破脱敏，但能一眼看出
+    哪些结果列压根没测（占位列）、以及哪几种行填得不一样（例如重锁行不测相噪）。
+    """
     all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
     res = []
     for _, g in group_blocks(split_blocks(all_rows)):
-        cols = []
-        for head in g[0]["header"]:
+        header = g[0]["header"]
+        row_ids = [r for b in g for r in b["data_rows"]]
+        rows = [all_rows[r - 1] for r in row_ids]
+        cols, keep = [], []
+        for c, head in enumerate(header):
             if is_blank(head):
                 continue
             cls, _why = classify_header(head, reveal, hide)
-            cols.append(f"{norm(head)}[{cls}]")
+            n = sum(1 for r in rows if c < len(r) and not is_blank(r[c]))
+            cols.append(f"{norm(head)}[{cls}]={n}")
+            keep.append(c)
         labels = [(b.get("label") or {}).get("text") for b in g]
         item = {
             "occurrences": len(g),
             "labels": [l for l in labels if l][:60],
             "first_header_row": g[0]["header_row"],
             "n_data_rows_each": sorted({len(b["data_rows"]) for b in g}),
+            "n_data_rows_total": len(rows),
+            "cols_note": "表头[分类]=非空行数",
             "cols": cols,
         }
-        dups = dup_headers(g[0]["header"])
+        # 行填充模式：几种行、各几行、每种行哪些列是空的（看重锁行/占位行）
+        sigs = {}
+        for rid, r in zip(row_ids, rows):
+            sig = tuple(c < len(r) and not is_blank(r[c]) for c in keep)
+            grp = sigs.setdefault(sig, [])
+            grp.append(rid)
+        pats = []
+        for sig, ids in sorted(sigs.items(), key=lambda kv: -len(kv[1]))[:max_patterns]:
+            empt = [str(norm(header[c])) for f, c in zip(sig, keep) if not f]
+            pats.append({"n_rows": len(ids), "example_rows": ids[:3],
+                         "n_empty_cols": len(empt),
+                         "empty_cols": empt[:max_empty_names]
+                         + (["…(截断)"] if len(empt) > max_empty_names else [])})
+        item["distinct_fill_patterns"] = len(sigs)
+        item["row_fill_patterns"] = pats
+        dups = dup_headers(header)
         if dups:
             item["duplicate_headers"] = dups
         res.append(item)
