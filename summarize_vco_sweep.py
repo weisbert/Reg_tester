@@ -94,6 +94,17 @@ def txt(v):
     return "" if v is None else str(v).strip()
 
 
+def qx(v, nd):
+    """横轴取值量化。
+
+    仪器脚本常用累加生成扫描点，于是同一个设定值在表里长这样：
+    0.15000000000000002 / 0.39999999999999997 / 0.7000000000000001。
+    不量化的话，同一个设定值在不同温度段会变成两个不同的字典键——
+    明细页多出半空的行、温漂对不上点，而且一点报错都没有。
+    """
+    return None if v is None else round(v, nd)
+
+
 def fmt_num(x, nd=3):
     if x is None:
         return None
@@ -348,6 +359,15 @@ def _extremes(pairs):
     hi = max(pairs, key=lambda x: x[0])
     return {"min": lo[0], "min_x": lo[1], "max": hi[0], "max_x": hi[1],
             "delta": hi[0] - lo[0], "n": len(pairs)}
+
+
+def items_with_data(groups, items):
+    """这一批组里真的量到了的指标。
+
+    两种扫法记的东西不一样：Vtune 扫每点都测点相噪/杂散/电流，CT 扫只记
+    频率/功率/积分相噪。不按组筛一遍，CT 那几页会多出十几列整片空白。
+    """
+    return [it for it in items if any(group_series(g, it) for g in groups)]
 
 
 def stats(g, item):
@@ -664,7 +684,7 @@ def write_summary(wb, by_kind, items, meta, st):
         ws = wb.create_sheet(name)
         if first_ws is None:
             first_ws = ws
-        r = _range_table(ws, 1, groups, items, st,
+        r = _range_table(ws, 1, groups, items_with_data(groups, items), st,
                          "逐点指标 · %s（横轴 %s）" % (KIND_LABEL.get(kind, kind),
                                                   groups[0].x_label)) + 2
         freq_item = meta["freq_item"]
@@ -906,24 +926,31 @@ def write_pn_chart(wb, grid, groups, pn_items, st):
 # ---------------------------------------------------------------- 锁定点页
 
 def write_locked(wb, locked, items, st, temp_name):
-    """闭环/锁定那几行单独列出来，跟开环曲线对照：闭环最后落在哪。"""
-    ws = wb.create_sheet("锁定点")
-    put(ws, 1, 1, "闭环 / 锁定行（不进开环统计，单列在这里跟开环曲线对照看）",
+    """扫描序列之外、但确实量到东西的行，单独列出来。
+
+    这类簿里每换一次温度都有一小段 闭环 → 锁定 → 开环 的切换动作，其中「锁定」
+    那行是带完整测量的：它就是闭环最后落在压控曲线的哪个位置，跟开环曲线对照着看
+    才有意义。还有自检 / 换模式那几行也可能带部分结果——一并列在这里，
+    免得「排除了 N 行」看着像凭空丢了数据。
+    """
+    ws = wb.create_sheet("非扫描行")
+    put(ws, 1, 1, "扫描序列之外但带测量值的行（不进扫描统计；「锁定」行可跟开环曲线对照）",
         st, st["f_group"], bold=True, align="left")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4 + len(items))
-    heads = ["原表行号", "Mode", temp_name or "温度", "Vtune"] + \
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5 + len(items))
+    heads = ["原表行号", "类型", "Mode", temp_name or "温度", "Vtune"] + \
             ["%s\n[%s]" % (it.label, it.unit) for it in items]
     for j, h in enumerate(heads):
         put(ws, 2, 1 + j, h, st, st["f_head"], bold=True, size=9)
-    for i, r in enumerate(locked):
+    for i, (r, kind) in enumerate(locked):
         put(ws, 3 + i, 1, r.xl, st, st["f_res"])
-        put(ws, 3 + i, 2, r.mode, st, st["f_res"], align="left")
-        put(ws, 3 + i, 3, fmt_num(r.temp), st, st["f_res"])
-        put(ws, 3 + i, 4, fmt_num(r.vt), st, st["f_res"])
+        put(ws, 3 + i, 2, kind, st, st["f_res"])
+        put(ws, 3 + i, 3, r.mode, st, st["f_res"], align="left")
+        put(ws, 3 + i, 4, fmt_num(r.temp), st, st["f_res"])
+        put(ws, 3 + i, 5, fmt_num(r.vt), st, st["f_res"])
         for j, it in enumerate(items):
-            put(ws, 3 + i, 5 + j, fmt_num(r.vals.get(it.col)), st, st["f_res"])
-    ws.column_dimensions["B"].width = 22
-    ws.freeze_panes = "B3"
+            put(ws, 3 + i, 6 + j, fmt_num(r.vals.get(it.col)), st, st["f_res"])
+    ws.column_dimensions["C"].width = 22
+    ws.freeze_panes = "C3"
     return ws
 
 
@@ -990,6 +1017,9 @@ def main():
                     help="只保留 Test Item 等于该值的行（默认取出现最多的那个值）")
     ap.add_argument("--ref-temp", type=float, default=25.0,
                     help="温漂参考温度（默认 25）")
+    ap.add_argument("--x-round", type=int, default=6,
+                    help="横轴取值四舍五入到几位小数（默认 6）。扫描点常是累加出来的，"
+                         "表里会是 0.39999999999999997 这种，不量化就跟别的段对不上点")
     ap.add_argument("--show-addr", action="store_true",
                     help="打印 CT 扫用的寄存器地址（默认不打印，地址是 IP）")
     ap.add_argument("--all-charts", action="store_true",
@@ -1088,19 +1118,20 @@ def main():
         if cnt:
             sweep_mode = max(cnt, key=lambda k: cnt[k])
 
-    excluded, rows, locked = [], [], []
+    excluded, rows, locked, others = [], [], [], []
     for n, raw in enumerate(data):
         xl = args.header_row + 1 + n
         if all(is_blank(v) for v in raw):
             continue
         mode = txt(raw[mode_i]) if mode_i is not None and mode_i < len(raw) else ""
         temp = num(raw[tcol]) if tcol is not None and tcol < len(raw) else None
-        vt = num(raw[vt_col]) if vt_col < len(raw) else None
-        ct = num(raw[ct_col]) if ct_col is not None and ct_col < len(raw) else None
+        vt = qx(num(raw[vt_col]) if vt_col < len(raw) else None, args.x_round)
+        ct = qx(num(raw[ct_col]) if ct_col is not None and ct_col < len(raw) else None,
+                args.x_round)
         r = Row(xl, temp, mode, vt, ct, raw)
         if mode and lock_re.search(mode):
             locked.append(r)
-            excluded.append((xl, "%s = %r，闭环/锁定行（列在「锁定点」页）" % (args.mode_col, mode)))
+            excluded.append((xl, "%s = %r，闭环/锁定行（列在「非扫描行」页）" % (args.mode_col, mode)))
             continue
         if ti_col is not None and keep_ti is not None:
             v = txt(raw[ti_col]) if ti_col < len(raw) else ""
@@ -1108,17 +1139,24 @@ def main():
                 excluded.append((xl, "Test Item = %r，不是主测试项 %r" % (v, keep_ti)))
                 continue
         if sweep_mode is not None and mode != sweep_mode:
+            others.append(r)
             excluded.append((xl, "%s = %r，不是扫描模式 %r" % (args.mode_col, mode, sweep_mode)))
             continue
         rows.append(r)
 
     skip = {vt_col} | ({ct_col} if ct_col is not None else set())
-    items, dropped = build_items(cols, [r.raw for r in rows + locked], skip_cols=skip)
+    items, dropped = build_items(cols, [r.raw for r in rows + locked + others],
+                                 skip_cols=skip)
     if not items:
         sys.exit("没识别出任何有数据的结果列")
-    for r in rows + locked:
+    for r in rows + locked + others:
         for it in items:
             r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+
+    # 扫描序列之外但确实量到东西的行：单列一页，别让「排除了 N 行」看着像丢了数据
+    extra = [(r, "锁定") for r in locked if any(v is not None for v in r.vals.values())]
+    extra += [(r, "其它") for r in others if any(v is not None for v in r.vals.values())]
+    extra.sort(key=lambda x: x[0].xl)
 
     keep = []
     for r in rows:
@@ -1135,7 +1173,10 @@ def main():
     # 于是 CT 扫那几行被并进 Vtune 扫，去重后只剩最后一个，把曲线上那个点悄悄换掉）
     for g in groups:
         xs = [g.x_of(r) for r in g.rows if g.x_of(r) is not None]
-        if len(xs) - len(set(xs)) >= 2:
+        dup = len(xs) - len(set(xs))
+        # 少量重复是正常的（先粗扫一遍再回头细扫，几个点会重复量）；
+        # 大面积重复才是「组里还藏着另一个在动的变量」。
+        if dup >= 2 and dup > 0.2 * len(xs):
             warnings.append("组「%s」有 %d 个点但横轴只有 %d 个不同取值——"
                             "是不是还有一个没识别出来的扫描变量？(--ct-col 指定)"
                             % (g.title, len(xs), len(set(xs))))
@@ -1188,8 +1229,9 @@ def main():
     print("分组 %d 组:" % len(groups))
     for g in groups:
         print("    %-16s %-22s 行 %d~%d" % (g.title, g.stage, g.rows[0].xl, g.rows[-1].xl))
-    if locked:
-        print("闭环/锁定行 %d 行: %s" % (len(locked), ", ".join(str(r.xl) for r in locked)))
+    if extra:
+        print("非扫描行里带测量值的 %d 行（列在「非扫描行」页）: %s"
+              % (len(extra), ", ".join("%d/%s" % (r.xl, k) for r, k in extra[:12])))
     if excluded:
         print("排除 %d 行:" % len(excluded))
         for xl, why in excluded:
@@ -1209,7 +1251,7 @@ def main():
         if kind == "point":
             continue
         nm = "Vtune明细" if kind == "vtune" else "CT明细"
-        ws_d, blocks = write_detail(wb, nm, gs, items, st)
+        ws_d, blocks = write_detail(wb, nm, gs, items_with_data(gs, items), st)
         panels.append((ws_d, blocks, gs, gs[0].x_label))
         if freq_item is not None and any(len(group_series(g, freq_item)) >= 2 for g in gs):
             sn = "Kvco明细" if kind == "vtune" else "CT斜率明细"
@@ -1226,8 +1268,8 @@ def main():
     vt_groups = next((gs for k, gs in by_kind if k == "vtune"), [])
     write_pn_chart(wb, grid, vt_groups or [g for _k, gs in by_kind for g in gs],
                    pn_items, st)
-    if locked:
-        write_locked(wb, locked, items, st, tname)
+    if extra:
+        write_locked(wb, extra, items, st, tname)
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
     wb.save(out)
