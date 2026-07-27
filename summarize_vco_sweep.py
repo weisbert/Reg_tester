@@ -11,14 +11,23 @@ summarize_vco_sweep.py — 开环压控扫描簿 → 带汇总页的 Excel
 
 输出：一份新的 .xlsx——
     第 1 页   原始数据（原封不动，就是输入那一页）
-    汇总      compliance 版式：逐点指标 Min/Max/Δ（Vtune 扫一张表、CT 扫一张表）
-              + 压控特性派生指标（Kvco、线性度、单调性、温漂）
-              Spec 两列留空给人填，填完 PASS/FAIL 由 Excel 公式自动出、超规自动标红
+    ★ 结论    这页才是报告：把两种扫描合起来算，只放能下判断的行——
+              有没有锁不上的盲区（Band overlap 比）、目标频率覆盖余量、
+              温漂折合几个 CT 码、工作点 Kvco 与带宽漂移倍数、单调性、各指标最差点。
+              Spec 两列留空给人填，「关注」列提示该填哪边，填完 PASS/FAIL 自动出、超规标红。
+    汇总      逐点极值大表（Vtune 扫一张、CT 扫一张）：查数用，不是结论
     Vtune明细 指标 × Vtune 矩阵（按温度分列），既能翻数也是图表的数据源
     Kvco明细  逐点斜率 ΔF/ΔV（区间中点 × 温度）
     CT明细    指标 × CT 码
-    图表      各指标 vs Vtune（每温一条线）、Kvco vs Vtune、vs CT、相噪 vs offset
-    锁定点    闭环/锁定那几行单列出来，跟开环曲线对照着看
+    图表      频率 vs Vtune / vs CT（每温一条线，另叠一条目标 fVCO 水平参考线）、
+              Kvco vs Vtune、ΔF/ΔCT vs CT、相噪 vs offset
+    非扫描行  闭环/锁定那几行单列出来，跟开环曲线对照着看
+
+为什么单独有一页「结论」
+    把每个指标的 Min/Max/Δ 都铺一遍，是数据搬运不是结论：十几个指标乘几个温度
+    乘三列，没人读得完，而真正要回答的问题一个都没答。这类测试的核心问题是
+    「单个电容码用调谐电压能盖多宽 ÷ 相邻码差多少」——这个比值 <1 就有锁不上的
+    频率，而它必须把两张扫描合起来才算得出来。所以结论页在前，大表降级到后面查数。
 
 为什么按「扫描组」而不是按温度汇总
     这类簿里自变量是 Vtune 和 CT，温度只是分组维度。同一个温度下会有两种扫描
@@ -669,6 +678,315 @@ def build_derived(groups, freq_item, ref_group):
     return rows
 
 
+# ---------------------------------------------------------------- 结论页
+
+def worst_dir(item):
+    """这个指标往哪个方向算"差"。None = 不谈好坏（频率、调谐电压之类）。
+
+    借 report-forge 的 limit le/ge 那个思路：一个结果只关心单边，
+    相噪只有上限、功率只有下限，两边都要人填反而没人填。
+    """
+    src = item.src.lower()
+    lab = item.label.lower()
+    if "power" in src:
+        return "min"                       # 输出功率越低越差
+    if "current" in src:
+        return "max"                       # 电流越大越差
+    if "ipn" in src or lab.startswith("spotpn@") or lab.startswith("spur@"):
+        return "max"                       # 相噪/杂散越接近 0 越差
+    return None
+
+
+def _at(ser, x0):
+    """在「横轴->值」视图里取离 x0 最近的那个点，返回 (值, 实际横轴值)。"""
+    if not ser or x0 is None:
+        return None, None
+    x = min(ser, key=lambda k: abs(k - x0))
+    return ser[x], x
+
+
+def build_conclusion(by_kind, items, freq_item, ref_temp, fvco):
+    """把两种扫描合起来，推出真能下判断的几行。
+
+    ★ 为什么必须合起来：这份测试的核心问题是「有没有锁不上的盲区」——
+    单个电容码用调谐电压全程能盖多宽（只有 Vtune 扫知道）除以相邻码差多少
+    （只有 CT 扫知道），比值 >1 才不留缝。两张扫描各算各的，这个数永远出不来。
+    """
+    vg = {}
+    cg = {}
+    for kind, groups in by_kind:
+        for g in groups:
+            if g.temp is None:
+                continue
+            d = vg if kind == "vtune" else (cg if kind == "ct" else None)
+            if d is not None:
+                d.setdefault(g.temp, g)
+    temps = sorted(set(vg) | set(cg))
+    if not temps:
+        return [], []
+
+    rows = []
+
+    def add(cat, item, unit, direction, fn, kind="result", note=""):
+        vals = {}
+        for t in temps:
+            try:
+                vals[t] = fn(t)
+            except Exception:
+                vals[t] = None
+        if any(v is not None for v in vals.values()):
+            rows.append({"cat": cat, "item": item, "unit": unit, "dir": direction,
+                         "kind": kind, "vals": vals, "note": note})
+
+    def fser(t, which):
+        g = (vg if which == "v" else cg).get(t)
+        return group_series(g, freq_item) if (g and freq_item) else {}
+
+    def v_ct(t):
+        """CT 扫是在哪个调谐电压下做的。"""
+        g = cg.get(t)
+        xs = [r.vt for r in g.rows if r.vt is not None] if g else []
+        return xs[0] if xs else None
+
+    def dfv(t):
+        """单码 Vtune 全程可调范围。"""
+        s = fser(t, "v")
+        return (max(s.values()) - min(s.values())) if len(s) >= 2 else None
+
+    def code_steps(t):
+        g = cg.get(t)
+        return [abs(s[1]) for s in slopes(g, freq_item)] if (g and freq_item) else []
+
+    # ---- 条件行 ----
+    add("Condition", "温度", "℃", "", lambda t: t, kind="cond")
+    add("Condition", "Vtune 扫范围", "V", "", lambda t: "%s~%s" % (
+        fmt_num(min(fser(t, "v"))), fmt_num(max(fser(t, "v")))) if fser(t, "v") else None,
+        kind="cond")
+    add("Condition", "CT 扫范围（点数）", "code", "", lambda t: "%s~%s (%d)" % (
+        fmt_num(min(fser(t, "c"))), fmt_num(max(fser(t, "c"))), len(fser(t, "c")))
+        if fser(t, "c") else None, kind="cond")
+    add("Condition", "CT 扫时的 Vtune", "V", "", lambda t: v_ct(t), kind="cond")
+    if fvco is not None:
+        add("Condition", "目标 fVCO", "MHz", "", lambda t: fvco, kind="cond")
+
+    # ---- 频率覆盖 ----
+    add("Coverage", "单码 Vtune 可调范围 ΔF", "MHz", "≥", dfv)
+    add("Coverage", "CT 全码可调范围 ΔF", "MHz", "≥",
+        lambda t: (max(fser(t, "c").values()) - min(fser(t, "c").values()))
+        if len(fser(t, "c")) >= 2 else None)
+
+    def cover(t, side):
+        """两个扫描拼出来的总覆盖（一阶估计）。
+
+        CT 扫是在某个固定 Vtune 上做的，所以从 CT 扫的两个端点出发，
+        再用 Vtune 相对那一点还能往上/往下拉多少，拼出总范围。
+        前提：Kvco 与 CT 码无关——一阶近似，页面上标了「估计」。
+        """
+        sv, sc = fser(t, "v"), fser(t, "c")
+        if len(sv) < 2 or len(sc) < 2:
+            return None
+        f0, _x = _at(sv, v_ct(t))
+        if f0 is None:
+            return None
+        if side == "low":
+            return min(sc.values()) - (f0 - min(sv.values()))
+        return max(sc.values()) + (max(sv.values()) - f0)
+
+    note_est = "一阶估计：CT 扫端点 + Vtune 相对该点还能拉的量，假设 Kvco 与 CT 码无关"
+    add("Coverage", "估计总覆盖 下限", "MHz", "≤", lambda t: cover(t, "low"), note=note_est)
+    add("Coverage", "估计总覆盖 上限", "MHz", "≥", lambda t: cover(t, "high"), note=note_est)
+    if fvco is not None:
+        add("Coverage", "目标余量 · 下", "MHz", "≥",
+            lambda t: (fvco - cover(t, "low")) if cover(t, "low") is not None else None,
+            note="目标 fVCO 离覆盖下限还有多远，必须为正且留得住温漂")
+        add("Coverage", "目标余量 · 上", "MHz", "≥",
+            lambda t: (cover(t, "high") - fvco) if cover(t, "high") is not None else None,
+            note="同上，覆盖上限一侧")
+
+    # ---- 频段搭接：有没有锁不上的盲区 ----
+    add("Band", "相邻码间隔 平均", "MHz/code", "",
+        lambda t: (sum(code_steps(t)) / len(code_steps(t))) if code_steps(t) else None)
+    add("Band", "相邻码间隔 最大", "MHz/code", "≤",
+        lambda t: max(code_steps(t)) if code_steps(t) else None,
+        note="最坏那一档，搭接比按它算")
+    add("Band", "★ Band overlap 比", "-", "≥",
+        lambda t: (dfv(t) / max(code_steps(t)))
+        if (dfv(t) and code_steps(t) and max(code_steps(t)) > 1e-12) else None,
+        note="单码 Vtune 可调范围 ÷ 最大码间隔。<1 = 两个码之间有锁不上的频率；"
+             "工程上留温漂和散差余量一般要 ≥1.5")
+
+    # ---- 温漂 ----
+    ref_t = min(temps, key=lambda t: abs(t - ref_temp)) if temps else None
+    if ref_t is not None and len(temps) > 1:
+        def drift(t):
+            a, b = fser(t, "v"), fser(ref_t, "v")
+            sh = [a[x] - b[x] for x in a if x in b]
+            return max(sh, key=abs) if sh else None
+        add("Drift", "同 Vtune 最大频漂 vs %s℃" % fmt_num(ref_t), "MHz", "≤", drift,
+            note="带符号，取绝对值最大的那个点")
+        add("Drift", "折合 CT 码数", "code", "≤",
+            lambda t: (abs(drift(t)) / (sum(code_steps(ref_t)) / len(code_steps(ref_t))))
+            if (drift(t) is not None and code_steps(ref_t)) else None,
+            note="温漂要靠几个码补回来；这些码是从 256 个里扣掉的，决定 CT 位宽够不够")
+
+    # ---- 压控增益 ----
+    add("Kvco", "Kvco @工作点", "MHz/V", "",
+        lambda t: next((abs(s[1]) for s in sorted(
+            slopes(vg[t], freq_item), key=lambda s: abs(s[0] - (v_ct(t) or 0.4)))), None)
+        if (t in vg and freq_item) else None,
+        note="取离 CT 扫所用 Vtune 最近的那个区间——环路就锁在这附近，"
+             "这个值才是环路带宽用的")
+    add("Kvco", "Kvco 最小（逐点）", "MHz/V", "",
+        lambda t: min((abs(s[1]) for s in slopes(vg[t], freq_item)), default=None)
+        if (t in vg and freq_item) else None)
+    add("Kvco", "Kvco 最大（逐点）", "MHz/V", "",
+        lambda t: max((abs(s[1]) for s in slopes(vg[t], freq_item)), default=None)
+        if (t in vg and freq_item) else None)
+    add("Kvco", "Kvco 最大/最小", "-", "≤",
+        lambda t: (max(abs(s[1]) for s in slopes(vg[t], freq_item))
+                   / min(abs(s[1]) for s in slopes(vg[t], freq_item)))
+        if (t in vg and freq_item and slopes(vg[t], freq_item)
+            and min(abs(s[1]) for s in slopes(vg[t], freq_item)) > 1e-12) else None,
+        note="环路带宽会跟着 Kvco 同比例变；这个倍数就是带宽的漂移倍数")
+
+    # ---- 单调性：非单调 = 电容阵列/压控有毛病，是真 bug 信号 ----
+    add("Monotonic", "F vs Vtune", "-", "",
+        lambda t: monotonic(vg[t], freq_item) if (t in vg and freq_item) else None)
+    add("Monotonic", "F vs CT", "-", "",
+        lambda t: monotonic(cg[t], freq_item) if (t in cg and freq_item) else None,
+        note="出现「否」= 码序里有翻转，电容阵列该查")
+
+    # ---- 各指标最差点（每个指标一行，不再铺 Min/Max/Δ 三列） ----
+    for it in items:
+        d = worst_dir(it)
+        if d is None:
+            continue
+
+        def pick(t, it=it, d=d):
+            vals = []
+            for gd in (vg, cg):
+                g = gd.get(t)
+                if g:
+                    vals += list(group_series(g, it).values())
+            if not vals:
+                return None
+            return max(vals) if d == "max" else min(vals)
+
+        where = []
+        for t in temps:
+            for gd in (vg, cg):
+                g = gd.get(t)
+                if not g:
+                    continue
+                for x, v in group_series(g, it).items():
+                    where.append((v, "%s@%s=%s" % (g.title.split()[0], g.x_unit, fmt_num(x))))
+        note = ""
+        if where:
+            w = max(where, key=lambda p: p[0]) if d == "max" else min(where, key=lambda p: p[0])
+            note = "全温最差 %s 出在 %s" % (fmt_num(w[0]), w[1])
+        add("Worst", "%s 最差" % it.label, it.unit, "≤" if d == "max" else "≥",
+            pick, note=note)
+    return rows, temps
+
+
+def _conclusion_table(ws, r0, temps, rows, st, title):
+    """结论表：列 = 各温度；每行一个能下判断的结论。"""
+    from openpyxl.utils import get_column_letter as L
+
+    n_fix = 6                              # Category|Item|Unit|关注|Spec Min|Spec Max
+    c_note = n_fix + len(temps) + 1
+    c_judge = c_note + 1
+    widths = [12, 30, 10, 6, 10, 10] + [13] * len(temps) + [46, 10]
+    for i, w in enumerate(widths):
+        ws.column_dimensions[L(i + 1)].width = w
+
+    put(ws, r0, 1, title, st, st["f_group"], bold=True, align="left")
+    ws.merge_cells(start_row=r0, start_column=1, end_row=r0, end_column=c_judge)
+    h = r0 + 1
+    for c in range(1, c_judge + 1):
+        put(ws, h, c, None, st, st["f_head"])
+        put(ws, h + 1, c, None, st, st["f_head"])
+    for c, lab in ((1, "Category"), (2, "Item"), (3, "Unit"), (4, "关注"),
+                   (c_note, "说明 / 最差点"), (c_judge, "判定")):
+        ws.merge_cells(start_row=h, start_column=c, end_row=h + 1, end_column=c)
+        put(ws, h, c, lab, st, st["f_head"], bold=True, size=9)
+    ws.merge_cells(start_row=h, start_column=5, end_row=h, end_column=6)
+    put(ws, h, 5, "Spec（自己填）", st, st["f_head"], bold=True, size=9)
+    put(ws, h + 1, 5, "Min", st, st["f_head"], bold=True, size=9)
+    put(ws, h + 1, 6, "Max", st, st["f_head"], bold=True, size=9)
+    ws.merge_cells(start_row=h, start_column=n_fix + 1, end_row=h,
+                   end_column=n_fix + len(temps))
+    put(ws, h, n_fix + 1, "温度", st, st["f_head"], bold=True, size=9)
+    for j, t in enumerate(temps):
+        put(ws, h + 1, n_fix + 1 + j, "%s℃" % fmt_num(t), st, st["f_head"], bold=True, size=9)
+
+    d0 = h + 2
+    for n, row in enumerate(rows):
+        r = d0 + n
+        fill = st["f_group"] if row["kind"] == "cond" else st["f_res"]
+        for c in range(1, c_judge + 1):
+            put(ws, r, c, None, st, fill)
+        put(ws, r, 2, row["item"], st, fill, align="left",
+            bold=row["item"].startswith("★"))
+        put(ws, r, 3, row["unit"], st, fill)
+        put(ws, r, 4, row["dir"], st, fill, bold=True)
+        numeric = True
+        for j, t in enumerate(temps):
+            v = row["vals"].get(t)
+            if isinstance(v, str):
+                numeric = False
+            put(ws, r, n_fix + 1 + j, v if isinstance(v, str) else fmt_num(v), st, fill)
+        put(ws, r, c_note, row["note"], st, fill, align="left", size=8)
+        if numeric and row["kind"] == "result":
+            rng = "%s%d:%s%d" % (L(n_fix + 1), r, L(n_fix + len(temps)), r)
+            put(ws, r, c_judge,
+                '=IF(COUNT(%s)=0,"",IF(AND($E%d="",$F%d=""),"",'
+                'IF(AND(OR($E%d="",MIN(%s)>=$E%d),OR($F%d="",MAX(%s)<=$F%d)),"PASS","FAIL")))'
+                % (rng, r, r, r, rng, r, r, rng, r), st, fill, bold=True)
+
+    i = 0                                   # Category 纵向合并
+    while i < len(rows):
+        j = i
+        while j + 1 < len(rows) and rows[j + 1]["cat"] == rows[i]["cat"]:
+            j += 1
+        if j > i:
+            ws.merge_cells(start_row=d0 + i, start_column=1, end_row=d0 + j, end_column=1)
+        put(ws, d0 + i, 1, rows[i]["cat"], st,
+            st["f_group"] if rows[i]["kind"] == "cond" else st["f_res"], bold=True)
+        i = j + 1
+    _pass_fail_cf(ws, L(c_judge), d0, d0 + len(rows) - 1, st)
+    ws.freeze_panes = "%s%d" % (L(n_fix + 1), d0)
+    return d0 + len(rows)
+
+
+def write_conclusion(wb, rows, temps, st, meta):
+    ws = wb.create_sheet("结论")
+    r = _conclusion_table(ws, 1, temps, rows, st, "结论（能下判断的都在这一页；逐点数据翻后面的明细页）")
+    r += 2
+    put(ws, r, 1, "这页在回答什么", st, st["f_group"], bold=True, align="left")
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
+    for line in [
+        "① 有没有锁不上的盲区 —— 看「★ Band overlap 比」。单个 CT 码用 Vtune 全程能盖的频率范围，"
+        "除以相邻码之间的最大间隔。<1 就是两个码中间有一段频率谁也够不着；"
+        "要留温漂和器件散差的余量，一般要 ≥1.5。",
+        "② 目标频率覆盖得住吗 —— 看「目标余量 · 下/上」，两个都得是正的，而且要大于「同 Vtune 最大频漂」，"
+        "否则换个温度就掉出去了。总覆盖是两张扫描拼出来的一阶估计（假设 Kvco 与 CT 码无关），"
+        "要精确值得做二维扫描。",
+        "③ 温漂吃掉多少余量 —— 看「折合 CT 码数」。温漂得靠挪 CT 码补回来，"
+        "这些码是从总码数里扣掉的，决定 CT 位宽够不够。",
+        "④ 环路能不能稳 —— 看「Kvco @工作点」和「Kvco 最大/最小」。环路带宽跟 Kvco 成正比，"
+        "后者就是带宽的漂移倍数。",
+        "⑤ 器件有没有毛病 —— 「F vs CT」出现「否」= 码序里有频率翻转，电容阵列该查。",
+        "⑥ 性能最差点 —— Worst 那几行给的是该温度下所有扫描点里最差的那个值，"
+        "「说明」列写明全温最差出在哪个温度的哪个横轴点，能在明细页原样查到。",
+        "Spec 两列自己填，「关注」列提示该填哪边（≥ 填 Min、≤ 填 Max）；填完判定自动出、超规标红。",
+    ]:
+        r += 1
+        put(ws, r, 1, line, st, None, align="left")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=8)
+    return ws
+
+
 def write_summary(wb, by_kind, items, meta, st):
     """每种扫法一张汇总页。
 
@@ -739,8 +1057,12 @@ def write_summary(wb, by_kind, items, meta, st):
 
 # ---------------------------------------------------------------- 明细页
 
-def write_detail(wb, name, groups, items, st):
-    """每个指标一块：行=横轴取值（各组并集，升序），列=组。图表就吃这个。"""
+def write_detail(wb, name, groups, items, st, target=None, target_item=None):
+    """每个指标一块：行=横轴取值（各组并集，升序），列=组。图表就吃这个。
+
+    target 给了的话，在频率那一块多加一列常数（目标 fVCO），图上就成了一条
+    水平参考线——目标频率有没有落在覆盖范围里，扫一眼就知道，不用去查数。
+    """
     from openpyxl.utils import get_column_letter as L
     ws = wb.create_sheet(name)
     ws.column_dimensions["A"].width = 12
@@ -750,12 +1072,16 @@ def write_detail(wb, name, groups, items, st):
     xs = sorted({g.x_of(r) for g in groups for r in g.rows if g.x_of(r) is not None})
     blocks, r = [], 1
     for it in items:
+        want_target = target is not None and it is target_item
+        n_col = len(groups) + (1 if want_target else 0)
         put(ws, r, 1, "%s  [%s]" % (it.label, it.unit), st, st["f_group"], bold=True, align="left")
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1 + len(groups))
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1 + n_col)
         r += 1
         put(ws, r, 1, groups[0].x_label, st, st["f_head"], bold=True)
         for i, g in enumerate(groups):
             put(ws, r, 2 + i, g.title, st, st["f_head"], bold=True, size=9)
+        if want_target:
+            put(ws, r, 2 + len(groups), "目标 fVCO", st, st["f_head"], bold=True, size=9)
         head, r = r, r + 1
         first = r
         series = [group_series(g, it) for g in groups]
@@ -763,8 +1089,10 @@ def write_detail(wb, name, groups, items, st):
             put(ws, r, 1, fmt_num(x), st, st["f_res"])
             for i in range(len(groups)):
                 put(ws, r, 2 + i, fmt_num(series[i].get(x)), st, st["f_res"])
+            if want_target:
+                put(ws, r, 2 + len(groups), target, st, st["f_res"])
             r += 1
-        blocks.append((it, head, first, r - 1))
+        blocks.append((it, head, first, r - 1, n_col))
         r += 1
     ws.freeze_panes = "B1"
     return ws, blocks
@@ -805,23 +1133,38 @@ def _scatter(title, xtitle, ytitle, logx=False):
     ch.style = 13
     ch.x_axis.title = xtitle
     ch.y_axis.title = ytitle
-    ch.x_axis.delete = False
+    ch.x_axis.delete = False          # openpyxl 老毛病：不显式置 False 坐标轴不显示
     ch.y_axis.delete = False
     ch.height, ch.width = 7.5, 13
     ch.dispBlanksAs = "gap"
+    # 图例默认在右边，13cm 宽的图会被中文图例挤掉四分之一绘图区
+    if ch.legend is not None:
+        ch.legend.position = "b"
+        ch.legend.overlay = False
     if logx:
         ch.x_axis.scaling.logBase = 10
     return ch
 
 
 def _add_series(ch, ws, n_series, head, first, last):
+    """挂数据系列。
+
+    两处必须显式设，否则图会骗人：
+    · smooth：OOXML 散点图默认走平滑曲线，压控曲线会被画出假拐点（读者
+      会以为 Kvco 在中间有突变）；点多的时候更是扭成波浪。一律关掉。
+    · marker：点数多了（CT 全码扫 256 点）满屏圆点糊成一坨，看不出斜率，
+      超过阈值就只留线。
+    """
     from openpyxl.chart import Reference, Series
     from openpyxl.chart.marker import Marker
+    n_pts = last - first + 1
     xref = Reference(ws, min_col=1, min_row=first, max_row=last)
     for i in range(n_series):
         yref = Reference(ws, min_col=2 + i, min_row=head, max_row=last)
         s = Series(yref, xref, title_from_data=True)
-        s.marker = Marker(symbol="circle", size=5)
+        s.smooth = False
+        s.marker = Marker(symbol="circle" if n_pts <= 60 else "none",
+                          size=5 if n_pts <= 30 else 3)
         ch.series.append(s)
 
 
@@ -854,11 +1197,11 @@ def write_charts(wb, panels, st, all_charts=False):
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
     grid = ChartGrid(ws)
     for ws_src, blocks, groups, xlabel in panels:
-        for it, head, first, last in blocks:
+        for it, head, first, last, n_col in blocks:
             if not all_charts and MINOR_CHART.match(it.label):
                 continue
             ch = _scatter("%s vs %s" % (it.label, xlabel), xlabel, it.unit)
-            _add_series(ch, ws_src, len(groups), head, first, last)
+            _add_series(ch, ws_src, n_col, head, first, last)
             grid.add(ch)
     return ws, grid
 
@@ -918,6 +1261,7 @@ def write_pn_chart(wb, grid, groups, pn_items, st):
     for j in range(len(picks)):
         yref = Reference(ws, min_col=2 + j, min_row=2, max_row=2 + len(pn_items))
         s = Series(yref, xref, title_from_data=True)
+        s.smooth = False
         s.marker = Marker(symbol="circle", size=5)
         ch.series.append(s)
     grid.add(ch)
@@ -1017,6 +1361,8 @@ def main():
                     help="只保留 Test Item 等于该值的行（默认取出现最多的那个值）")
     ap.add_argument("--ref-temp", type=float, default=25.0,
                     help="温漂参考温度（默认 25）")
+    ap.add_argument("--fvco", type=float, default=None,
+                    help="目标 VCO 频率 MHz（默认从 fVCO_MHz 列读）。用来算覆盖余量")
     ap.add_argument("--x-round", type=int, default=6,
                     help="横轴取值四舍五入到几位小数（默认 6）。扫描点常是累加出来的，"
                          "表里会是 0.39999999999999997 这种，不量化就跟别的段对不上点")
@@ -1198,6 +1544,19 @@ def main():
         if withtemp:
             ref_by_kind[kind] = min(withtemp, key=lambda g: abs(g.temp - args.ref_temp))
 
+    # 目标 VCO 频率：算覆盖余量要用。表里就有这一列，不写死在脚本里。
+    fvco = args.fvco
+    if fvco is None:
+        _n, fc = cols.find(r"^fvco")
+        if fc is not None:
+            for r in rows:
+                v = num(r.raw[fc]) if fc < len(r.raw) else None
+                if v:
+                    fvco = v
+                    break
+    concl_rows, concl_temps = build_conclusion(by_kind, items, freq_item,
+                                               args.ref_temp, fvco)
+
     excluded.sort(key=lambda x: x[0])
     meta = {
         "excluded": excluded, "warnings": warnings, "freq_item": freq_item,
@@ -1216,6 +1575,8 @@ def main():
           % (n_filled, args.header_row, sum(1 for h in header if txt(h)),
              ws.max_row, ws.max_column))
     print("温度列 : %s" % (tname or "(没有)"))
+    print("目标fVCO: %s MHz%s" % (fmt_num(fvco) if fvco else "(没读到，覆盖余量出不来)",
+                                 "" if args.fvco is None else "  (命令行指定)"))
     print("Vtune  : %s   %s" % (vt_name, vt_why))
     if ct_name:
         addr = ("  地址=%s" % ct_addr) if (ct_addr and args.show_addr) else \
@@ -1250,6 +1611,8 @@ def main():
 
     # ---- 写出 ----
     st = _styles()
+    if concl_rows:
+        write_conclusion(wb, concl_rows, concl_temps, st, meta)
     write_summary(wb, by_kind, items, meta, st)
 
     panels, slope_jobs = [], []
@@ -1257,7 +1620,8 @@ def main():
         if kind == "point":
             continue
         nm = "Vtune明细" if kind == "vtune" else "CT明细"
-        ws_d, blocks = write_detail(wb, nm, gs, items_with_data(gs, items), st)
+        ws_d, blocks = write_detail(wb, nm, gs, items_with_data(gs, items), st,
+                                    target=fvco, target_item=freq_item)
         panels.append((ws_d, blocks, gs, gs[0].x_label))
         if freq_item is not None and any(len(group_series(g, freq_item)) >= 2 for g in gs):
             sn = "Kvco明细" if kind == "vtune" else "CT斜率明细"
