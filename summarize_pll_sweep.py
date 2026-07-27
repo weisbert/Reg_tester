@@ -506,7 +506,7 @@ def write_detail(wb, legs, items, st):
 
 # ---------------------------------------------------------------- 温巡过程
 
-def write_journey(wb, legs, items, st):
+def write_journey(wb, legs, items, st, yranges):
     """按实际测试顺序把整趟温巡摊平成一张表，作为过程图的数据源。
 
     汇总页和温度明细都是「按温度」看的，那一维把先后顺序压没了。
@@ -600,20 +600,26 @@ def write_journey(wb, legs, items, st):
     ws.freeze_panes = "A3"
 
     charts = []
+    lblskip = max(1, len(seq) // 18)          # 横轴最多摆 ~18 个刻度标签，多了糊成一片
     if vt:
+        b = yranges.get(vt.label) or axis_bounds([r.vals.get(vt.col) for _l, r in seq])
         charts.append({"title": f"{vt.label} 温巡过程（含重锁点）",
-                       "ytitle": f"{vt.label} ({vt.unit})", "col": cols["vt"]})
+                       "ytitle": f"{vt.label} ({vt.unit})", "col": cols["vt"],
+                       "bounds": b, "lblskip": lblskip})
     if fq and dfs:
-        # ★纵轴要钉死。记录精度只有 0.001 MHz，Δf 只能取 0/±1 kHz 这几档，
-        # 让 Excel 自动缩放就会把这点量化噪声铺满整个画面、看着像频率在剧烈跳变，
-        # 评审第一句话就是"频率为什么在跳"。给个 ±5 kHz 的固定窗，它才如实
-        # 显示成一条贴零的平线 = 频率没变。
-        lim = max(5.0, round(max(dfs) * 3 + 0.5))
+        # ★这一张的纵轴故意不贴着数据算。记录精度只有 0.001 MHz，Δf 只能取
+        # 0/±1 kHz 这几档；贴着数据画就把这点量化噪声放大成满屏方波，
+        # 评审第一句话必然是"频率为什么在跳"。给一个比噪声宽得多的窗，
+        # 它才如实显示成一条贴零的平线＝频率没变。窗宽仍由数据算。
+        lim = max(3.0 * max(dfs), 5.0)
+        _s = nice_step(2 * lim)
+        lim = -(-lim // _s) * _s                  # 向上取到整刻度，别出现 ±7.269 这种轴
+        b = yranges.get("Δf") or (-lim, lim, _s)
         charts.append({"title": f"输出频率漂移 温巡过程（相对首点；"
                                 f"全程 |Δf| ≤ {max(dfs)} kHz，记录精度 1 kHz）",
                        "ytitle": "Δf (kHz)", "col": cols["fq"],
-                       "ymin": -lim, "ymax": lim})
-    jinfo = {"first": r0, "last": r0 + len(seq) - 1, "c_idx": 1, "c_temp": 4,
+                       "bounds": b, "lblskip": lblskip})
+    jinfo = {"first": r0, "last": r0 + len(seq) - 1, "c_temp": 4,
              "charts": charts} if charts else None
     return ws, jinfo
 
@@ -647,15 +653,16 @@ def _style(series, color, symbol, line=True, dash=None, size=6):
 
 
 def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
-                 ws_j, jinfo, chart_items, st):
+                 ws_j, jinfo, chart_items, yranges, st):
     from openpyxl.chart import Reference, ScatterChart, Series
     from openpyxl.chart.marker import Marker
 
     ws = wb.create_sheet("图表")
     for i, line in enumerate([
-        "图 1-2 = 温巡过程（横轴 = 测点序号，按实际测试顺序）：看整趟温巡里量怎么走、"
-        "每次重锁把它拉回到哪。红三角 = 重锁点。",
-        "图 3 起 = 指标 vs 温度（横轴 = 温度，每段一条线）：同一个温度上几条线分叉 = 回滞。",
+        "上面两张 = 温巡过程：横轴按实际测试先后排，刻度标的是当时的温度。"
+        "看整趟温巡里量怎么走、每次重锁把它拉回到哪。红三角 = 重锁点。",
+        "下面几张 = 指标 vs 温度（横轴 = 温度，每段一条线）：同一个温度上几条线分叉 = 回滞。"
+        "相噪 vs offset 那张在「相噪-offset」页，图和数据放一起。",
     ]):
         put(ws, 1 + i, 1, line, st, st["f_group"] if i == 0 else None, bold=(i == 0),
             align="left")
@@ -672,96 +679,146 @@ def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
         ch.title = f"{it.label} vs 温度"
         ch.style = 13
         ch.x_axis.title = "温度 (℃)"
-        ch.y_axis.title = f"{it.label} ({it.unit})"
+        ch.y_axis.title = it.unit                 # 量名已在标题里，轴上只留单位，省地方
         ch.x_axis.delete = False
         ch.y_axis.delete = False
-        ch.height, ch.width = 8.5, 14
+        ch.height, ch.width = 9, 15
         ch.dispBlanksAs = "gap"
         xref = Reference(ws_detail, min_col=1, min_row=first, max_row=last)
+        vals = []
         for i, _lg in enumerate(legs):
             yref = Reference(ws_detail, min_col=2 + i, min_row=head, max_row=last)
             s = Series(yref, xref, title_from_data=True)
             color, sym = LEG_STYLE[i % len(LEG_STYLE)]
             _style(s, color, sym)
             ch.series.append(s)
-        ws.add_chart(ch, f"{'A' if n % 2 == 0 else 'J'}{row + (n // 2) * 18}")
-    row += ((len(wanted) + 1) // 2) * 18
+            vals += [ws_detail.cell(row=r, column=2 + i).value
+                     for r in range(first, last + 1)]
+        _apply_y(ch, yranges.get(it.label)
+                 or axis_bounds([v for v in vals if isinstance(v, (int, float))]))
+        _legend_bottom(ch)
+        ws.add_chart(ch, f"{'A' if n % 2 == 0 else 'K'}{row + (n // 2) * 19}")
+    row += ((len(wanted) + 1) // 2) * 19
 
     if pn_items:
-        _pn_offset_chart(wb, ws, legs, pn_items, st, row)
+        _pn_offset_chart(wb, legs, pn_items, st, yranges)
     return ws
 
 
-def _journey_charts(ws, ws_j, jinfo, st, row):
-    """温巡过程图：横轴=测点序号，主轴=量，次轴=温度，重锁点单独一条只有记号的线。
+def nice_step(span):
+    """给定跨度挑一个好看的刻度步长（1/2/2.5/5 × 10^n）。"""
+    import math
+    if span <= 0:
+        return 1.0
+    raw = span / 5.0
+    e = 10.0 ** math.floor(math.log10(raw))
+    for f in (1, 2, 2.5, 5, 10):
+        if raw <= f * e:
+            return f * e
+    return 10 * e
 
-    为什么不用"vs 温度"那种图：温巡是有先后的，同一个温度会经过好几次；
+
+def axis_bounds(vals, pad=0.10):
+    """按数据自己算 (min, max, 步长)，两头留一点余量再对齐到整刻度。
+
+    ★ 不要指望 Excel 自动缩放。它常把值轴从 0 起画，量本身只在 0.69~0.73
+    晃的话就被压成一条平线，什么都看不出来。范围必须由数据算出来钉死。
+    """
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        d = abs(hi) * 0.05 or 1.0
+        lo, hi = lo - d, hi + d
+    m = (hi - lo) * pad
+    lo, hi = lo - m, hi + m
+    step = nice_step(hi - lo)
+    import math
+    return math.floor(lo / step) * step, math.ceil(hi / step) * step, step
+
+
+def _apply_y(chart, bounds):
+    if not bounds:
+        return
+    chart.y_axis.scaling.min, chart.y_axis.scaling.max = bounds[0], bounds[1]
+    chart.y_axis.majorUnit = bounds[2]
+
+
+def _legend_bottom(chart):
+    if chart.legend is not None:
+        chart.legend.position = "b"
+        chart.legend.overlay = False
+
+
+def _journey_charts(ws, ws_j, jinfo, st, row):
+    """温巡过程图：横轴=温度（按测试顺序从左到右排），重锁点单独一条只有记号的线。
+
+    为什么不按"vs 温度"画：温巡是有先后的，同一个温度会经过好几次；
     按温度画就把"先后"这一维压没了，看不出"锁完一次之后一路漂到哪、
     下一次重锁又拉回多少"。
+    横轴直接用温度当刻度标签＝既保留先后顺序，又能一眼看出走到哪个温度了；
+    温度本身不再单独画一条曲线（那条线不带信息，还要占一根次坐标轴、
+    把图例和轴标题挤到重叠）。
     """
     from openpyxl.chart import LineChart, Reference
     from openpyxl.chart.axis import ChartLines
 
     first, last = jinfo["first"], jinfo["last"]
     for spec in jinfo["charts"]:
-        c1 = LineChart()
-        c1.title = spec["title"]
-        c1.style = 13
-        c1.height, c1.width = 10.5, 28
-        c1.dispBlanksAs = "gap"
-        c1.y_axis.title = spec["ytitle"]
-        c1.x_axis.title = "测点序号（按实际测试顺序）"
-        c1.x_axis.delete = False
-        c1.y_axis.delete = False
-        c1.y_axis.majorGridlines = ChartLines()
-        cats = Reference(ws_j, min_col=jinfo["c_idx"], min_row=first, max_row=last)
-
-        c1.add_data(Reference(ws_j, min_col=spec["col"], min_row=first - 1, max_row=last),
-                    titles_from_data=True)
-        c1.add_data(Reference(ws_j, min_col=spec["col"] + 1, min_row=first - 1, max_row=last),
-                    titles_from_data=True)
-        c1.set_categories(cats)
-        _style(c1.series[0], "1F77B4", "circle", size=5)
-        _style(c1.series[1], "D62728", "triangle", line=False, size=11)
-
-        c2 = LineChart()
-        c2.add_data(Reference(ws_j, min_col=jinfo["c_temp"], min_row=first - 1, max_row=last),
-                    titles_from_data=True)
-        c2.set_categories(cats)
-        _style(c2.series[0], "808080", None, dash="dash")
-        c2.y_axis.axId = 200
-        c2.y_axis.title = "温度 (℃)"
-        c2.y_axis.delete = False
-        c1.y_axis.crosses = "max"
-        c1 += c2
-
-        if spec.get("ymin") is not None:
-            c1.y_axis.scaling.min = spec["ymin"]
-            c1.y_axis.scaling.max = spec["ymax"]
-        c1.x_axis.tickLblSkip = 4
-        c1.x_axis.tickMarkSkip = 4
-        ws.add_chart(c1, f"A{row}")
-        row += 22
+        c = LineChart()
+        c.title = spec["title"]
+        c.style = 13
+        c.height, c.width = 9.5, 30
+        c.dispBlanksAs = "gap"
+        c.y_axis.title = spec["ytitle"]
+        c.x_axis.title = "温度 (℃)　—　从左到右＝实际测试先后"
+        c.x_axis.delete = False
+        c.y_axis.delete = False
+        c.y_axis.majorGridlines = ChartLines()
+        c.add_data(Reference(ws_j, min_col=spec["col"], min_row=first - 1, max_row=last),
+                   titles_from_data=True)
+        c.add_data(Reference(ws_j, min_col=spec["col"] + 1, min_row=first - 1, max_row=last),
+                   titles_from_data=True)
+        c.set_categories(Reference(ws_j, min_col=jinfo["c_temp"],
+                                   min_row=first, max_row=last))
+        _style(c.series[0], "1F77B4", "circle", size=5)
+        _style(c.series[1], "D62728", "triangle", line=False, size=11)
+        _apply_y(c, spec.get("bounds"))
+        _legend_bottom(c)
+        c.x_axis.tickLblSkip = spec.get("lblskip", 3)
+        c.x_axis.tickMarkSkip = spec.get("lblskip", 3)
+        ws.add_chart(c, f"A{row}")
+        row += 21
     return row
 
 
-def _pn_offset_chart(wb, ws_chart, legs, pn_items, st, anchor_row):
-    """相噪-vs-offset：数据另开一小块（行=offset，列=选中的温度），再挂散点图。"""
+def _pn_offset_chart(wb, legs, pn_items, st, yranges):
+    """相噪-vs-offset：数据和图放在同一页，别让人看见一张孤零零的表不知道干嘛的。
+
+    取哪几条温度：最低 / 最接近常温 25℃ / 最高。之前取"排序后的中位数"，
+    结果常温那条挑到了 35℃——中位数是统计意义上的中间，不是工程上的常温。
+    """
     from openpyxl.chart import Reference, ScatterChart, Series
-    from openpyxl.chart.marker import Marker
 
     lg = max(legs, key=lambda x: len(x.rows))            # 取点最多的那一段
     temps = sorted({r.temp for r in lg.rows if r.temp is not None})
     if not temps:
         return
-    pick = sorted({temps[0], temps[len(temps) // 2], temps[-1]})
+    room = min(temps, key=lambda t: abs(t - 25))
+    pick = sorted({temps[0], room, temps[-1]})
 
-    ws = wb.create_sheet("PN曲线数据")
-    put(ws, 1, 1, f"相噪 vs offset（取 {lg.title}，各温度一条线）",
+    ws = wb.create_sheet("相噪-offset")
+    put(ws, 1, 1, f"相噪 vs offset —— 取「{lg.title} {lg.stage}」这一段，"
+                  f"最低 / 最接近常温 / 最高 三个温度各一条线。右边就是图。",
         st, st["f_group"], bold=True, align="left")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4)
+    ws.column_dimensions["A"].width = 13
     put(ws, 2, 1, "offset_MHz", st, st["f_head"], bold=True)
     for j, t in enumerate(pick):
         put(ws, 2, 2 + j, f"{fmt_num(t)}℃", st, st["f_head"], bold=True)
+        ws.column_dimensions[ws.cell(row=2, column=2 + j).column_letter].width = 12
+    vals = []
     for i, it in enumerate(pn_items):
         m = re.search(r"@([\d.]+)(k|M)Hz", it.label)
         off = float(m.group(1)) / (1000.0 if m and m.group(2) == "k" else 1.0) if m else None
@@ -772,24 +829,29 @@ def _pn_offset_chart(wb, ws_chart, legs, pn_items, st, anchor_row):
                 if row.temp == t and row.vals.get(it.col) is not None:
                     v = row.vals[it.col]
             put(ws, 3 + i, 2 + j, fmt_num(v), st, st["f_res"])
+            if v is not None:
+                vals.append(v)
 
     ch = ScatterChart()
     ch.title = "相噪 vs offset"
     ch.style = 13
-    ch.x_axis.title = "offset (MHz)"
+    ch.x_axis.title = "offset (MHz，对数)"
     ch.y_axis.title = "dBc/Hz"
     ch.x_axis.delete = False
     ch.y_axis.delete = False
     ch.x_axis.scaling.logBase = 10
-    ch.height, ch.width = 8, 14
+    ch.height, ch.width = 10, 17
     ch.dispBlanksAs = "gap"
     xref = Reference(ws, min_col=1, min_row=3, max_row=2 + len(pn_items))
     for j in range(len(pick)):
         yref = Reference(ws, min_col=2 + j, min_row=2, max_row=2 + len(pn_items))
         s = Series(yref, xref, title_from_data=True)
-        s.marker = Marker(symbol="circle", size=5)
+        color, sym = LEG_STYLE[j % len(LEG_STYLE)]
+        _style(s, color, sym)
         ch.series.append(s)
-    ws_chart.add_chart(ch, f"A{anchor_row}")
+    _apply_y(ch, yranges.get("PN") or axis_bounds(vals))
+    _legend_bottom(ch)
+    ws.add_chart(ch, "F2")
 
 
 # ---------------------------------------------------------------- 重锁对比
@@ -877,6 +939,10 @@ def main():
                     help="哪些指标画 值-vs-温度 图（逗号分隔；all=全画，空=一张都不画）。"
                          "温巡过程图和相噪-offset 图不受这个控制，始终画。"
                          f"默认 {','.join(DEFAULT_CHART_ITEMS)}")
+    ap.add_argument("--y-range", default="",
+                    help="手工钉死某张图的纵轴，如 \"Vtune_V=0.1:0.8,IPN_SSB=-60:-40\"；"
+                         "键还可用 Δf（频率漂移图）/ PN（相噪-offset 图）。"
+                         "不给就按数据自动算范围")
     ap.add_argument("--dry-run", action="store_true", help="只打印识别结果，不写文件")
     args = ap.parse_args()
 
@@ -1024,9 +1090,22 @@ def main():
         return
 
     # ---- 写出 ----
+    # --y-range "Vtune_V=0.1:0.8,IPN_SSB=-60:-40"；键还可以是 Δf / PN
+    yranges = {}
+    for part in args.y_range.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            k, rng = part.split("=", 1)
+            lo, hi = (float(x) for x in rng.split(":"))
+            yranges[k.strip()] = (lo, hi, nice_step(hi - lo))
+        except ValueError:
+            sys.exit(f"--y-range 格式应为 指标名=下限:上限，逗号分隔；解析不了: {part!r}")
+
     st = _styles()
     write_summary(wb, legs, items, meta, st)
-    ws_j, jinfo = write_journey(wb, legs, items, st)
+    ws_j, jinfo = write_journey(wb, legs, items, st, yranges)
     ws_detail, blocks, _temps = write_detail(wb, legs, items, st)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     if args.chart_items.strip().lower() == "all":
@@ -1036,14 +1115,14 @@ def main():
     else:
         chart_items = []
     write_charts(wb, ws_detail, blocks, legs, items, pn_items,
-                 ws_j, jinfo, chart_items, st)
+                 ws_j, jinfo, chart_items, yranges, st)
     write_relock(wb, legs, items, st)
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
     wb.save(out)
     print(f"\n已写出: {os.path.abspath(out)}")
-    print(f"  第 1 页「{ws.title}」= 原始数据原样保留；"
-          f"新增 汇总 / 温度明细 / 图表 / PN曲线数据 / 重锁对比")
+    print(f"  第 1 页「{ws.title}」= 原始数据原样保留；新增 "
+          + " / ".join(n for n in wb.sheetnames if n != ws.title))
     print("  汇总页的 Spec Min/Max 两列留空，填进去 PASS/FAIL 自动出、超规自动标红。")
 
 
