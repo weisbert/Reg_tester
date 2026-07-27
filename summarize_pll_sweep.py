@@ -504,39 +504,245 @@ def write_detail(wb, legs, items, st):
     return ws, blocks, temps
 
 
+# ---------------------------------------------------------------- 温巡过程
+
+def write_journey(wb, legs, items, st):
+    """按实际测试顺序把整趟温巡摊平成一张表，作为过程图的数据源。
+
+    汇总页和温度明细都是「按温度」看的，那一维把先后顺序压没了。
+    可这类测试要回答的恰恰是有先后的问题：锁完一次之后一路漂到哪、
+    下一次重锁又拉回多少、频率在整趟里有没有变。所以单开这一页。
+    """
+    def pick(*names):
+        for n in names:
+            for it in items:
+                if it.label == n:
+                    return it
+        return None
+
+    vt = pick("Vtune_V") or next((i for i in items if "vtune" in i.label.lower()), None)
+    fq = pick("Freq_MHz") or next((i for i in items if i.cat == "Frequency"), None)
+
+    ws = wb.create_sheet("温巡过程")
+    # 重锁点那条线的表头就是图例文字，顺手把锁在哪几个温度写进去——
+    # 等于把标注做进图例里，看图的人不用再去翻数据页
+    lt = "/".join(str(fmt_num(lg.lock_temp)) for lg in legs if lg.lock_temp is not None)
+    lock_label = f"重锁点（锁@{lt}℃）" if lt else "重锁点"
+    head = ["序号", "原表行", "段", "温度℃", "事件"]
+    cols = {}
+    if vt:
+        cols["vt"] = len(head) + 1
+        head += [vt.label, lock_label]
+    if fq:
+        cols["fq"] = len(head) + 1
+        head += ["Δf (kHz)", lock_label, fq.label]
+    for i, h in enumerate(head, 1):
+        put(ws, 2, i, h, st, st["f_head"], bold=True)
+        ws.column_dimensions[ws.cell(row=2, column=i).column_letter].width = \
+            14 if i > 2 else 8
+
+    seq = [(lg, r) for lg in legs for r in lg.rows]
+    f0 = None
+    if fq:
+        for _lg, r in seq:
+            v = r.vals.get(fq.col)
+            if v is not None:
+                f0 = v
+                break
+
+    r0 = 3
+    dfs = []
+    for n, (lg, row) in enumerate(seq):
+        r = r0 + n
+        is_lock = row is lg.rows[0] and lg.lock_temp is not None
+        fill = st["f_group"] if is_lock else st["f_res"]
+        put(ws, r, 1, n + 1, st, fill)
+        put(ws, r, 2, row.xl, st, fill, size=9)
+        put(ws, r, 3, lg.n, st, fill)
+        put(ws, r, 4, fmt_num(row.temp), st, fill)
+        put(ws, r, 5, f"锁@{fmt_num(lg.lock_temp)}℃" if is_lock else None, st, fill,
+            bold=is_lock, color=COLOR_FLAG if is_lock else None)
+        if vt:
+            v = row.vals.get(vt.col)
+            put(ws, r, cols["vt"], fmt_num(v, 5), st, fill)
+            put(ws, r, cols["vt"] + 1, fmt_num(v, 5) if is_lock else None, st, fill)
+        if fq:
+            v = row.vals.get(fq.col)
+            df = None if (v is None or f0 is None) else round((v - f0) * 1000.0, 3)
+            if df is not None:
+                dfs.append(abs(df))
+            put(ws, r, cols["fq"], df, st, fill)
+            put(ws, r, cols["fq"] + 1, df if is_lock else None, st, fill)
+            put(ws, r, cols["fq"] + 2, fmt_num(v, 6), st, fill, size=9)
+
+    note = ("整趟温巡按测试顺序排；米色行 = 重锁点。"
+            + (f"  Δf = 相对第 1 个测点（{fmt_num(f0, 6)}）的偏差，"
+               f"全程 |Δf| ≤ {max(dfs) if dfs else 0} kHz" if fq and dfs else ""))
+    if vt:
+        # 自动算两句结论：重锁复位得一致不一致、两次重锁之间最多漂多少。
+        # 这两个数就是这类温巡测试要的答案，不该让人自己去表里减。
+        resets = [lg.rows[0].vals.get(vt.col) for lg in legs
+                  if lg.rows and lg.lock_temp is not None]
+        resets = [v for v in resets if v is not None]
+        drifts = [(s["delta"], lg.n) for lg in legs for s in [stats(lg, vt)] if s]
+        if resets:
+            note += (f"\n重锁后 {vt.label} = "
+                     + ", ".join(str(fmt_num(v, 5)) for v in resets)
+                     + f"（极差 {fmt_num(max(resets) - min(resets), 5)} {vt.unit}"
+                     + "，越小说明重锁复位越一致）")
+        if drifts:
+            d, ln = max(drifts)
+            note += f"；两次重锁之间最大漂移 {fmt_num(d, 5)} {vt.unit}（段{ln}）"
+    c = put(ws, 1, 1, note, st, st["f_group"], bold=True, align="left")
+    c.alignment = c.alignment.copy(wrap_text=True)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(head))
+    ws.row_dimensions[1].height = 32
+    ws.freeze_panes = "A3"
+
+    charts = []
+    if vt:
+        charts.append({"title": f"{vt.label} 温巡过程（含重锁点）",
+                       "ytitle": f"{vt.label} ({vt.unit})", "col": cols["vt"]})
+    if fq and dfs:
+        # ★纵轴要钉死。记录精度只有 0.001 MHz，Δf 只能取 0/±1 kHz 这几档，
+        # 让 Excel 自动缩放就会把这点量化噪声铺满整个画面、看着像频率在剧烈跳变，
+        # 评审第一句话就是"频率为什么在跳"。给个 ±5 kHz 的固定窗，它才如实
+        # 显示成一条贴零的平线 = 频率没变。
+        lim = max(5.0, round(max(dfs) * 3 + 0.5))
+        charts.append({"title": f"输出频率漂移 温巡过程（相对首点；"
+                                f"全程 |Δf| ≤ {max(dfs)} kHz，记录精度 1 kHz）",
+                       "ytitle": "Δf (kHz)", "col": cols["fq"],
+                       "ymin": -lim, "ymax": lim})
+    jinfo = {"first": r0, "last": r0 + len(seq) - 1, "c_idx": 1, "c_temp": 4,
+             "charts": charts} if charts else None
+    return ws, jinfo
+
+
 # ---------------------------------------------------------------- 图表
 
-def write_charts(wb, ws_detail, blocks, legs, items, pn_items, st):
+# 每段一个颜色 + 一个记号形状：4 条线叠在一张图上，光靠颜色分不开（打印/色弱都糊），
+# 形状也得不一样。
+LEG_STYLE = [("1F77B4", "circle"), ("D62728", "square"),
+             ("2CA02C", "triangle"), ("FF7F0E", "diamond")]
+# 默认只给这几个指标画 值-vs-温度 图。全画会出十几张，评审翻不动也问不出重点；
+# 其余指标的极值/Δ 汇总表里都有，要补画用 --chart-items。
+DEFAULT_CHART_ITEMS = ["Vtune_V", "IPN_SSB", "Current_mA", "Power_dBm"]
+
+
+def _style(series, color, symbol, line=True, dash=None, size=6):
+    from openpyxl.chart.marker import Marker
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.drawing.line import LineProperties
+    gp = GraphicalProperties()
+    gp.line = LineProperties(noFill=True) if not line else \
+        LineProperties(solidFill=color, w=20000, prstDash=dash)
+    series.graphicalProperties = gp
+    if symbol:
+        m = Marker(symbol=symbol, size=size)
+        m.graphicalProperties = GraphicalProperties(solidFill=color)
+        series.marker = m
+    else:
+        series.marker = Marker(symbol="none")
+    series.smooth = False
+
+
+def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
+                 ws_j, jinfo, chart_items, st):
     from openpyxl.chart import Reference, ScatterChart, Series
     from openpyxl.chart.marker import Marker
 
     ws = wb.create_sheet("图表")
-    put(ws, 1, 1, "每张图：横轴=温度，每段一条线。同温不同线分叉 = 回滞/温漂没回来。",
-        st, st["f_group"], bold=True, align="left")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
+    for i, line in enumerate([
+        "图 1-2 = 温巡过程（横轴 = 测点序号，按实际测试顺序）：看整趟温巡里量怎么走、"
+        "每次重锁把它拉回到哪。红三角 = 重锁点。",
+        "图 3 起 = 指标 vs 温度（横轴 = 温度，每段一条线）：同一个温度上几条线分叉 = 回滞。",
+    ]):
+        put(ws, 1 + i, 1, line, st, st["f_group"] if i == 0 else None, bold=(i == 0),
+            align="left")
+        ws.merge_cells(start_row=1 + i, start_column=1, end_row=1 + i, end_column=14)
 
-    row_anchor, col_anchor = 3, 1
-    for n, (it, head, first, last) in enumerate(blocks):
+    row = 4
+    if jinfo:
+        row = _journey_charts(ws, ws_j, jinfo, st, row)
+
+    # 值 vs 温度：只画点名的几个
+    wanted = [b for b in blocks if b[0].label in chart_items]
+    for n, (it, head, first, last) in enumerate(wanted):
         ch = ScatterChart()
         ch.title = f"{it.label} vs 温度"
         ch.style = 13
         ch.x_axis.title = "温度 (℃)"
-        ch.y_axis.title = it.unit
+        ch.y_axis.title = f"{it.label} ({it.unit})"
         ch.x_axis.delete = False
         ch.y_axis.delete = False
-        ch.height, ch.width = 7.5, 13
+        ch.height, ch.width = 8.5, 14
         ch.dispBlanksAs = "gap"
         xref = Reference(ws_detail, min_col=1, min_row=first, max_row=last)
-        for i, lg in enumerate(legs):
+        for i, _lg in enumerate(legs):
             yref = Reference(ws_detail, min_col=2 + i, min_row=head, max_row=last)
             s = Series(yref, xref, title_from_data=True)
-            s.marker = Marker(symbol="circle", size=5)
+            color, sym = LEG_STYLE[i % len(LEG_STYLE)]
+            _style(s, color, sym)
             ch.series.append(s)
-        ws.add_chart(ch, f"{'A' if n % 2 == 0 else 'I'}{row_anchor + (n // 2) * 16}")
-    # 相噪 vs offset：横轴对数，每条线一个温度
+        ws.add_chart(ch, f"{'A' if n % 2 == 0 else 'J'}{row + (n // 2) * 18}")
+    row += ((len(wanted) + 1) // 2) * 18
+
     if pn_items:
-        _pn_offset_chart(wb, ws, legs, pn_items, st, row_anchor + ((len(blocks) + 1) // 2) * 16)
+        _pn_offset_chart(wb, ws, legs, pn_items, st, row)
     return ws
+
+
+def _journey_charts(ws, ws_j, jinfo, st, row):
+    """温巡过程图：横轴=测点序号，主轴=量，次轴=温度，重锁点单独一条只有记号的线。
+
+    为什么不用"vs 温度"那种图：温巡是有先后的，同一个温度会经过好几次；
+    按温度画就把"先后"这一维压没了，看不出"锁完一次之后一路漂到哪、
+    下一次重锁又拉回多少"。
+    """
+    from openpyxl.chart import LineChart, Reference
+    from openpyxl.chart.axis import ChartLines
+
+    first, last = jinfo["first"], jinfo["last"]
+    for spec in jinfo["charts"]:
+        c1 = LineChart()
+        c1.title = spec["title"]
+        c1.style = 13
+        c1.height, c1.width = 10.5, 28
+        c1.dispBlanksAs = "gap"
+        c1.y_axis.title = spec["ytitle"]
+        c1.x_axis.title = "测点序号（按实际测试顺序）"
+        c1.x_axis.delete = False
+        c1.y_axis.delete = False
+        c1.y_axis.majorGridlines = ChartLines()
+        cats = Reference(ws_j, min_col=jinfo["c_idx"], min_row=first, max_row=last)
+
+        c1.add_data(Reference(ws_j, min_col=spec["col"], min_row=first - 1, max_row=last),
+                    titles_from_data=True)
+        c1.add_data(Reference(ws_j, min_col=spec["col"] + 1, min_row=first - 1, max_row=last),
+                    titles_from_data=True)
+        c1.set_categories(cats)
+        _style(c1.series[0], "1F77B4", "circle", size=5)
+        _style(c1.series[1], "D62728", "triangle", line=False, size=11)
+
+        c2 = LineChart()
+        c2.add_data(Reference(ws_j, min_col=jinfo["c_temp"], min_row=first - 1, max_row=last),
+                    titles_from_data=True)
+        c2.set_categories(cats)
+        _style(c2.series[0], "808080", None, dash="dash")
+        c2.y_axis.axId = 200
+        c2.y_axis.title = "温度 (℃)"
+        c2.y_axis.delete = False
+        c1.y_axis.crosses = "max"
+        c1 += c2
+
+        if spec.get("ymin") is not None:
+            c1.y_axis.scaling.min = spec["ymin"]
+            c1.y_axis.scaling.max = spec["ymax"]
+        c1.x_axis.tickLblSkip = 4
+        c1.x_axis.tickMarkSkip = 4
+        ws.add_chart(c1, f"A{row}")
+        row += 22
+    return row
 
 
 def _pn_offset_chart(wb, ws_chart, legs, pn_items, st, anchor_row):
@@ -667,6 +873,10 @@ def main():
                     help="只保留该模式的行（默认取出现最多的那个值）；重锁行始终保留。"
                          "挡的是夹在扫描序列里的旁路/自检行——它们也带部分结果值，"
                          "不挡就会被算进相邻那一段，把段的走向和极值都带偏")
+    ap.add_argument("--chart-items", default=",".join(DEFAULT_CHART_ITEMS),
+                    help="哪些指标画 值-vs-温度 图（逗号分隔；all=全画，空=一张都不画）。"
+                         "温巡过程图和相噪-offset 图不受这个控制，始终画。"
+                         f"默认 {','.join(DEFAULT_CHART_ITEMS)}")
     ap.add_argument("--dry-run", action="store_true", help="只打印识别结果，不写文件")
     args = ap.parse_args()
 
@@ -816,9 +1026,17 @@ def main():
     # ---- 写出 ----
     st = _styles()
     write_summary(wb, legs, items, meta, st)
+    ws_j, jinfo = write_journey(wb, legs, items, st)
     ws_detail, blocks, _temps = write_detail(wb, legs, items, st)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
-    write_charts(wb, ws_detail, blocks, legs, items, pn_items, st)
+    if args.chart_items.strip().lower() == "all":
+        chart_items = [it.label for it in items]
+    elif args.chart_items.strip():
+        chart_items = [s.strip() for s in args.chart_items.split(",") if s.strip()]
+    else:
+        chart_items = []
+    write_charts(wb, ws_detail, blocks, legs, items, pn_items,
+                 ws_j, jinfo, chart_items, st)
     write_relock(wb, legs, items, st)
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
