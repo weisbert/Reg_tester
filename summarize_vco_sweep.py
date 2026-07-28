@@ -595,8 +595,9 @@ def _range_table(ws, r0, groups, items, st, title, lay):
         return rref(lay["sheet"], lay["col_of"][id(g)], f, l)
 
     plan = [("cat", "Category", 16), ("item", "Item", 22), ("unit", "Unit", 9),
-            ("spec_min", "Min", 10), ("spec_max", "Max", 10), ("sep", "", 2)]
-    blocks = [("Spec", "", [3, 4])]
+            ("spec_min", "Min", 10), ("spec_typ", "Typ", 10), ("spec_max", "Max", 10),
+            ("sep", "", 2)]
+    blocks = [("Spec", "", [3, 4, 5])]
     for g in groups:
         base = len(plan)
         plan += [("min", "Min", 11), ("max", "Max", 11), ("delta", "Δ", 10), ("sep", "", 2)]
@@ -666,7 +667,7 @@ def _range_table(ws, r0, groups, items, st, title, lay):
                                        fmt_num(s["max"]) if s else None), st, st["f_res"])
             put(ws, r, cc[2] + 1, emit(f_span(alls),
                                        fmt_num(s["delta"]) if s else None), st, st["f_res"])
-        smin, smax = "$D%d" % r, "$E%d" % r
+        smin, smax = "$D%d" % r, "$F%d" % r
         amin, amax = "%s%d" % (L(cc[0] + 1), r), "%s%d" % (L(cc[1] + 1), r)
         put(ws, r, col_judge + 1,
             '=IF(AND(%s="",%s=""),"",IF(AND(OR(%s="",%s>=%s),OR(%s="",%s<=%s)),"PASS","FAIL"))'
@@ -1049,10 +1050,12 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
     """结论表：列 = 各温度；每行一个能下判断的结论。"""
     from openpyxl.utils import get_column_letter as L
 
-    n_fix = 6                              # Category|Item|Unit|关注|Spec Min|Spec Max
+    # Category|Item|Unit|Limit|Spec Min|Spec Typ|Spec Max
+    # Typ 只是给人对照的标称值，不参与判定——判定还是看 Min/Max 两个边界。
+    n_fix = 7
     c_note = n_fix + len(temps) + 1
     c_judge = c_note + 1
-    widths = [16, 34, 10, 6, 10, 10] + [13] * len(temps) + [52, 10]
+    widths = [16, 34, 10, 6, 10, 10, 10] + [13] * len(temps) + [52, 10]
     for i, w in enumerate(widths):
         ws.column_dimensions[L(i + 1)].width = w
 
@@ -1066,10 +1069,10 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
                    (c_note, "备注"), (c_judge, "判定")):
         ws.merge_cells(start_row=h, start_column=c, end_row=h + 1, end_column=c)
         put(ws, h, c, lab, st, st["f_head"], bold=True, size=9)
-    ws.merge_cells(start_row=h, start_column=5, end_row=h, end_column=6)
+    ws.merge_cells(start_row=h, start_column=5, end_row=h, end_column=7)
     put(ws, h, 5, "Spec", st, st["f_head"], bold=True, size=9)
-    put(ws, h + 1, 5, "Min", st, st["f_head"], bold=True, size=9)
-    put(ws, h + 1, 6, "Max", st, st["f_head"], bold=True, size=9)
+    for c, lab in ((5, "Min"), (6, "Typ"), (7, "Max")):
+        put(ws, h + 1, c, lab, st, st["f_head"], bold=True, size=9)
     ws.merge_cells(start_row=h, start_column=n_fix + 1, end_row=h,
                    end_column=n_fix + len(temps))
     put(ws, h, n_fix + 1, "温度", st, st["f_head"], bold=True, size=9)
@@ -1110,8 +1113,8 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
         if numeric and row["kind"] == "result":
             rng = "%s%d:%s%d" % (L(n_fix + 1), r, L(n_fix + len(temps)), r)
             put(ws, r, c_judge,
-                '=IF(COUNT(%s)=0,"",IF(AND($E%d="",$F%d=""),"",'
-                'IF(AND(OR($E%d="",MIN(%s)>=$E%d),OR($F%d="",MAX(%s)<=$F%d)),"PASS","FAIL")))'
+                '=IF(COUNT(%s)=0,"",IF(AND($E%d="",$G%d=""),"",'
+                'IF(AND(OR($E%d="",MIN(%s)>=$E%d),OR($G%d="",MAX(%s)<=$G%d)),"PASS","FAIL")))'
                 % (rng, r, r, r, rng, r, r, rng, r), st, fill, bold=True)
 
     i = 0                                   # Category 纵向合并
