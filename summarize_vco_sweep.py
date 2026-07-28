@@ -893,13 +893,6 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
         fml=lambda t, R: f_guard("%s-%s" % (R("fmax", t), R("fmin", t)),
                                  R("fmin", t), R("fmax", t)),
         note="= Fmax − Fmin")
-    add("Frequency Range", "Tuning Range  调谐范围", "%", "≥",
-        lambda t: (200.0 * (fr(t, "high") - fr(t, "low")) / (fr(t, "high") + fr(t, "low")))
-        if (fr(t, "low") and fr(t, "high")) else None,
-        fml=lambda t, R: f_guard("2*(%s-%s)/(%s+%s)*100"
-                                 % (R("fmax", t), R("fmin", t), R("fmax", t), R("fmin", t)),
-                                 R("fmin", t), R("fmax", t)),
-        note="= 2×(Fmax − Fmin)/(Fmax + Fmin)×100")
     if fvco is not None:
         add("Frequency Range", "Margin to fVCO  下边余量", "MHz", "≥",
             lambda t: (fvco - fr(t, "low")) if fr(t, "low") is not None else None,
@@ -913,29 +906,34 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             note="= Fmax − 目标 fVCO")
 
     # ---- 频段搭接：有没有锁不上的盲区 ----
-    add("Sub-band", "Sub-band Tuning Range  单码调谐范围", "MHz", "≥", dfv,
+    add("CT Band", "单码调谐范围（固定 CT 码）", "MHz", "≥", dfv,
         fml=lambda t, R: f_span([rng("v", t, freq_item)]) if rng("v", t, freq_item) else None,
         rid="dfv",
         note="= F(%s) − F(%s)，CT 码固定不动" % (_V(_vmax), _V(_vmin)))
-    add("Sub-band", "Band Coverage  全码跨度", "MHz", "≥",
+    add("CT Band", "CT 全码跨度", "MHz", "≥",
         lambda t: (max(ser("c", t).values()) - min(ser("c", t).values()))
         if len(ser("c", t)) >= 2 else None,
         fml=lambda t, R: f_span([rng("c", t, freq_item)]) if rng("c", t, freq_item) else None,
         note="= CT 扫最高频 − 最低频，Vtune 钉在 %s" % _V(_vc))
-    add("Sub-band", "Band Step  相邻码间隔 平均", "MHz/code", "",
+    add("CT Band", "CT Band Step  相邻码间隔 平均", "MHz/code", "",
         lambda t: (sum(steps("c", t)) / len(steps("c", t))) if steps("c", t) else None,
         fml=lambda t, R: ('=IF(COUNT(%s)=0,"",ABS(AVERAGE(%s)))'
                           % (srng("c", t), srng("c", t))) if srng("c", t) else None,
         rid="step_avg", note="= 相邻两个码的频率差 |ΔF/ΔCT| 的平均")
-    add("Sub-band", "Band Step  相邻码间隔 最大", "MHz/code", "≤",
+    add("CT Band", "CT Band Step  相邻码间隔 最大", "MHz/code", "≤",
         lambda t: max(steps("c", t)) if steps("c", t) else None,
         fml=lambda t, R: f_absmax(srng("c", t)) if srng("c", t) else None, rid="step_max",
         note="= 相邻两个码的频率差 |ΔF/ΔCT| 的最大值")
-    add("Sub-band", "Band Overlap Ratio  搭接比", "-", "≥",
-        lambda t: (dfv(t) / max(steps("c", t)))
-        if (dfv(t) and steps("c", t) and max(steps("c", t)) > 1e-12) else None,
-        fml=lambda t, R: f_div(R("dfv", t), R("step_max", t)),
-        note="= 单码调谐范围 ÷ 相邻码间隔最大值", key=True)
+    # ★ 原来给的是无量纲的"搭接比"，读者(包括用户自己)看不出量级意味着什么。
+    #   换成 MHz：为正 = 相邻两个码的可调范围还重叠这么多；为负 = 中间有这么多
+    #   MHz 是任何 (码, Vtune) 组合都够不着的，那段频率锁不上。
+    add("CT Band", "频段重叠量", "MHz", "≥",
+        lambda t: (dfv(t) - max(steps("c", t)))
+        if (dfv(t) is not None and steps("c", t)) else None,
+        fml=lambda t, R: f_guard("%s-%s" % (R("dfv", t), R("step_max", t)),
+                                 R("dfv", t), R("step_max", t)),
+        note="= 单码调谐范围 − CT Band Step 最大值；"
+             "为正表示相邻码之间频率连续，为负表示有 |值| MHz 够不着", key=True)
 
     # ---- 温漂 ----
     ref_t = min(temps, key=lambda t: abs(t - ref_temp)) if temps else None
@@ -962,7 +960,7 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             fml=lambda t, R: '=IF(N(%s)=0,"",ABS(%s)/%s)' % (R("step_avg", ref_t),
                                                              R("drift", t),
                                                              R("step_avg", ref_t)),
-            note="= |Freq Drift| ÷ Band Step 平均（%s℃）" % rt)
+            note="= |Freq Drift| ÷ CT Band Step 平均（%s℃）" % rt)
 
     # ---- 压控增益 ----
     def kv_work(t):
@@ -1010,23 +1008,24 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
         if d is None:
             continue
 
+        # ★ 只在 Vtune 扫里取，不跟 CT 扫混。CT 扫从 0 码到 255 码跨了几百 MHz，
+        #   那是不同的工作频率，把它和 Vtune 扫的点并成一个集合取"最差"没有物理
+        #   意义。CT 扫本来也只记了频率/功率/积分相噪，是画频段图用的。
         def pick(t, it=it, d=d):
-            vals = []
-            for k in ("v", "c"):
-                g = _g(k, t)
-                if g:
-                    vals += list(group_series(g, it).values())
+            g = _g("v", t)
+            vals = list(group_series(g, it).values()) if g else []
             if not vals:
                 return None
             return max(vals) if d == "max" else min(vals)
 
         def pick_f(t, R, it=it, d=d):
-            rs = [x for x in (rng("v", t, it), rng("c", t, it)) if x]
-            return f_minmax("MAX" if d == "max" else "MIN", rs) if rs else None
+            r = rng("v", t, it)
+            return f_minmax("MAX" if d == "max" else "MIN", [r]) if r else None
 
-        add("Worst Case", it.label, it.unit, "≤" if d == "max" else "≥",
+        add("Worst @Vtune扫", it.label, it.unit, "≤" if d == "max" else "≥",
             pick, fml=pick_f,
-            note="= 该温度下所有扫描点里的%s值" % ("最大" if d == "max" else "最小"))
+            note="= Vtune %s~%s 全程里的%s值（不含 CT 扫）"
+                 % (_V(_vmin), _V(_vmax), "最大" if d == "max" else "最小"))
     return rows, temps
 
 
