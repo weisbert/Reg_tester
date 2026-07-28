@@ -106,15 +106,22 @@ def fmt_num(x, nd=3):
     return round(x, nd)
 
 
-def sref(title, col_idx0, xl_row):
+def sref(title, col_idx0, xl_row, coerce=False):
     """指向原始页某个格子的引用串，如 ='Sheet1'!CD5。
 
     汇总里的每个数都做成引用而不是写死：原始页改了值，汇总跟着变；
     也免得 review 的人怀疑"这个数是不是手敲进去的"。
     ⚠ 只在源格子确实有值时才引用——Excel 里引用空格子会显示成 0。
+
+    coerce=True 时发 `=--'页'!CD5`（双负号）。原始表里某些列会存成
+    **文本型数字**：Python 的 float() 解得动，Excel 的 COUNT/MIN/MATCH 却一律
+    不认，于是整列被当成没有数字——MIN 返回 0、MATCH 找不到 0，
+    极值温度那格就是 #N/A。双负号把文本转成数值，是数值则原样。
     """
     from openpyxl.utils import get_column_letter
-    return f"='{str(title).replace(chr(39), chr(39) * 2)}'!{get_column_letter(col_idx0 + 1)}{xl_row}"
+    ref = (f"'{str(title).replace(chr(39), chr(39) * 2)}'"
+           f"!{get_column_letter(col_idx0 + 1)}{xl_row}")
+    return f"=--{ref}" if coerce else f"={ref}"
 
 
 def fmt_hz(mhz):
@@ -162,10 +169,11 @@ class Columns:
 # ---------------------------------------------------------------- 指标识别
 
 class Item:
-    __slots__ = ("cat", "label", "unit", "col", "src")
+    __slots__ = ("cat", "label", "unit", "col", "src", "text_src")
 
     def __init__(self, cat, label, unit, col, src):
         self.cat, self.label, self.unit, self.col, self.src = cat, label, unit, col, src
+        self.text_src = False       # 原始列是文本型数字？是的话引用要加双负号
 
 
 SIMPLE_ITEMS = [
@@ -219,6 +227,14 @@ def build_items(cols, rows):
             f = fmt_hz(sorted(freqs)[0]) if len(freqs) == 1 else (
                 "/".join(fmt_hz(x) for x in sorted(freqs)[:3]) or f"#{i-1}")
             items.append(Item(cat, tpl.format(f=f), unit, rc, f"{prefix}Result{i-1}"))
+
+    # 标出「文本型数字」列：Python 解得动、Excel 不认。不标出来的话，
+    # 引用过去 COUNT/MIN 全落空，极值温度那格直接 #N/A。
+    for it in items:
+        n_txt = sum(1 for r in rows
+                    if it.col < len(r) and isinstance(r[it.col], str)
+                    and num(r[it.col]) is not None)
+        it.text_src = n_txt > 0
     return items, dropped
 
 
@@ -547,22 +563,28 @@ def write_summary(wb, legs, items, meta, st, room_t, dref):
             lo = f"{D}!${L(b['c_lo'])}${f0}:${L(b['c_lo'])}${f1}"
             hi = f"{D}!${L(b['c_hi'])}${f0}:${L(b['c_hi'])}${f1}"
             tcol = f"{D}!$A${f0}:$A${f1}"
-            put(ws, r, C["m_min"], f"=MIN({lo})", st, st["f_res"])
+            # 全部带护栏：一个数字都没有时给空白, 而不是 MIN 返回 0、
+            # MATCH 再找不到 0 而甩出 #N/A。报告里不该出现错误值。
+            put(ws, r, C["m_min"], f'=IF(COUNT({lo})=0,"",MIN({lo}))', st, st["f_res"])
             put(ws, r, C["m_lo_at"],
-                f"=INDEX({tcol},MATCH(MIN({lo}),{lo},0))", st, st["f_res"], size=9)
-            put(ws, r, C["m_max"], f"=MAX({hi})", st, st["f_res"])
+                f'=IFERROR(INDEX({tcol},MATCH(MIN({lo}),{lo},0)),"")',
+                st, st["f_res"], size=9)
+            put(ws, r, C["m_max"], f'=IF(COUNT({hi})=0,"",MAX({hi}))', st, st["f_res"])
             put(ws, r, C["m_hi_at"],
-                f"=INDEX({tcol},MATCH(MAX({hi}),{hi},0))", st, st["f_res"], size=9)
-            put(ws, r, C["m_d"], f"={L(C['m_max'])}{r}-{L(C['m_min'])}{r}",
-                st, st["f_res"])
+                f'=IFERROR(INDEX({tcol},MATCH(MAX({hi}),{hi},0)),"")',
+                st, st["f_res"], size=9)
+            put(ws, r, C["m_d"],
+                f'=IF(OR({L(C["m_min"])}{r}="",{L(C["m_max"])}{r}=""),"",'
+                f'{L(C["m_max"])}{r}-{L(C["m_min"])}{r})', st, st["f_res"])
             if b["room_row"]:
                 rr = f"{D}!${L(2)}${b['room_row']}:${L(1 + b['n_legs'])}${b['room_row']}"
                 put(ws, r, C["m_typ"], f"=IF(COUNT({rr})=0,\"\",MEDIAN({rr}))",
                     st, st["f_res"])
         mn, mx = f"{L(C['m_min'])}{r}", f"{L(C['m_max'])}{r}"
         sn, sx, lim = f"${L(C['s_min'])}{r}", f"${L(C['s_max'])}{r}", f"${L(C['limit'])}{r}"
+        # 实测为空时不判（Excel 里 ""<=数字 会算成 FALSE，不挡住会误判成 FAIL）
         put(ws, r, C["judge"],
-            f'=IF({lim}="","",'
+            f'=IF(OR({lim}="",{mn}="",{mx}=""),"",'
             f'IF({lim}="le",IF({sx}="","",IF({mx}<={sx},"PASS","FAIL")),'
             f'IF({lim}="ge",IF({sn}="","",IF({mn}>={sn},"PASS","FAIL")),'
             f'IF(AND({sn}<>"",{mn}<{sn}),"FAIL",'
@@ -673,7 +695,8 @@ def write_detail(wb, legs, items, st, src_title, room_t):
                 room_row = r
             for i, _lg in enumerate(legs):
                 xl = srcs[i].get(t)
-                put(ws, r, 2 + i, sref(src_title, it.col, xl) if xl else None,
+                put(ws, r, 2 + i,
+                    sref(src_title, it.col, xl, it.text_src) if xl else None,
                     st, st["f_res"])
             rng = f"{L(2)}{r}:{L(1 + len(legs))}{r}"
             put(ws, r, c_lo, f"=IF(COUNT({rng})=0,\"\",MIN({rng}))", st, st["f_res"], size=9)
@@ -754,7 +777,8 @@ def write_conclusions(wb, legs, items, meta, st, jinfo, sinfo, room_t, title):
     r += 1
     if c_df:
         rng = f"{J}!${c_df}${j0}:${c_df}${j1}"
-        line(r, "输出频率最大漂移 |Δf|max", f"=MAX(MAX({rng}),-MIN({rng}))", "kHz",
+        line(r, "输出频率最大漂移 |Δf|max",
+             f'=IF(COUNT({rng})=0,"",MAX(MAX({rng}),-MIN({rng})))', "kHz",
              True, f'=IF($E{r}="","",IF($C{r}<=$E{r},"PASS","FAIL"))',
              "判据填允许的频率偏差。频率没变＝环路仍锁在参考上；"
              "若漂移小于原始记录的最小刻度，说明它小到测不出来")
@@ -778,11 +802,11 @@ def write_conclusions(wb, legs, items, meta, st, jinfo, sinfo, room_t, title):
         line(r, "压控范围　上轨", None, vt.unit, False, None, "", val_input=True)
         r += 1
         r_min, r_max = r, r + 1
-        line(r, f"全温 {vt.label} 最小", f"=MIN({vrng})", vt.unit, False, None,
-             "整趟温巡里的最低点")
+        line(r, f"全温 {vt.label} 最小", f'=IF(COUNT({vrng})=0,"",MIN({vrng}))',
+             vt.unit, False, None, "整趟温巡里的最低点")
         r += 1
-        line(r, f"全温 {vt.label} 最大", f"=MAX({vrng})", vt.unit, False, None,
-             "整趟温巡里的最高点")
+        line(r, f"全温 {vt.label} 最大", f'=IF(COUNT({vrng})=0,"",MAX({vrng}))',
+             vt.unit, False, None, "整趟温巡里的最高点")
         r += 1
         r_req = r + 2
         line(r, "距下轨余量", f'=IF($C{r_lo}="","",$C{r_min}-$C{r_lo})', vt.unit, False,
@@ -806,11 +830,11 @@ def write_conclusions(wb, legs, items, meta, st, jinfo, sinfo, room_t, title):
                 continue
             lk = f"{J}!${c_vt}${lg['lock_row']}"
             line(r, f"{lg['title']}（{lg['stage']}）锁定点起最大偏离",
-                 f"=MAX(MAX({seg})-{lk},{lk}-MIN({seg}))", vt.unit,
-                 False, None, None, indent="　")
+                 f'=IF(COUNT({seg})=0,"",MAX(MAX({seg})-{lk},{lk}-MIN({seg})))',
+                 vt.unit, False, None, None, indent="　")
             put(ws, r, 7,
-                f'="锁定点 "&TEXT({lk},"0.####")&"　→　本段范围 "'
-                f'&TEXT(MIN({seg}),"0.####")&" ~ "&TEXT(MAX({seg}),"0.####")',
+                f'=IFERROR("锁定点 "&TEXT({lk},"0.####")&"　→　本段范围 "'
+                f'&TEXT(MIN({seg}),"0.####")&" ~ "&TEXT(MAX({seg}),"0.####"),"")',
                 st, st["f_res"], size=9, align="left")
             r += 1
     else:
@@ -825,10 +849,12 @@ def write_conclusions(wb, legs, items, meta, st, jinfo, sinfo, room_t, title):
     r += 1
     if c_lk:
         lrng = f"{J}!${c_lk}${j0}:${c_lk}${j1}"
-        line(r, f"重锁后 {vt.label}（各次中位数）", f"=MEDIAN({lrng})", vt.unit, False,
+        line(r, f"重锁后 {vt.label}（各次中位数）",
+             f'=IF(COUNT({lrng})=0,"",MEDIAN({lrng}))', vt.unit, False,
              None, "重锁把工作点拉回到这里")
         r += 1
-        line(r, "各次重锁复位极差", f"=MAX({lrng})-MIN({lrng})", vt.unit, True,
+        line(r, "各次重锁复位极差",
+             f'=IF(COUNT({lrng})=0,"",MAX({lrng})-MIN({lrng}))', vt.unit, True,
              f'=IF(OR($C{r}="",$E{r}=""),"",IF($C{r}<=$E{r},"PASS","FAIL"))',
              "↙ 填允许的复位一致性；越小说明不管在什么温度重锁都回到同一点")
         r += 1
@@ -960,7 +986,7 @@ def write_journey(wb, legs, items, st, yranges, src_title):
             bold=is_lock, color=COLOR_FLAG if is_lock else None)
         if vt:
             v = row.vals.get(vt.col)
-            ref = sref(src_title, vt.col, row.xl) if v is not None else None
+            ref = sref(src_title, vt.col, row.xl, vt.text_src) if v is not None else None
             put(ws, r, cols["vt"], ref, st, fill)
             put(ws, r, cols["vt"] + 1, ref if (is_lock and ref) else None, st, fill)
         if fq:
@@ -970,16 +996,18 @@ def write_journey(wb, legs, items, st, yranges, src_title):
                 dfs.append(abs(df))
             # Δf 也做成公式：(本行频率 - 首点频率) × 1000
             if v is not None and f0_row:
-                a = sref(src_title, fq.col, row.xl)[1:]      # 去掉开头的 '='
-                b = sref(src_title, fq.col, f0_row)[1:]
-                dformula = f"=({a}-{b})*1000"
+                # 每项各自加括号：文本列会带双负号，不括起来就拼成 A---B 这种
+                # 一串连续减号，能不能按预期解析全看 Excel 心情
+                a = sref(src_title, fq.col, row.xl, fq.text_src)[1:]   # 去掉开头的 '='
+                b = sref(src_title, fq.col, f0_row, fq.text_src)[1:]
+                dformula = f"=(({a})-({b}))*1000"
             else:
                 dformula = None
             put(ws, r, cols["fq"], dformula, st, fill)
             put(ws, r, cols["fq"] + 1,
                 dformula if (is_lock and dformula) else None, st, fill)
             put(ws, r, cols["fq"] + 2,
-                sref(src_title, fq.col, row.xl) if v is not None else None,
+                sref(src_title, fq.col, row.xl, fq.text_src) if v is not None else None,
                 st, fill, size=9)
 
     note = ("整趟温巡按测试顺序排；米色行 = 重锁点。"
@@ -1434,7 +1462,13 @@ def main():
         print(f"主模式  : {keep_mode!r}（+ 重锁行；其余行排除）")
     print(f"识别指标 {len(items)} 个:")
     for it in items:
-        print(f"    [{it.cat:<12}] {it.label:<18} {it.unit:<7} <- 列 {it.src}")
+        print(f"    [{it.cat:<12}] {it.label:<18} {it.unit:<7} <- 列 {it.src}"
+              + ("   ⚠ 原始列是文本型数字，引用已加双负号转数值" if it.text_src else ""))
+    txts = [it.src for it in items if it.text_src]
+    if txts:
+        warnings.append(f"原始表里这些结果列存成了文本型数字（Excel 的 COUNT/MIN 不认，"
+                        f"不处理会让极值温度出 #N/A）：{', '.join(txts)}；"
+                        f"引用已加双负号转成数值")
     if dropped:
         print(f"  跳过的空列 {len(dropped)} 个: " + ", ".join(k for k, _ in dropped))
     print(f"分段 {len(legs)} 段:")
