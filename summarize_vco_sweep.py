@@ -123,6 +123,19 @@ def emit(formula, value):
     return formula if (LIVE_REFS and formula is not None) else value
 
 
+def as_text(v):
+    """说明文字写进格子前过一道。
+
+    ★ 以 = 开头的字符串会被 openpyxl 按**公式**写进去，Excel 一解析就变成
+      #NAME? / #REF!——备注列整列报错或空白。踩过一次：备注本来写成
+      "= Fmax − Fmin" 这种算式样子，结果全成了错误值。
+      开头是 = + - @ 的一律前面垫个空格挡住。
+    """
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+        return " " + v
+    return v
+
+
 def q(title):
     """工作表名放进公式里：一律加单引号（表名带空格/中文/减号都不会炸）。"""
     return "'%s'" % str(title).replace("'", "''")
@@ -831,20 +844,20 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             return None
         return vref(cref(LAY["src"], LAY["vtcol"], cg[t].rows[0].xl))
 
-    add("Condition", "温度", "℃", "", lambda t: t, fml=f_temp, kind="cond",
+    add("Condition", "Temperature", "℃", "", lambda t: t, fml=f_temp, kind="cond",
         note="原表 Temperature 列")
-    add("Condition", "Vtune 扫范围", "V", "",
+    add("Condition", "Vtune Range", "V", "",
         lambda t: "%s~%s" % (fmt_num(ends("v", t)[0]), fmt_num(ends("v", t)[1]))
         if ends("v", t)[0] is not None else None, fml=f_vrange, kind="cond",
         note="Vtune 扫的起止设定值")
-    add("Condition", "CT 扫范围（点数）", "code", "",
+    add("Condition", "CT Code Range (points)", "code", "",
         lambda t: "%s~%s (%d)" % (fmt_num(ends("c", t)[0]), fmt_num(ends("c", t)[1]),
                                   len(ser("c", t))) if ends("c", t)[0] is not None else None,
         fml=f_crange, kind="cond", note="CT 扫的起止码值（括号内为测点数）")
-    add("Condition", "Vtune @ CT sweep  CT 扫时的调谐电压", "V", "",
+    add("Condition", "Vtune @ CT sweep", "V", "",
         lambda t: v_ct(t), fml=f_vct, kind="cond", note="CT 扫全程把 Vtune 钉在这个值")
     if fvco is not None:
-        add("Condition", "目标 fVCO", "MHz", "", lambda t: fvco,
+        add("Condition", "Target fVCO", "MHz", "", lambda t: fvco,
             fml=lambda t, R: vref(fvco_ref) if fvco_ref else None,
             kind="cond", rid="fvco", note="原表 fVCO_MHz 列")
 
@@ -881,59 +894,49 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
         return ("=MIN(%s)-(%s-MIN(%s))" % (rc, c0, rv)) if side == "low" \
             else ("=MAX(%s)+(MAX(%s)-%s)" % (rc, rv, c0))
 
-    add("Frequency Range", "Fmin  最低频", "MHz", "≤", lambda t: fr(t, "low"),
+    add("Frequency Range", "Fmin", "MHz", "≤", lambda t: fr(t, "low"),
         fml=lambda t, R: fr_f(t, "low"), rid="fmin",
-        note="= CT 扫最低频 − [F(%s) − F(%s)]" % (_V(_vc), _V(_vmin)))
-    add("Frequency Range", "Fmax  最高频", "MHz", "≥", lambda t: fr(t, "high"),
+        note="CT 扫最低频 − [F(%s) − F(%s)]" % (_V(_vc), _V(_vmin)))
+    add("Frequency Range", "Fmax", "MHz", "≥", lambda t: fr(t, "high"),
         fml=lambda t, R: fr_f(t, "high"), rid="fmax",
-        note="= CT 扫最高频 + [F(%s) − F(%s)]" % (_V(_vmax), _V(_vc)))
-    add("Frequency Range", "Tuning Range  调谐范围", "MHz", "≥",
+        note="CT 扫最高频 + [F(%s) − F(%s)]" % (_V(_vmax), _V(_vc)))
+    add("Frequency Range", "Tuning Range", "MHz", "≥",
         lambda t: (fr(t, "high") - fr(t, "low"))
         if (fr(t, "low") is not None and fr(t, "high") is not None) else None,
         fml=lambda t, R: f_guard("%s-%s" % (R("fmax", t), R("fmin", t)),
                                  R("fmin", t), R("fmax", t)),
-        note="= Fmax − Fmin")
+        note="Fmax − Fmin")
     if fvco is not None:
-        add("Frequency Range", "Margin to fVCO  下边余量", "MHz", "≥",
+        add("Frequency Range", "Margin to fVCO (low)", "MHz", "≥",
             lambda t: (fvco - fr(t, "low")) if fr(t, "low") is not None else None,
             fml=lambda t, R: f_guard("%s-%s" % (R("fvco", t), R("fmin", t)),
                                      R("fmin", t), R("fvco", t)),
-            note="= 目标 fVCO − Fmin")
-        add("Frequency Range", "Margin to fVCO  上边余量", "MHz", "≥",
+            note="目标 fVCO − Fmin")
+        add("Frequency Range", "Margin to fVCO (high)", "MHz", "≥",
             lambda t: (fr(t, "high") - fvco) if fr(t, "high") is not None else None,
             fml=lambda t, R: f_guard("%s-%s" % (R("fmax", t), R("fvco", t)),
                                      R("fmax", t), R("fvco", t)),
-            note="= Fmax − 目标 fVCO")
+            note="Fmax − 目标 fVCO")
 
     # ---- 频段搭接：有没有锁不上的盲区 ----
-    add("CT Band", "单码调谐范围（固定 CT 码）", "MHz", "≥", dfv,
+    add("CT Band", "Sub-band Tuning Range", "MHz", "≥", dfv,
         fml=lambda t, R: f_span([rng("v", t, freq_item)]) if rng("v", t, freq_item) else None,
         rid="dfv",
-        note="= F(%s) − F(%s)，CT 码固定不动" % (_V(_vmax), _V(_vmin)))
-    add("CT Band", "CT 全码跨度", "MHz", "≥",
+        note="F(%s) − F(%s)，CT 码固定不动" % (_V(_vmax), _V(_vmin)))
+    add("CT Band", "CT Band Coverage", "MHz", "≥",
         lambda t: (max(ser("c", t).values()) - min(ser("c", t).values()))
         if len(ser("c", t)) >= 2 else None,
         fml=lambda t, R: f_span([rng("c", t, freq_item)]) if rng("c", t, freq_item) else None,
-        note="= CT 扫最高频 − 最低频，Vtune 钉在 %s" % _V(_vc))
-    add("CT Band", "CT Band Step  相邻码间隔 平均", "MHz/code", "",
+        note="CT 扫最高频 − 最低频，Vtune 钉在 %s" % _V(_vc))
+    add("CT Band", "CT Band Step (avg)", "MHz/code", "",
         lambda t: (sum(steps("c", t)) / len(steps("c", t))) if steps("c", t) else None,
         fml=lambda t, R: ('=IF(COUNT(%s)=0,"",ABS(AVERAGE(%s)))'
                           % (srng("c", t), srng("c", t))) if srng("c", t) else None,
-        rid="step_avg", note="= 相邻两个码的频率差 |ΔF/ΔCT| 的平均")
-    add("CT Band", "CT Band Step  相邻码间隔 最大", "MHz/code", "≤",
+        rid="step_avg", note="相邻两个码的频率差 |ΔF/ΔCT| 的平均")
+    add("CT Band", "CT Band Step (max)", "MHz/code", "≤",
         lambda t: max(steps("c", t)) if steps("c", t) else None,
         fml=lambda t, R: f_absmax(srng("c", t)) if srng("c", t) else None, rid="step_max",
-        note="= 相邻两个码的频率差 |ΔF/ΔCT| 的最大值")
-    # ★ 原来给的是无量纲的"搭接比"，读者(包括用户自己)看不出量级意味着什么。
-    #   换成 MHz：为正 = 相邻两个码的可调范围还重叠这么多；为负 = 中间有这么多
-    #   MHz 是任何 (码, Vtune) 组合都够不着的，那段频率锁不上。
-    add("CT Band", "频段重叠量", "MHz", "≥",
-        lambda t: (dfv(t) - max(steps("c", t)))
-        if (dfv(t) is not None and steps("c", t)) else None,
-        fml=lambda t, R: f_guard("%s-%s" % (R("dfv", t), R("step_max", t)),
-                                 R("dfv", t), R("step_max", t)),
-        note="= 单码调谐范围 − CT Band Step 最大值；"
-             "为正表示相邻码之间频率连续，为负表示有 |值| MHz 够不着", key=True)
+        note="相邻两个码的频率差 |ΔF/ΔCT| 的最大值")
 
     # ---- 温漂 ----
     ref_t = min(temps, key=lambda t: abs(t - ref_temp)) if temps else None
@@ -951,16 +954,16 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             return f_signed_absmax(d) if (d and t != ref_t) else None
 
         rt = fmt_num(ref_t)
-        add("Temp Drift", "Freq Drift vs %s℃  频漂" % rt, "MHz", "≤", drift,
+        add("Temp Drift", "Freq Drift vs %s℃" % rt, "MHz", "≤", drift,
             fml=f_drift, rid="drift",
-            note="= 同一 Vtune 下 F(T) − F(%s℃)，取 |ΔF| 最大的那个点，带符号" % rt)
-        add("Temp Drift", "Drift in CT Codes  折合码数", "code", "≤",
+            note="同一 Vtune 下 F(T) − F(%s℃)，取 |ΔF| 最大的那个点，带符号" % rt)
+        add("Temp Drift", "Drift in CT Codes", "code", "≤",
             lambda t: (abs(drift(t)) / (sum(steps("c", ref_t)) / len(steps("c", ref_t))))
             if (t != ref_t and drift(t) is not None and steps("c", ref_t)) else None,
             fml=lambda t, R: '=IF(N(%s)=0,"",ABS(%s)/%s)' % (R("step_avg", ref_t),
                                                              R("drift", t),
                                                              R("step_avg", ref_t)),
-            note="= |Freq Drift| ÷ CT Band Step 平均（%s℃）" % rt)
+            note="|Freq Drift| ÷ CT Band Step 平均（%s℃）" % rt)
 
     # ---- 压控增益 ----
     def kv_work(t):
@@ -982,25 +985,25 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             return None
         return "=ABS(%s)" % cref(s["sheet"], s["col_of"][id(g)], s["first"] + i)
 
-    add("Kvco", "Kvco @ %s  工作点增益" % _V(_vc), "MHz/V", "", kv_work, fml=kv_work_f,
-        note="= ΔF/ΔVtune，取 %s 所在的那个区间" % _V(_vc))
-    add("Kvco", "Kvco min  最小", "MHz/V", "",
+    add("Kvco", "Kvco @ %s" % _V(_vc), "MHz/V", "", kv_work, fml=kv_work_f,
+        note="ΔF/ΔVtune，取 %s 所在的那个区间" % _V(_vc))
+    add("Kvco", "Kvco min", "MHz/V", "",
         lambda t: min((abs(s[1]) for s in slopes(vg[t], freq_item)), default=None)
         if (t in vg and freq_item) else None,
         fml=lambda t, R: f_absmin(srng("v", t)) if srng("v", t) else None, rid="kv_min",
-        note="= 逐区间 ΔF/ΔVtune 里 |值| 最小的")
-    add("Kvco", "Kvco max  最大", "MHz/V", "",
+        note="逐区间 ΔF/ΔVtune 里 |值| 最小的")
+    add("Kvco", "Kvco max", "MHz/V", "",
         lambda t: max((abs(s[1]) for s in slopes(vg[t], freq_item)), default=None)
         if (t in vg and freq_item) else None,
         fml=lambda t, R: f_absmax(srng("v", t)) if srng("v", t) else None, rid="kv_max",
-        note="= 逐区间 ΔF/ΔVtune 里 |值| 最大的")
-    add("Kvco", "Kvco Ratio  最大/最小", "-", "≤",
+        note="逐区间 ΔF/ΔVtune 里 |值| 最大的")
+    add("Kvco", "Kvco max/min", "-", "≤",
         lambda t: (max(abs(s[1]) for s in slopes(vg[t], freq_item))
                    / min(abs(s[1]) for s in slopes(vg[t], freq_item)))
         if (t in vg and freq_item and slopes(vg[t], freq_item)
             and min(abs(s[1]) for s in slopes(vg[t], freq_item)) > 1e-12) else None,
         fml=lambda t, R: f_div(R("kv_max", t), R("kv_min", t)),
-        note="= Kvco max ÷ Kvco min")
+        note="Kvco max ÷ Kvco min")
 
     # ---- 各指标最差点（每个指标一行，不再铺 Min/Max/Δ 三列） ----
     for it in items:
@@ -1022,9 +1025,9 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             r = rng("v", t, it)
             return f_minmax("MAX" if d == "max" else "MIN", [r]) if r else None
 
-        add("Worst @Vtune扫", it.label, it.unit, "≤" if d == "max" else "≥",
+        add("Worst @ Vtune sweep", it.label, it.unit, "≤" if d == "max" else "≥",
             pick, fml=pick_f,
-            note="= Vtune %s~%s 全程里的%s值（不含 CT 扫）"
+            note="Vtune %s~%s 全程里的%s值（不含 CT 扫）"
                  % (_V(_vmin), _V(_vmax), "最大" if d == "max" else "最小"))
     return rows, temps
 
@@ -1090,7 +1093,7 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
                     f = None
             put(ws, r, n_fix + 1 + j,
                 emit(f, v if isinstance(v, str) else fmt_num(v)), st, fill)
-        put(ws, r, c_note, row["note"], st, fill, align="left", size=8)
+        put(ws, r, c_note, as_text(row["note"]), st, fill, align="left", size=8)
         if numeric and row["kind"] == "result":
             rng = "%s%d:%s%d" % (L(n_fix + 1), r, L(n_fix + len(temps)), r)
             put(ws, r, c_judge,
@@ -1162,7 +1165,7 @@ def write_diag(wb, meta, st):
     for xl, why in meta["excluded"]:
         r += 1
         put(ws, r, 1, xl, st)
-        put(ws, r, 2, why, st, align="left")
+        put(ws, r, 2, as_text(why), st, align="left")
     if meta["warnings"]:
         r += 2
         put(ws, r, 1, "探查告警", st, st["f_group"], bold=True, align="left")
