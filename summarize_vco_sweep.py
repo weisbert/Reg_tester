@@ -712,7 +712,8 @@ def _at(ser, x0):
     return ser[x], x
 
 
-def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
+def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
+                     op_vtune=None):
     """把两种扫描合起来，推出真能下判断的几行。
 
     ★ 为什么必须合起来：这份测试的核心问题是「有没有锁不上的盲区」——
@@ -1005,30 +1006,42 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
         fml=lambda t, R: f_div(R("kv_max", t), R("kv_min", t)),
         note="Kvco max ÷ Kvco min")
 
-    # ---- 各指标最差点（每个指标一行，不再铺 Min/Max/Δ 三列） ----
-    for it in items:
-        d = worst_dir(it)
-        if d is None:
-            continue
+    # ---- 工作点性能：Vtune 钉在一个电压上，看三个温度 ----
+    # ★ 相噪/功率这些不能"跨整个 Vtune 扫取最差"：不同 Vtune = 不同振荡频率，
+    #   把它们并成一个集合取极值等于把不同工作条件混在一起，那个数没有意义。
+    #   钉在一个工作点（默认 = CT 扫用的那个 Vtune）看温度差异才是要问的。
+    #   同一个 Vtune 在不同温度对应的频率并不一样，所以频率也列出来当参照。
+    _op = op_vtune if op_vtune is not None else _vc
+    if _op is None and _t0 is not None:
+        xs0 = sorted(ser("v", _t0))
+        _op = xs0[len(xs0) // 2] if xs0 else None
 
-        # ★ 只在 Vtune 扫里取，不跟 CT 扫混。CT 扫从 0 码到 255 码跨了几百 MHz，
-        #   那是不同的工作频率，把它和 Vtune 扫的点并成一个集合取"最差"没有物理
-        #   意义。CT 扫本来也只记了频率/功率/积分相噪，是画频段图用的。
-        def pick(t, it=it, d=d):
-            g = _g("v", t)
-            vals = list(group_series(g, it).values()) if g else []
-            if not vals:
-                return None
-            return max(vals) if d == "max" else min(vals)
+    def op_x(t):
+        return near_x("v", t, _op)
 
-        def pick_f(t, R, it=it, d=d):
-            r = rng("v", t, it)
-            return f_minmax("MAX" if d == "max" else "MIN", [r]) if r else None
+    if _op is not None:
+        cat = "@ Vtune %s" % _V(_op)
+        add(cat, "Freq", "MHz", "",
+            lambda t: ser("v", t).get(op_x(t)),
+            fml=lambda t, R: ("=" + cell("v", t, freq_item, op_x(t)))
+            if cell("v", t, freq_item, op_x(t)) else None,
+            note="Vtune 扫里 %s 那一点的输出频率（各温度不同）" % _V(_op))
+        for it in items:
+            d = worst_dir(it)
+            if d is None:
+                continue
 
-        add("Worst @ Vtune sweep", it.label, it.unit, "≤" if d == "max" else "≥",
-            pick, fml=pick_f,
-            note="Vtune %s~%s 全程里的%s值（不含 CT 扫）"
-                 % (_V(_vmin), _V(_vmax), "最大" if d == "max" else "最小"))
+            def at_op(t, it=it):
+                g = _g("v", t)
+                return group_series(g, it).get(op_x(t)) if g else None
+
+            def at_op_f(t, R, it=it):
+                c = cell("v", t, it, op_x(t))
+                return ("=" + c) if c else None
+
+            add(cat, it.label, it.unit, "≤" if d == "max" else "≥",
+                at_op, fml=at_op_f,
+                note="Vtune 扫里 %s 那一点的实测值" % _V(_op))
     return rows, temps
 
 
@@ -1421,11 +1434,11 @@ def write_slope_chart(grid, ws_slope, groups, anchor, title, xlabel, unit,
     grid.add(ch)
 
 
-def write_pn_chart(wb, grid, groups, pn_items, st):
+def write_pn_chart(wb, grid, groups, pn_items, st, op_x=None):
     """相噪 vs offset：数据另开一小块（行=offset，列=各组的代表点），再挂散点图。
 
-    每组取横轴的中间那个点当代表——相噪本身随 Vtune 变，取哪个点必须写清楚，
-    否则图上三条线不知道是在什么条件下量的。
+    取的是工作点那一点，跟结论页「@ Vtune 0.4V」用的是同一个点——
+    相噪随 Vtune 变，表和图要是各取各的点，两处数字对不上就没人信了。
     """
     from openpyxl.chart import Reference, Series
     from openpyxl.chart.marker import Marker
@@ -1437,7 +1450,7 @@ def write_pn_chart(wb, grid, groups, pn_items, st):
         xs = sorted({g.x_of(r) for r in g.rows if g.x_of(r) is not None})
         if not xs:
             continue
-        xm = xs[len(xs) // 2]
+        xm = min(xs, key=lambda z: abs(z - op_x)) if op_x is not None             else xs[len(xs) // 2]
         row = None
         for r in g.rows:
             if g.x_of(r) is not None and abs(g.x_of(r) - xm) < 1e-12:
@@ -1568,6 +1581,9 @@ def main():
                     help="温漂参考温度（默认 25）")
     ap.add_argument("--fvco", type=float, default=None,
                     help="目标 VCO 频率 MHz（默认从 fVCO_MHz 列读）。用来算覆盖余量")
+    ap.add_argument("--op-vtune", type=float, default=None,
+                    help="工作点调谐电压 V（默认取 CT 扫用的那个值）。相噪/功率这些"
+                         "按这个点报，不跨整个扫描取极值——不同 Vtune 是不同振荡频率")
     ap.add_argument("--x-round", type=int, default=6,
                     help="横轴取值四舍五入到几位小数（默认 6）。扫描点常是累加出来的，"
                          "表里会是 0.39999999999999997 这种，不量化就跟别的段对不上点")
@@ -1862,7 +1878,8 @@ def main():
                 LAY[kind]["drift"] = dlay
 
     concl_rows, concl_temps = build_conclusion(by_kind, items, freq_item,
-                                               args.ref_temp, fvco, fvco_ref, LAY)
+                                               args.ref_temp, fvco, fvco_ref, LAY,
+                                               args.op_vtune)
     if concl_rows:
         write_conclusion(wb, concl_rows, concl_temps, st,
                          args.title or "VCO 开环特性 · 结论")
@@ -1884,8 +1901,14 @@ def main():
         grid.add(ch)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     vt_groups = next((gs for k, gs in by_kind if k == "vtune"), [])
+    op_x = args.op_vtune
+    if op_x is None:
+        cg0 = next((g for k, gs in by_kind if k == "ct" for g in gs), None)
+        if cg0 is not None:
+            xv = [r.vt for r in cg0.rows if r.vt is not None]
+            op_x = xv[0] if xv else None
     write_pn_chart(wb, grid, vt_groups or [g for _k, gs in by_kind for g in gs],
-                   pn_items, st)
+                   pn_items, st, op_x)
     if extra:
         write_locked(wb, extra, items, st, tname)
     if args.notes:
