@@ -141,6 +141,18 @@ def rref(title, col0, r0, r1):
     return "%s!$%s$%d:$%s$%d" % (q(title), L, r0, L, r1)
 
 
+def vref(ref):
+    """引用原始表的一格，并且强制变成数值。
+
+    ★ 原始表里"数字存成文本"是常事（仪器脚本导出、或者列被设成文本格式）。
+      直接写 ='Sheet1'!$X$9 的话，Python 这边 num() 照样解析得出来，
+      但 Excel 的 MIN/MAX/COUNT 会**跳过文本**——公式版静默算错、静态版却是对的，
+      两边对不上还查不出原因。VALUE() 把文本数字转成数，
+      真数字原样通过，"-"/空/非数字则落到 "" 当没测。
+    """
+    return '=IFERROR(VALUE(%s),"")' % ref
+
+
 def f_minmax(which, refs):
     """MIN/MAX，区间全空时给空串而不是 0。refs 可以是多段（跨表也行）。"""
     a = ",".join(refs)
@@ -793,7 +805,7 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
         g = _g("v", t) or _g("c", t)
         if g is None or LAY.get("tcol") is None:
             return None
-        return "=" + cref(LAY["src"], LAY["tcol"], g.rows[0].xl)
+        return vref(cref(LAY["src"], LAY["tcol"], g.rows[0].xl))
 
     def f_vrange(t, R):
         a, b = ends("v", t)
@@ -809,7 +821,7 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
     def f_vct(t, R):
         if t not in cg or LAY.get("vtcol") is None:
             return None
-        return "=" + cref(LAY["src"], LAY["vtcol"], cg[t].rows[0].xl)
+        return vref(cref(LAY["src"], LAY["vtcol"], cg[t].rows[0].xl))
 
     add("Condition", "温度", "℃", "", lambda t: t, fml=f_temp, kind="cond")
     add("Condition", "Vtune 扫范围", "V", "",
@@ -822,7 +834,7 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
     add("Condition", "CT 扫时的 Vtune", "V", "", lambda t: v_ct(t), fml=f_vct, kind="cond")
     if fvco is not None:
         add("Condition", "目标 fVCO", "MHz", "", lambda t: fvco,
-            fml=lambda t, R: ("=" + fvco_ref) if fvco_ref else None,
+            fml=lambda t, R: vref(fvco_ref) if fvco_ref else None,
             kind="cond", rid="fvco")
 
     # ---- 频率覆盖 ----
@@ -895,21 +907,22 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
     ref_t = min(temps, key=lambda t: abs(t - ref_temp)) if temps else None
     if ref_t is not None and len(temps) > 1:
         def drift(t):
+            # 参考温对自己的漂移恒等于 0，那一格不是测量结果，留空
+            if t == ref_t:
+                return None
             a, b = ser("v", t), ser("v", ref_t)
             sh = [a[x] - b[x] for x in a if x in b]
             return max(sh, key=abs) if sh else None
 
         def f_drift(t, R):
             d = drng("v", t)
-            if d:
-                return f_signed_absmax(d)
-            return 0 if t == ref_t else None
+            return f_signed_absmax(d) if (d and t != ref_t) else None
 
         add("Drift", "同 Vtune 最大频漂 vs %s℃" % fmt_num(ref_t), "MHz", "≤", drift,
             fml=f_drift, note="取 |ΔF| 最大的点，带符号", rid="drift")
         add("Drift", "折合 CT 码数", "code", "≤",
             lambda t: (abs(drift(t)) / (sum(steps("c", ref_t)) / len(steps("c", ref_t))))
-            if (drift(t) is not None and steps("c", ref_t)) else None,
+            if (t != ref_t and drift(t) is not None and steps("c", ref_t)) else None,
             fml=lambda t, R: '=IF(N(%s)=0,"",ABS(%s)/%s)' % (R("step_avg", ref_t),
                                                              R("drift", t),
                                                              R("step_avg", ref_t)),
@@ -952,12 +965,6 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             and min(abs(s[1]) for s in slopes(vg[t], freq_item)) > 1e-12) else None,
         fml=lambda t, R: f_div(R("kv_max", t), R("kv_min", t)))
 
-    # ---- 单调性：非单调 = 电容阵列/压控有毛病，是真 bug 信号 ----
-    add("Monotonic", "F vs Vtune", "-", "",
-        lambda t: monotonic(vg[t], freq_item) if (t in vg and freq_item) else None)
-    add("Monotonic", "F vs CT", "-", "",
-        lambda t: monotonic(cg[t], freq_item) if (t in cg and freq_item) else None)
-
     # ---- 各指标最差点（每个指标一行，不再铺 Min/Max/Δ 三列） ----
     for it in items:
         d = worst_dir(it)
@@ -978,7 +985,7 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY):
             rs = [x for x in (rng("v", t, it), rng("c", t, it)) if x]
             return f_minmax("MAX" if d == "max" else "MIN", rs) if rs else None
 
-        add("Worst", "%s 最差" % it.label, it.unit, "≤" if d == "max" else "≥",
+        add("Worst Case", it.label, it.unit, "≤" if d == "max" else "≥",
             pick, fml=pick_f)
     return rows, temps
 
@@ -1147,7 +1154,15 @@ def write_detail(wb, name, groups, items, st, src_title, target=None,
     for i, g in enumerate(groups):
         layout["col_of"][id(g)] = 1 + i          # 0 基列号，0 号是横轴列
     for it in items:
+        # ★ 目标频率参考线只在它落进本图数据范围时才画。落在外面的话，
+        #   Y 轴被拉到目标值那么高，真正的曲线被压成底部一条细带，形状全看不见——
+        #   一条"有用的参考线"能把整张图毁掉。差多少在结论页有精确数。
         want_target = target is not None and it is target_item
+        if want_target:
+            allv = [v for g in groups for v in group_series(g, it).values()]
+            lo, hi = (min(allv), max(allv)) if allv else (None, None)
+            pad = (hi - lo) * 0.15 if (lo is not None and hi > lo) else 0
+            want_target = lo is not None and (lo - pad) <= target <= (hi + pad)
         n_col = len(groups) + (1 if want_target else 0)
         put(ws, r, 1, "%s  [%s]" % (it.label, it.unit), st, st["f_group"], bold=True, align="left")
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1 + n_col)
@@ -1171,7 +1186,7 @@ def write_detail(wb, name, groups, items, st, src_title, target=None,
                 else:
                     # ★ 不写死：指回原始表那一格。评审时点开就能追到源头。
                     put(ws, r, 2 + i,
-                        emit("=" + cref(src_title, it.col, sv[1].xl), fmt_num(sv[0])),
+                        emit(vref(cref(src_title, it.col, sv[1].xl)), fmt_num(sv[0])),
                         st, st["f_res"])
             if want_target:
                 put(ws, r, 2 + len(groups), emit(target_ref, target), st, st["f_res"])
@@ -1279,7 +1294,11 @@ def _scatter(title, xtitle, ytitle, logx=False):
     ch.x_axis.delete = False          # openpyxl 老毛病：不显式置 False 坐标轴不显示
     ch.y_axis.delete = False
     ch.height, ch.width = 7.5, 13
-    ch.dispBlanksAs = "gap"
+    # ★ 属性名必须是 openpyxl 的 display_blanks / visible_cells_only。
+    #   写成 OOXML 里的 dispBlanksAs / plotVisOnly 不会报错，只是挂了个没人读的
+    #   属性，序列化时压根不看——图照样生成，设置却一个都没生效。
+    ch.display_blanks = "gap"          # 断点留空，不连成直线
+    ch.visible_cells_only = False      # 数据页是隐藏的，不关掉这个图会整片空白
     # 图例默认在右边，13cm 宽的图会被中文图例挤掉四分之一绘图区
     if ch.legend is not None:
         ch.legend.position = "b"
@@ -1289,20 +1308,22 @@ def _scatter(title, xtitle, ytitle, logx=False):
     return ch
 
 
-def _add_series(ch, ws, n_series, head, first, last):
+def _add_series(ch, ws, n_series, head, first, last, counts=None):
     """挂数据系列。
 
-    两处必须显式设，否则图会骗人：
+    三处必须显式设，否则图会骗人：
     · smooth：OOXML 散点图默认走平滑曲线，压控曲线会被画出假拐点（读者
       会以为 Kvco 在中间有突变）；点多的时候更是扭成波浪。一律关掉。
-    · marker：点数多了（CT 全码扫 256 点）满屏圆点糊成一坨，看不出斜率，
-      超过阈值就只留线。
+    · marker：点数多了（全码扫 256 点）满屏圆点糊成一坨，看不出斜率。
+    · ★ marker 要按**每条线自己的点数**定，不能按整块的行数：同一张图上
+      常温扫了 256 个码、高低温只扫了 5 个，用整块行数判断的话那 5 个点的线
+      就没有 marker，被画成一条跨满全程的直线——看着像"全程都测过"。
     """
     from openpyxl.chart import Reference, Series
     from openpyxl.chart.marker import Marker
-    n_pts = last - first + 1
     xref = Reference(ws, min_col=1, min_row=first, max_row=last)
     for i in range(n_series):
+        n_pts = counts[i] if (counts and i < len(counts)) else (last - first + 1)
         yref = Reference(ws, min_col=2 + i, min_row=head, max_row=last)
         s = Series(yref, xref, title_from_data=True)
         s.smooth = False
@@ -1327,31 +1348,34 @@ class ChartGrid:
         self.n += 1
 
 
-# 每个 offset 的点相噪/杂散单独出图 = 十几张一样的图，默认不画；
-# 它们在明细页翻得到，趋势看「相噪 vs offset」那张。--all-charts 全画。
-MINOR_CHART = re.compile(r"^(SpotPN@|Spur@)")
+# 默认出图的指标。宁缺毋滥：逐 offset 的点相噪/杂散有十几个，趋势看
+# 「相噪 vs offset」那一张就够；CT 全码扫只关心频段怎么搬和相噪跟不跟得上。
+CHART_ITEMS = {"vtune": ("Freq_MHz", "Power_dBm", "IPN_SSB", "Current_mA"),
+               "ct": ("Freq_MHz", "IPN_SSB")}
 
 
 def write_charts(wb, panels, st, all_charts=False):
     """panels: [(sheet, blocks, groups, xlabel)]，每块一张图。"""
     ws = wb.create_sheet("图表")
     grid = ChartGrid(ws)
-    for ws_src, blocks, groups, xlabel in panels:
+    for ws_src, blocks, groups, xlabel, kind in panels:
         for it, head, first, last, n_col in blocks:
-            if not all_charts and MINOR_CHART.match(it.label):
+            if not all_charts and it.src not in CHART_ITEMS.get(kind, ()):
                 continue
             ch = _scatter("%s vs %s" % (it.label, xlabel), xlabel, it.unit)
-            _add_series(ch, ws_src, n_col, head, first, last)
+            counts = [len(group_series(g, it)) for g in groups]
+            _add_series(ch, ws_src, n_col, head, first, last, counts)
             grid.add(ch)
     return ws, grid
 
 
-def write_slope_chart(grid, ws_slope, groups, anchor, title, xlabel, unit):
+def write_slope_chart(grid, ws_slope, groups, anchor, title, xlabel, unit,
+                      counts=None):
     head, first, last = anchor[0], anchor[1], anchor[2]
     if last < first:
         return
     ch = _scatter(title, xlabel, unit)
-    _add_series(ch, ws_slope, len(groups), head, first, last)
+    _add_series(ch, ws_slope, len(groups), head, first, last, counts)
     grid.add(ch)
 
 
@@ -1386,7 +1410,7 @@ def write_pn_chart(wb, grid, groups, pn_items, st):
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=1 + len(picks))
     put(ws, 2, 1, "offset_MHz", st, st["f_head"], bold=True)
     for j, (g, xm, _r) in enumerate(picks):
-        put(ws, 2, 2 + j, "%s   %s=%s" % (g.title, g.x_label.split()[0], fmt_num(xm)),
+        put(ws, 2, 2 + j, "%s @%s%s" % (g.title.split()[0], fmt_num(xm), g.x_unit),
             st, st["f_head"], bold=True, size=9)
     for i, it in enumerate(pn_items):
         m = re.search(r"@([\d.]+)(k|M)Hz", it.label)
@@ -1509,6 +1533,11 @@ def main():
                     help="打印 CT 扫用的寄存器地址（默认不打印，地址是 IP）")
     ap.add_argument("--all-charts", action="store_true",
                     help="每个指标都出图（默认跳过逐 offset 的点相噪/杂散那十几张）")
+    ap.add_argument("--tables", action="store_true",
+                    help="多出「汇总」页（各指标逐点 Min/Max/Δ 的大表）。默认不出——"
+                         "同样的信息图上看得见，表只是多一页要翻的东西")
+    ap.add_argument("--show-data-sheets", action="store_true",
+                    help="不隐藏明细/斜率/温漂那几页（默认隐藏，它们是图的数据源）")
     ap.add_argument("--static", action="store_true",
                     help="格子里写算好的死值，不写引用公式。默认是公式——"
                          "每个数都能一路追回原始表那一格，原始数据改了整本跟着变")
@@ -1770,9 +1799,9 @@ def main():
         nm = "Vtune明细" if kind == "vtune" else "CT明细"
         ws_d, blocks, lay = write_detail(wb, nm, gs, items_with_data(gs, items), st,
                                          ws.title, target=fvco, target_item=freq_item,
-                                         target_ref=("=" + fvco_ref) if fvco_ref else None)
+                                         target_ref=vref(fvco_ref) if fvco_ref else None)
         LAY.setdefault(kind, {})["detail"] = lay
-        panels.append((ws_d, blocks, gs, gs[0].x_label))
+        panels.append((ws_d, blocks, gs, gs[0].x_label, kind))
         if freq_item is not None and any(len(group_series(g, freq_item)) >= 2 for g in gs):
             sn = "Kvco明细" if kind == "vtune" else "CT斜率明细"
             unit = "MHz/V" if kind == "vtune" else "MHz/code"
@@ -1781,7 +1810,8 @@ def main():
             LAY[kind]["slope"] = slay
             slope_jobs.append((ws_s, gs, anchor,
                                "Kvco vs Vtune" if kind == "vtune" else "ΔF/ΔCT vs CT",
-                               gs[0].x_label, unit))
+                               gs[0].x_label, unit,
+                               [max(0, len(group_series(g, freq_item)) - 1) for g in gs]))
         refg = ref_by_kind.get(kind)
         if refg is not None and len(gs) > 1 and freq_item is not None:
             dn = "温漂明细" if kind == "vtune" else "温漂明细-CT"
@@ -1794,11 +1824,22 @@ def main():
     if concl_rows:
         write_conclusion(wb, concl_rows, concl_temps, st,
                          args.title or "VCO 开环特性 · 结论")
-    write_summary(wb, by_kind, items, st, LAY)
+    if args.tables:
+        write_summary(wb, by_kind, items, st, LAY)
 
     _ws_chart, grid = write_charts(wb, panels, st, all_charts=args.all_charts)
-    for ws_s, gs, anchor, title, xlabel, unit in slope_jobs:
-        write_slope_chart(grid, ws_s, gs, anchor, title, xlabel, unit)
+    for ws_s, gs, anchor, title, xlabel, unit, cnts in slope_jobs:
+        write_slope_chart(grid, ws_s, gs, anchor, title, xlabel, unit, cnts)
+    for kind, gs in by_kind:
+        d = (LAY.get(kind) or {}).get("drift")
+        if not d or d["last"] < d["first"]:
+            continue
+        ch = _scatter("ΔF vs %s（相对 %s）" % (gs[0].x_label, d["ref"].title),
+                      gs[0].x_label, "MHz")
+        others = [g for g in gs if g is not d["ref"]]
+        _add_series(ch, wb[d["sheet"]], len(d["col_of"]), 2, d["first"], d["last"],
+                    [len(group_series(g, freq_item)) for g in others])
+        grid.add(ch)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     vt_groups = next((gs for k, gs in by_kind if k == "vtune"), [])
     write_pn_chart(wb, grid, vt_groups or [g for _k, gs in by_kind for g in gs],
@@ -1808,12 +1849,20 @@ def main():
     if args.notes:
         write_diag(wb, meta, st)
 
-    # 页序：原表 -> 结论 -> 汇总 -> 明细 -> 图 -> 附录
-    order = [ws.title, "结论", "汇总", "汇总-CT扫", "Vtune明细", "Kvco明细", "温漂明细",
-             "CT明细", "CT斜率明细", "温漂明细-CT", "图表", "相噪曲线", "闭环锁定点",
-             "数据处理记录"]
+    # 页序：能看的在前，数据源在后
+    order = [ws.title, "结论", "图表", "闭环锁定点", "汇总", "汇总-CT扫",
+             "Vtune明细", "Kvco明细", "温漂明细", "CT明细", "CT斜率明细",
+             "温漂明细-CT", "相噪曲线", "数据处理记录"]
     have = [n for n in order if n in wb.sheetnames]
     wb._sheets = [wb[n] for n in have] + [s for s in wb._sheets if s.title not in have]
+    # ★ 明细/斜率/温漂/相噪那几页是图的数据源，不是给人翻的：默认藏起来，
+    #   打开簿子只看见 原表 / 结论 / 图表 / 闭环锁定点。要翻数在 Excel 里
+    #   右键取消隐藏就行，一个数都没少。
+    if not args.show_data_sheets:
+        for n in ("Vtune明细", "Kvco明细", "温漂明细", "CT明细", "CT斜率明细",
+                  "温漂明细-CT", "相噪曲线"):
+            if n in wb.sheetnames:
+                wb[n].sheet_state = "hidden"
     # 格子里现在全是公式，openpyxl 不算值；让 Excel 一打开就重算，图才有数据
     wb.calculation.fullCalcOnLoad = True
 
