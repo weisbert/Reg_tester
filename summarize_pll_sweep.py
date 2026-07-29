@@ -484,12 +484,11 @@ def build_drift_rows(jinfo):
     if not jinfo or not jinfo.get("c_vt") or not jinfo.get("legs"):
         return []
     vt = jinfo["vt_item"]
-    J, cv, ct = f"'{jinfo['sheet']}'", L(jinfo["c_vt"]), L(jinfo["c_temp"])
+    J, cv = f"'{jinfo['sheet']}'", L(jinfo["c_vt"])
     out = []
     for lg in jinfo["legs"]:
         f0, f1, k = lg["first"], lg["last"], lg["lock_row"]
         seg = f"{J}!${cv}${f0}:${cv}${f1}"
-        tmp = f"{J}!${ct}${f0}:${ct}${f1}"
         lock = f"{J}!${cv}${k}"
         out.append({
             "cat": f"{vt.label} 温漂",
@@ -497,9 +496,7 @@ def build_drift_rows(jinfo):
             "unit": vt.unit,
             "m_min": f'=IF(COUNT({seg})=0,"",MIN({seg})-{lock})',
             "m_max": f'=IF(COUNT({seg})=0,"",MAX({seg})-{lock})',
-            "m_lo_at": f'=IFERROR(INDEX({tmp},MATCH(MIN({seg}),{seg},0)),"")',
-            "m_hi_at": f'=IFERROR(INDEX({tmp},MATCH(MAX({seg}),{seg},0)),"")',
-            "m_typ": None,          # 锁定点自己就是 0，没有"典型值"可言
+            # 三个代表温度点那几列留空：偏离是"每段一个数", 不是"每个温度一个数"
         })
     return out
 
@@ -520,15 +517,24 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
     from openpyxl.worksheet.datavalidation import DataValidation
 
     ws = wb.create_sheet("汇总")
+    # 实测组：先给几个代表温度点的值（最低 / 常温 / 最高），再给全温 MIN/MAX/Δ。
+    # 原先那两列「@℃」（极值出现在哪个温度）看表的人反映碍眼——想知道趋势
+    # 直接看三个温度点的值就够了，极值落在哪一格要细究再去「温度明细」。
+    all_t = sorted({t for lg in legs for t in lg.temps})
+    show_t = sorted({all_t[0], room_t, all_t[-1]} - {None}) if all_t else []
     plan = [("cat", "Category", 15), ("item", "Item", 24), ("unit", "Unit", 9),
             ("sep", "", 2),
             ("s_min", "MIN", 10), ("s_typ", "TYP", 10), ("s_max", "MAX", 10),
             ("limit", "limit", 8), ("sep", "", 2),
-            ("sim", "仿真值", 12), ("sep", "", 2),
-            ("m_min", "MIN", 11), ("m_lo_at", "@℃", 7), ("m_typ", "TYP", 11),
-            ("m_max", "MAX", 11), ("m_hi_at", "@℃", 7), ("m_d", "Δ", 10),
-            ("sep", "", 2),
-            ("judge", "判定 / 备注", 26)]
+            ("sim", "仿真值", 12), ("sep", "", 2)]
+    tkeys = []
+    for i, t in enumerate(show_t):
+        k = f"t{i}"
+        tkeys.append((k, t))
+        plan.append((k, f"{fmt_num(t)}℃", 11))
+    plan += [("m_min", "MIN", 11), ("m_max", "MAX", 11), ("m_d", "Δ", 10),
+             ("sep", "", 2),
+             ("judge", "判定 / 备注", 26)]
     C = {k: i + 1 for i, (k, _l, _w) in enumerate(plan) if k != "sep"}
     for i, (_k, _l, w) in enumerate(plan):
         ws.column_dimensions[L(i + 1)].width = w
@@ -537,11 +543,10 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
     temps = sorted({t for lg in legs for t in lg.temps})
     groups = [("Spec", "MIN / TYP / MAX　判据 limit",
                [C["s_min"], C["s_typ"], C["s_max"], C["limit"]]),
-              ("实测（全温）",
-               f"{fmt_num(temps[0])} ~ {fmt_num(temps[-1])}℃，{n_pts} 点"
-               if temps else "",
-               [C["m_min"], C["m_lo_at"], C["m_typ"],
-                C["m_max"], C["m_hi_at"], C["m_d"]])]
+              ("实测",
+               f"代表温度点 ＋ 全温 {fmt_num(temps[0])} ~ {fmt_num(temps[-1])}℃ "
+               f"{n_pts} 点的极值" if temps else "",
+               [C[k] for k, _t in tkeys] + [C["m_min"], C["m_max"], C["m_d"]])]
 
     for r in range(1, 4):
         for c in range(1, len(plan) + 1):
@@ -557,7 +562,6 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
         put(ws, 2, cc[0], stage, st, st["f_head"], bold=True, size=9)
         for ci in cc:
             put(ws, 3, ci, plan[ci - 1][1], st, st["f_head"], bold=True, size=9)
-    put(ws, 3, C["m_typ"], f"TYP({fmt_num(room_t)}℃)", st, st["f_head"], bold=True, size=9)
     for i, (k, _l, _w) in enumerate(plan):
         if k == "sep":
             for r in range(1, 4):
@@ -574,12 +578,13 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
         put(ws, r, C["item"], item, st, st["f_group"], align="left")
         put(ws, r, C["unit"], unit, st, st["f_group"])
         if isinstance(val, tuple):
-            for ci, v in zip((C["m_min"], C["m_typ"], C["m_max"]), val):
+            for ci, v in zip([C[k] for k, _ in tkeys], val):
                 put(ws, r, ci, fmt_num(v), st, st["f_group"], bold=True)
         else:
-            ws.merge_cells(start_row=r, start_column=C["m_min"],
+            c0 = C[tkeys[0][0]] if tkeys else C["m_min"]   # 实测组的第一列
+            ws.merge_cells(start_row=r, start_column=c0,
                            end_row=r, end_column=C["m_d"])
-            put(ws, r, C["m_min"], val, st, st["f_group"], bold=True, align="left")
+            put(ws, r, c0, val, st, st["f_group"], bold=True, align="left")
         if note:
             put(ws, r, C["judge"], note, st, st["f_group"], size=8, align="left")
         r += 1
@@ -595,16 +600,16 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
             D, f0, f1 = b["sheet"], b["first"], b["last"]
             lo = f"{D}!${L(b['c_lo'])}${f0}:${L(b['c_lo'])}${f1}"
             hi = f"{D}!${L(b['c_hi'])}${f0}:${L(b['c_hi'])}${f1}"
-            tcol = f"{D}!$A${f0}:$A${f1}"
             # 全部带护栏：一个数字都没有时给空白, 而不是 MIN 返回 0、
             # MATCH 再找不到 0 而甩出 #N/A。报告里不该出现错误值。
             s["m_min"] = f'=IF(COUNT({lo})=0,"",MIN({lo}))'
-            s["m_lo_at"] = f'=IFERROR(INDEX({tcol},MATCH(MIN({lo}),{lo},0)),"")'
             s["m_max"] = f'=IF(COUNT({hi})=0,"",MAX({hi}))'
-            s["m_hi_at"] = f'=IFERROR(INDEX({tcol},MATCH(MAX({hi}),{hi},0)),"")'
-            if b["room_row"]:
-                rr = f"{D}!${L(2)}${b['room_row']}:${L(1 + b['n_legs'])}${b['room_row']}"
-                s["m_typ"] = f'=IF(COUNT({rr})=0,"",MEDIAN({rr}))'
+            # 每个代表温度点：该温度在各段里被测了好几次, 取中位数
+            for k, tt in tkeys:
+                dr = (b.get("rows_by_temp") or {}).get(tt)
+                if dr:
+                    rr = f"{D}!${L(2)}${dr}:${L(1 + b['n_legs'])}${dr}"
+                    s[k] = f'=IF(COUNT({rr})=0,"",MEDIAN({rr}))'
         specs.append(s)
     drift = build_drift_rows(jinfo)
     if drift:
@@ -621,10 +626,9 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
                 st["f_in"] if k in fill_in else st["f_res"])
         put(ws, r, C["item"], sp["item"], st, st["f_res"], align="left")
         put(ws, r, C["unit"], sp["unit"], st, st["f_res"])
-        for key in ("m_min", "m_lo_at", "m_typ", "m_max", "m_hi_at"):
+        for key in [k for k, _ in tkeys] + ["m_min", "m_max"]:
             if sp.get(key):
-                put(ws, r, C[key], sp[key], st, st["f_res"],
-                    size=9 if key.endswith("_at") else 10)
+                put(ws, r, C[key], sp[key], st, st["f_res"])
         put(ws, r, C["m_d"],
             f'=IF(OR({L(C["m_min"])}{r}="",{L(C["m_max"])}{r}=""),"",'
             f'{L(C["m_max"])}{r}-{L(C["m_min"])}{r})', st, st["f_res"])
@@ -666,7 +670,7 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
     #   被拿去跟 spec 比会莫名其妙标红。
     a = res_first
     sn, sx, lim = f"${L(C['s_min'])}{a}", f"${L(C['s_max'])}{a}", f"${L(C['limit'])}{a}"
-    for key in ("m_min", "m_typ", "m_max"):
+    for key in [k for k, _ in tkeys] + ["m_min", "m_max"]:
         col = L(C[key])
         cur = f"{col}{a}"
         ws.conditional_formatting.add(
@@ -737,11 +741,10 @@ def write_detail(wb, legs, items, st, src_title, room_t):
                 if row.temp is not None and row.vals.get(it.col) is not None:
                     m[row.temp] = row.xl
             srcs.append(m)
-        room_row = None
+        rows_by_temp = {}
         for t in temps:
             put(ws, r, 1, fmt_num(t), st, st["f_res"])
-            if t == room_t:
-                room_row = r
+            rows_by_temp[t] = r
             for i, _lg in enumerate(legs):
                 xl = srcs[i].get(t)
                 put(ws, r, 2 + i,
@@ -752,7 +755,7 @@ def write_detail(wb, legs, items, st, src_title, room_t):
             put(ws, r, c_hi, f"=IF(COUNT({rng})=0,\"\",MAX({rng}))", st, st["f_res"], size=9)
             r += 1
         blocks.append({"item": it, "head": head, "first": first, "last": r - 1,
-                       "c_lo": c_lo, "c_hi": c_hi, "room_row": room_row})
+                       "c_lo": c_lo, "c_hi": c_hi, "rows_by_temp": rows_by_temp})
         r += 1
     ws.freeze_panes = "B1"
     return ws, blocks, temps
@@ -1362,7 +1365,7 @@ def main():
     ws_detail, blocks, _temps = write_detail(wb, legs, items, st, ws.title, room_t)
     dref = {b["item"].label: {"sheet": f"'{ws_detail.title}'", "first": b["first"],
                               "last": b["last"], "c_lo": b["c_lo"], "c_hi": b["c_hi"],
-                              "room_row": b["room_row"], "n_legs": len(legs)}
+                              "rows_by_temp": b["rows_by_temp"], "n_legs": len(legs)}
             for b in blocks}
     # 温巡过程要先建：汇总页的「相对锁定点偏离」几行按段引用它的格子
     ws_j, jinfo = write_journey(wb, legs, items, st, yranges, ws.title)
