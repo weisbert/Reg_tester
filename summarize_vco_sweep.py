@@ -62,6 +62,7 @@ summarize_vco_sweep.py — 开环压控扫描簿 → 带汇总页的 Excel
 """
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -1053,9 +1054,10 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
     # Category|Item|Unit|Limit|Spec Min|Spec Typ|Spec Max
     # Typ 只是给人对照的标称值，不参与判定——判定还是看 Min/Max 两个边界。
     n_fix = 7
-    c_note = n_fix + len(temps) + 1
+    c_sim = n_fix + len(temps) + 1     # 仿真值：留空给人填，不参与判定
+    c_note = c_sim + 1
     c_judge = c_note + 1
-    widths = [16, 34, 10, 6, 10, 10, 10] + [13] * len(temps) + [52, 10]
+    widths = [16, 34, 10, 6, 10, 10, 10] + [13] * len(temps) + [12, 52, 10]
     for i, w in enumerate(widths):
         ws.column_dimensions[L(i + 1)].width = w
 
@@ -1066,7 +1068,7 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
         put(ws, h, c, None, st, st["f_head"])
         put(ws, h + 1, c, None, st, st["f_head"])
     for c, lab in ((1, "Category"), (2, "Item"), (3, "Unit"), (4, "Limit"),
-                   (c_note, "备注"), (c_judge, "判定")):
+                   (c_sim, "仿真"), (c_note, "备注"), (c_judge, "判定")):
         ws.merge_cells(start_row=h, start_column=c, end_row=h + 1, end_column=c)
         put(ws, h, c, lab, st, st["f_head"], bold=True, size=9)
     ws.merge_cells(start_row=h, start_column=5, end_row=h, end_column=7)
@@ -1075,7 +1077,7 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
         put(ws, h + 1, c, lab, st, st["f_head"], bold=True, size=9)
     ws.merge_cells(start_row=h, start_column=n_fix + 1, end_row=h,
                    end_column=n_fix + len(temps))
-    put(ws, h, n_fix + 1, "温度", st, st["f_head"], bold=True, size=9)
+    put(ws, h, n_fix + 1, "测试", st, st["f_head"], bold=True, size=9)
     for j, t in enumerate(temps):
         put(ws, h + 1, n_fix + 1 + j, "%s℃" % fmt_num(t), st, st["f_head"], bold=True, size=9)
 
@@ -1094,6 +1096,7 @@ def _conclusion_table(ws, r0, temps, rows, st, title):
         for c in range(1, c_judge + 1):
             put(ws, r, c, None, st, fill)
         put(ws, r, 2, row["item"], st, fill, align="left", bold=row.get("key", False))
+        put(ws, r, c_sim, None, st, st["f_res"])          # 仿真值：手工填
         put(ws, r, 3, row["unit"], st, fill)
         put(ws, r, 4, row["dir"], st, fill, bold=True)
         numeric = True
@@ -1249,7 +1252,7 @@ def write_detail(wb, name, groups, items, st, src_title, target=None,
             if want_target:
                 put(ws, r, 2 + len(groups), emit(target_ref, target), st, st["f_res"])
             r += 1
-        blocks.append((it, head, first, r - 1, n_col))
+        blocks.append((it, head, first, r - 1, n_col, target if want_target else None))
         layout["block"][it.col] = (first, r - 1)
         layout["xrow"][it.col] = xrow
         r += 1
@@ -1291,9 +1294,13 @@ def write_slope(wb, name, groups, freq_item, st, unit, xlabel, layout):
                 fmt_num(ab[2])), st, st["f_res"])
         r += 1
     ws.freeze_panes = "B2"
+    yv = [v for d in per for (_a, _b, v) in d.values()]
+    sers = [dict((m, ab[2]) for m, ab in d.items()) for d in per]
+    xrow = dict((m, 3 + k) for k, m in enumerate(mids))
     return ws, (2, 3, r - 1), {"sheet": ws.title,
                                "col_of": {id(g): 1 + i for i, g in enumerate(groups)},
-                               "first": 3, "last": r - 1, "mids": mids}
+                               "first": 3, "last": r - 1, "mids": mids,
+                               "xvals": mids, "yvals": yv, "sers": sers, "xrow": xrow}
 
 
 def write_drift(wb, name, groups, ref_g, freq_item, st, layout, xlabel):
@@ -1342,51 +1349,133 @@ def write_drift(wb, name, groups, ref_g, freq_item, st, layout, xlabel):
 
 # ---------------------------------------------------------------- 图表
 
-def _scatter(title, xtitle, ytitle, logx=False):
+# 曲线配色：不给显式颜色的话，Excel 会用主题强调色的**深浅变体**去区分系列——
+# 屏幕上勉强能分，打印或投影基本分不开。这里点名指定对比度足够的颜色。
+SERIES_COLORS = ["1F77B4", "D62728", "2CA02C", "FF7F0E", "9467BD", "8C564B"]
+TARGET_COLOR = "808080"
+
+
+def _nice(lo, hi, pad=0.06):
+    """坐标轴范围：贴着数据留一点边距，再对齐到整刻度。
+
+    不显式给 min/max 的话由 Excel 自己定，同一组图的范围会各挑各的，
+    几张图并排看时曲线高低没法直接比；某些情况还会把基线拉到 0，
+    把一条 2000~2180 MHz 的调谐曲线压成顶上一条平线。
+    """
+    if lo is None or hi is None or hi < lo:
+        return None
+    # 整条线是常数：给个对称的窄带，别让轴退化。
+    # 判"相等"要用相对容差——斜率这类算出来的值常差在 1e-13 上，不是严格相等，
+    # 但那点差异画出来就是坐标轴退化成 1e-13 量级、刻度全是科学计数法。
+    if hi - lo <= max(abs(lo), abs(hi), 1e-12) * 1e-9:
+        d = max(abs(hi) * 0.05, 1e-6)
+        return lo - d, hi + d
+    span = hi - lo
+    lo, hi = lo - span * pad, hi + span * pad
+    step = 10 ** math.floor(math.log10((hi - lo) / 8.0))
+    return math.floor(lo / step) * step, math.ceil(hi / step) * step
+
+
+def _scatter(title, xtitle, ytitle, logx=False, xlim=None, ylim=None):
     from openpyxl.chart import ScatterChart
+    from openpyxl.chart.axis import ChartLines
     ch = ScatterChart()
     ch.title = title
-    ch.style = 13
     ch.x_axis.title = xtitle
     ch.y_axis.title = ytitle
     ch.x_axis.delete = False          # openpyxl 老毛病：不显式置 False 坐标轴不显示
     ch.y_axis.delete = False
-    ch.height, ch.width = 7.5, 13
+    ch.x_axis.majorGridlines = ChartLines()
+    ch.y_axis.majorGridlines = ChartLines()
+    ch.x_axis.numFmt = "General"
+    ch.y_axis.numFmt = "General"
+    ch.height, ch.width = 8.5, 14
     # ★ 属性名必须是 openpyxl 的 display_blanks / visible_cells_only。
     #   写成 OOXML 里的 dispBlanksAs / plotVisOnly 不会报错，只是挂了个没人读的
     #   属性，序列化时压根不看——图照样生成，设置却一个都没生效。
     ch.display_blanks = "gap"          # 断点留空，不连成直线
     ch.visible_cells_only = False      # 数据页是隐藏的，不关掉这个图会整片空白
-    # 图例默认在右边，13cm 宽的图会被中文图例挤掉四分之一绘图区
     if ch.legend is not None:
-        ch.legend.position = "b"
+        ch.legend.position = "b"       # 默认在右边，会吃掉四分之一绘图区
         ch.legend.overlay = False
     if logx:
         ch.x_axis.scaling.logBase = 10
+    else:
+        if xlim:
+            ch.x_axis.scaling.min, ch.x_axis.scaling.max = xlim
+        if ylim:
+            ch.y_axis.scaling.min, ch.y_axis.scaling.max = ylim
     return ch
 
 
-def _add_series(ch, ws, n_series, head, first, last, counts=None):
+def _style_series(s, color, dashed=False, marker="circle", size=5):
+    from openpyxl.chart.marker import Marker
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.drawing.line import LineProperties
+    ln = LineProperties(solidFill=color, w=22000)
+    if dashed:
+        ln.prstDash = "dash"
+    s.graphicalProperties = GraphicalProperties(ln=ln)
+    mk = Marker(symbol=marker, size=size)
+    if marker != "none":
+        mk.graphicalProperties = GraphicalProperties(
+            solidFill=color, ln=LineProperties(solidFill=color))
+    s.marker = mk
+
+
+def _label_points(s, idxs, numfmt="0.###"):
+    """只给指定的几个点打数值标签。
+
+    ★ 标的是**全图的最低点和最高点**，不是每条线各标首末点：三条温度曲线在
+      同一个横轴端点上值挨得很近，各标各的会叠成一坨看不清。全图两个极值点
+      各一个标签，位置天然分得开，而且那两个点正是要看的。
+    """
+    from openpyxl.chart.label import DataLabel, DataLabelList
+    if not idxs:
+        return
+    s.dLbls = DataLabelList()
+    s.dLbls.showVal = False
+    s.dLbls.showSerName = False
+    s.dLbls.showCatName = False
+    s.dLbls.showLegendKey = False
+    for i in sorted(set(idxs)):
+        dl = DataLabel(idx=i)
+        dl.showVal = True
+        dl.showSerName = False
+        dl.showCatName = False
+        dl.showLegendKey = False
+        dl.numFmt = numfmt
+        dl.dLblPos = "t"
+        s.dLbls.dLbl.append(dl)
+
+
+def _add_series(ch, ws, n_series, head, first, last, counts=None, labels=None,
+                target_idx=None):
     """挂数据系列。
 
-    三处必须显式设，否则图会骗人：
+    几处必须显式设，否则图会骗人：
     · smooth：OOXML 散点图默认走平滑曲线，压控曲线会被画出假拐点（读者
       会以为 Kvco 在中间有突变）；点多的时候更是扭成波浪。一律关掉。
-    · marker：点数多了（全码扫 256 点）满屏圆点糊成一坨，看不出斜率。
-    · ★ marker 要按**每条线自己的点数**定，不能按整块的行数：同一张图上
-      常温扫了 256 个码、高低温只扫了 5 个，用整块行数判断的话那 5 个点的线
-      就没有 marker，被画成一条跨满全程的直线——看着像"全程都测过"。
+    · marker 按**每条线自己的点数**定，不能按整块的行数：同一张图上常温扫了
+      256 个码、高低温只扫了 5 个，用整块行数判断的话那 5 个点的线就没有
+      marker，被画成一条跨满全程的直线——看着像"全程都测过"。
+    · 颜色点名给，别让 Excel 用主题色深浅去分。
     """
     from openpyxl.chart import Reference, Series
-    from openpyxl.chart.marker import Marker
     xref = Reference(ws, min_col=1, min_row=first, max_row=last)
     for i in range(n_series):
         n_pts = counts[i] if (counts and i < len(counts)) else (last - first + 1)
         yref = Reference(ws, min_col=2 + i, min_row=head, max_row=last)
         s = Series(yref, xref, title_from_data=True)
         s.smooth = False
-        s.marker = Marker(symbol="circle" if n_pts <= 60 else "none",
+        if target_idx is not None and i == target_idx:
+            _style_series(s, TARGET_COLOR, dashed=True, marker="none")
+        else:
+            _style_series(s, SERIES_COLORS[i % len(SERIES_COLORS)],
+                          marker="circle" if n_pts <= 60 else "none",
                           size=5 if n_pts <= 30 else 3)
+            if labels:
+                _label_points(s, labels.get(i) or [])
         ch.series.append(s)
 
 
@@ -1412,28 +1501,61 @@ CHART_ITEMS = {"vtune": ("Freq_MHz", "Power_dBm", "IPN_SSB", "Current_mA"),
                "ct": ("Freq_MHz", "IPN_SSB")}
 
 
+def _extreme_labels(sers, xrow, first):
+    """挑出全图的最低点和最高点，返回 {系列下标: [该系列里要标的点下标]}。"""
+    lo = hi = None
+    for i, d in enumerate(sers):
+        for x, v in d.items():
+            if x not in xrow:
+                continue
+            idx = xrow[x] - first
+            if lo is None or v < lo[0]:
+                lo = (v, i, idx)
+            if hi is None or v > hi[0]:
+                hi = (v, i, idx)
+    out = {}
+    for b in (lo, hi):
+        if b:
+            out.setdefault(b[1], []).append(b[2])
+    return out
+
+
 def write_charts(wb, panels, st, all_charts=False):
     """panels: [(sheet, blocks, groups, xlabel)]，每块一张图。"""
     ws = wb.create_sheet("图表")
     grid = ChartGrid(ws)
-    for ws_src, blocks, groups, xlabel, kind in panels:
-        for it, head, first, last, n_col in blocks:
+    for ws_src, blocks, groups, xlabel, kind, lay in panels:
+        for it, head, first, last, n_col, tgt in blocks:
             if not all_charts and it.src not in CHART_ITEMS.get(kind, ()):
                 continue
-            ch = _scatter("%s vs %s" % (it.label, xlabel), xlabel, it.unit)
-            counts = [len(group_series(g, it)) for g in groups]
-            _add_series(ch, ws_src, n_col, head, first, last, counts)
+            sers = [group_series(g, it) for g in groups]
+            ys = [v for d in sers for v in d.values()] + ([tgt] if tgt is not None else [])
+            xsv = [x for d in sers for x in d]
+            ch = _scatter("%s vs %s" % (it.label, xlabel), xlabel, it.unit,
+                          xlim=_nice(min(xsv), max(xsv)) if xsv else None,
+                          ylim=_nice(min(ys), max(ys)) if ys else None)
+            # 关键点 = 每条线自己的首末点，标上数值，不用对着坐标轴猜
+            xrow = lay["xrow"].get(it.col, {})
+            labels = _extreme_labels(sers, xrow, first)
+            _add_series(ch, ws_src, n_col, head, first, last,
+                        [len(d) for d in sers], labels,
+                        target_idx=len(groups) if tgt is not None else None)
             grid.add(ch)
     return ws, grid
 
 
 def write_slope_chart(grid, ws_slope, groups, anchor, title, xlabel, unit,
-                      counts=None):
+                      counts=None, rangevals=None, sers=None, xrow=None):
     head, first, last = anchor[0], anchor[1], anchor[2]
     if last < first:
         return
-    ch = _scatter(title, xlabel, unit)
-    _add_series(ch, ws_slope, len(groups), head, first, last, counts)
+    # 坐标范围得用 Python 侧算好的值：公式版里格子里是字符串，读不出数
+    xs, ys = (rangevals or ([], []))
+    ch = _scatter(title, xlabel, unit,
+                  xlim=_nice(min(xs), max(xs)) if xs else None,
+                  ylim=_nice(min(ys), max(ys)) if ys else None)
+    _add_series(ch, ws_slope, len(groups), head, first, last, counts,
+                _extreme_labels(sers or [], xrow or {}, first))
     grid.add(ch)
 
 
@@ -1478,13 +1600,21 @@ def write_pn_chart(wb, grid, groups, pn_items, st, op_x=None):
             put(ws, 3 + i, 2 + j, fmt_num(row.vals.get(it.col)), st, st["f_res"])
     ws.column_dimensions["A"].width = 12
 
+    # 标注同样只给全图最低/最高点，各线各标会在左端叠成一坨
+    pn_sers, pn_row = [], dict((i, 3 + i) for i in range(len(pn_items)))
+    for _g, _xm, row in picks:
+        pn_sers.append(dict((i, row.vals[it.col]) for i, it in enumerate(pn_items)
+                            if row.vals.get(it.col) is not None))
+    pn_labels = _extreme_labels(pn_sers, pn_row, 3)
+
     ch = _scatter("相噪 vs offset", "offset (MHz)", "dBc/Hz", logx=True)
     xref = Reference(ws, min_col=1, min_row=3, max_row=2 + len(pn_items))
     for j in range(len(picks)):
         yref = Reference(ws, min_col=2 + j, min_row=2, max_row=2 + len(pn_items))
         s = Series(yref, xref, title_from_data=True)
         s.smooth = False
-        s.marker = Marker(symbol="circle", size=5)
+        _style_series(s, SERIES_COLORS[j % len(SERIES_COLORS)])
+        _label_points(s, pn_labels.get(j) or [])
         ch.series.append(s)
     grid.add(ch)
 
@@ -1862,7 +1992,7 @@ def main():
                                          ws.title, target=fvco, target_item=freq_item,
                                          target_ref=vref(fvco_ref) if fvco_ref else None)
         LAY.setdefault(kind, {})["detail"] = lay
-        panels.append((ws_d, blocks, gs, gs[0].x_label, kind))
+        panels.append((ws_d, blocks, gs, gs[0].x_label, kind, lay))
         if freq_item is not None and any(len(group_series(g, freq_item)) >= 2 for g in gs):
             sn = "Kvco明细" if kind == "vtune" else "CT斜率明细"
             unit = "MHz/V" if kind == "vtune" else "MHz/code"
@@ -1872,7 +2002,9 @@ def main():
             slope_jobs.append((ws_s, gs, anchor,
                                "Kvco vs Vtune" if kind == "vtune" else "ΔF/ΔCT vs CT",
                                gs[0].x_label, unit,
-                               [max(0, len(group_series(g, freq_item)) - 1) for g in gs]))
+                               [max(0, len(group_series(g, freq_item)) - 1) for g in gs],
+                               (slay.get("xvals") or [], slay.get("yvals") or []),
+                               slay.get("sers"), slay.get("xrow")))
         refg = ref_by_kind.get(kind)
         if refg is not None and len(gs) > 1 and freq_item is not None:
             dn = "温漂明细" if kind == "vtune" else "温漂明细-CT"
@@ -1890,17 +2022,35 @@ def main():
         write_summary(wb, by_kind, items, st, LAY)
 
     _ws_chart, grid = write_charts(wb, panels, st, all_charts=args.all_charts)
-    for ws_s, gs, anchor, title, xlabel, unit, cnts in slope_jobs:
-        write_slope_chart(grid, ws_s, gs, anchor, title, xlabel, unit, cnts)
+    for ws_s, gs, anchor, title, xlabel, unit, cnts, rv, sr, xr in slope_jobs:
+        write_slope_chart(grid, ws_s, gs, anchor, title, xlabel, unit, cnts, rv, sr, xr)
     for kind, gs in by_kind:
         d = (LAY.get(kind) or {}).get("drift")
         if not d or d["last"] < d["first"]:
             continue
-        ch = _scatter("ΔF vs %s（相对 %s）" % (gs[0].x_label, d["ref"].title),
-                      gs[0].x_label, "MHz")
         others = [g for g in gs if g is not d["ref"]]
+        sref = group_series(d["ref"], freq_item)
+        dxs, dys = [], []
+        for g in others:
+            for x, v in group_series(g, freq_item).items():
+                if x in sref:
+                    dxs.append(x)
+                    dys.append(v - sref[x])
+        ch = _scatter("ΔF vs %s（相对 %s）" % (gs[0].x_label, d["ref"].title),
+                      gs[0].x_label, "MHz",
+                      xlim=_nice(min(dxs), max(dxs)) if dxs else None,
+                      ylim=_nice(min(dys), max(dys)) if dys else None)
+        dsers, drow, dr = [], {}, d["first"]
+        xs_all = sorted({x for g in others for x in group_series(g, freq_item)
+                         if x in sref})
+        for k, x in enumerate(xs_all):
+            drow[x] = dr + k
+        for g in others:
+            sg = group_series(g, freq_item)
+            dsers.append({x: sg[x] - sref[x] for x in sg if x in sref})
         _add_series(ch, wb[d["sheet"]], len(d["col_of"]), 2, d["first"], d["last"],
-                    [len(group_series(g, freq_item)) for g in others])
+                    [len(group_series(g, freq_item)) for g in others],
+                    _extreme_labels(dsers, drow, dr))
         grid.add(ch)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     vt_groups = next((gs for k, gs in by_kind if k == "vtune"), [])
