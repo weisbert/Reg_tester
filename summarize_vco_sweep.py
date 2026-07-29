@@ -1335,12 +1335,18 @@ def write_drift(wb, name, groups, ref_g, freq_item, st, layout, xlabel):
         rr = xrow[x]
         b = cref(dt, cref_[id(ref_g)], rr)
         for i, g in enumerate(others):
-            a = cref(dt, cref_[id(g)], rr)
             va, vb = sers[i].get(x), sref.get(x)
+            if va is None or vb is None:
+                # ★ 必须留真空格，不能写一个返回 "" 的公式。
+                #   Excel 的"空值按间断处理"只认真正的空单元格；公式返回的空串
+                #   是有内容的格子，散点图会把它当 0 画进去——常温扫了全部 256 个
+                #   码、高低温只扫 5 个，中间 251 格全成 0，曲线在 5 个测点之间
+                #   来回扎到零，看着像一串尖刺。
+                put(ws, r, 2 + i, None, st, st["f_res"])
+                continue
+            a = cref(dt, cref_[id(g)], rr)
             put(ws, r, 2 + i,
-                emit('=IF(AND(ISNUMBER(%s),ISNUMBER(%s)),%s-%s,"")' % (a, b, a, b),
-                     fmt_num(va - vb) if (va is not None and vb is not None) else None),
-                st, st["f_res"])
+                emit("=%s-%s" % (a, b), fmt_num(va - vb)), st, st["f_res"])
         r += 1
     ws.freeze_panes = "B2"
     return ws, {"sheet": ws.title, "col_of": {id(g): 1 + i for i, g in enumerate(others)},
@@ -1559,7 +1565,7 @@ def write_slope_chart(grid, ws_slope, groups, anchor, title, xlabel, unit,
     grid.add(ch)
 
 
-def write_pn_chart(wb, grid, groups, pn_items, st, op_x=None):
+def write_pn_chart(wb, grid, groups, pn_items, st, src_title, op_x=None):
     """相噪 vs offset：数据另开一小块（行=offset，列=各组的代表点），再挂散点图。
 
     取的是工作点那一点，跟结论页「@ Vtune 0.4V」用的是同一个点——
@@ -1597,7 +1603,10 @@ def write_pn_chart(wb, grid, groups, pn_items, st, op_x=None):
         off = float(m.group(1)) / (1000.0 if m and m.group(2) == "k" else 1.0) if m else None
         put(ws, 3 + i, 1, off, st, st["f_res"])
         for j, (_g, _xm, row) in enumerate(picks):
-            put(ws, 3 + i, 2 + j, fmt_num(row.vals.get(it.col)), st, st["f_res"])
+            v = row.vals.get(it.col)
+            put(ws, 3 + i, 2 + j,
+                emit(vref(cref(src_title, it.col, row.xl)), fmt_num(v))
+                if v is not None else None, st, st["f_res"])
     ws.column_dimensions["A"].width = 12
 
     # 标注同样只给全图最低/最高点，各线各标会在左端叠成一坨
@@ -2061,7 +2070,7 @@ def main():
             xv = [r.vt for r in cg0.rows if r.vt is not None]
             op_x = xv[0] if xv else None
     write_pn_chart(wb, grid, vt_groups or [g for _k, gs in by_kind for g in gs],
-                   pn_items, st, op_x)
+                   pn_items, st, ws.title, op_x)
     if extra:
         write_locked(wb, extra, items, st, tname)
     if args.notes:
