@@ -5,10 +5,12 @@ summarize_pll_sweep.py — 性能扫描簿 → 带汇总页的 Excel
 
 输入：一份仪器/脚本导出的性能扫描宽表（一行 = 一个测试项，列里有条件也有结果）。
 输出：一份新的 .xlsx，**是拿去 review 的成品**——
-    第 1 页    原始数据（原封不动，就是输入那一页）
-    汇总       compliance 表：上半「条件行」说明这组数在什么条件下取的，
-               下半「结果行」一行一个指标 × MIN/TYP/MAX，Spec 与 limit 留空给人填，
-               填完 PASS/FAIL 与超规标红由 Excel 公式+条件格式自动出
+    汇总       **这一页就是结论**。compliance 表：上半「条件行」说明这组数在什么
+               条件下取的，下半「结果行」一行一个指标 × MIN/TYP/MAX，Spec 与
+               limit 留空给人填，填完 PASS/FAIL 与超规标红由公式+条件格式自动出。
+               不另起「结论页」——那只会把同样的判定换个说法复述一遍，
+               看的人反而要问"这两页什么关系"。
+    原始数据   原封不动，就是输入那一页
     温巡过程   按实际测试顺序摊平的全表 + 过程图（重锁点标出来）
     温度明细   指标 × 温度矩阵（按段分列），汇总的数就是对它取 MIN/MAX/MEDIAN
     图表       关键指标的 值-vs-温度 图（每段一条线）
@@ -17,8 +19,10 @@ summarize_pll_sweep.py — 性能扫描簿 → 带汇总页的 Excel
 
 这份簿要回答的问题，以及各页的分工
     一颗锁定的 PLL 走完一整趟温度（中途不重锁，只在端点重锁）：
-      ① 各项性能的全温最坏值满不满足 spec        -> 汇总页（这是它唯一的职责）
-      ② 不重锁跑完全温，还锁着吗、压控走到轨没    -> 温巡过程页 + 图
+      ① 各项性能的全温最坏值满不满足 spec        -> 汇总页
+      ② 不重锁跑完全温，还锁着吗、压控走到轨没    -> 汇总页的 Freq / Vtune 两行
+         （压控余量＝给 Vtune 填 limit=range + Spec 上下轨，判定即余量够不够）
+                                                    ＋ 温巡过程页的图
       ③ 重锁有没有效、复位一致不一致              -> 温巡过程图的重锁点 + 页顶那两句结论
     ★ 「锁在哪、锁了几次」是取数的**条件**，不是被考核的性能：
       它在汇总页里只占一行条件行，重锁点本身不计入性能统计。
@@ -643,8 +647,9 @@ def write_summary(wb, legs, items, meta, st, room_t, dref):
 
     # 汇总页到此为止：给 review 看的东西不掺任何使用说明/告警，
     # 那些进独立的隐藏审计页（见 write_audit）。
-    return {"sheet": ws.title, "judge_col": L(C["judge"]),
-            "first": res_first, "last": res_last, "n_items": len(items)}
+    # 这一页就是这份簿的结论表——条件行说明在什么条件下取的数，
+    # 结果行一行一个指标、填了 Spec 与 limit 就自动判定，不需要另起一页复述。
+    return ws
 
 
 # ---------------------------------------------------------------- 温度明细
@@ -707,191 +712,6 @@ def write_detail(wb, legs, items, st, src_title, room_t):
         r += 1
     ws.freeze_panes = "B1"
     return ws, blocks, temps
-
-
-def write_conclusions(wb, legs, items, meta, st, jinfo, sinfo, room_t, title):
-    """结论页——这份簿唯一回答「所以呢」的一页。
-
-    这套温巡的跑法（锁一次→不重锁跑完全温→只在折返点重锁）只服务一个问题：
-    **一次锁定能不能扛住整个温度范围？扛不住的话余量还剩多少、重锁救不救得回来？**
-    拆成四条能下判断的结论，别的都是支撑数据：
-        C1 不重锁跨全温，PLL 保持锁定吗          <- 输出频率全程有没有变
-        C2 压控余量还剩多少（本测试的核心产出）  <- 从锁定点漂到温度另一端，离轨多远
-        C3 重锁能把工作点复位吗                  <- 三次不同温度重锁后回到哪、差多少
-        C4 各项性能全温满足规格吗                <- 指向汇总页的判定统计
-    页上每个数都是公式（引到温巡过程/汇总/明细），浅黄格子是要人填的判据。
-    """
-    from openpyxl.utils import get_column_letter as L
-
-    ws = wb.create_sheet("结论")
-    widths = [5, 34, 14, 8, 14, 10, 52]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[L(i)].width = w
-    NC = len(widths)
-
-    def band(r, text):
-        put(ws, r, 1, text, st, st["f_group"], bold=True, align="left")
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NC)
-
-    def hdr(r):
-        for c, h in enumerate(["", "项目", "数值", "单位", "判据", "判定", "说明"], 1):
-            put(ws, r, c, h, st, st["f_head"], bold=True, size=9)
-
-    def line(r, name, val, unit, crit=False, judge=None, note=None, indent="",
-             val_input=False):
-        """crit=True / val_input=True 的格子涂成浅黄＝要人填。别的一律不涂，
-        免得满页黄格子分不清哪个真要填。"""
-        put(ws, r, 1, None, st, st["f_res"])
-        put(ws, r, 2, indent + name, st, st["f_res"], align="left")
-        put(ws, r, 3, val, st, st["f_in"] if val_input else st["f_res"], bold=True)
-        put(ws, r, 4, unit, st, st["f_res"], size=9)
-        put(ws, r, 5, None, st, st["f_in"] if crit else st["f_res"])
-        put(ws, r, 6, judge, st, st["f_res"], bold=True)
-        put(ws, r, 7, note, st, st["f_res"], size=9, align="left")
-
-    J = f"'{jinfo['sheet']}'" if jinfo else None
-    j0, j1 = (jinfo["first"], jinfo["last"]) if jinfo else (0, 0)
-    vt, fq = (jinfo or {}).get("vt_item"), (jinfo or {}).get("fq_item")
-    c_vt = L(jinfo["c_vt"]) if jinfo and jinfo.get("c_vt") else None
-    c_lk = L(jinfo["c_lock"]) if jinfo and jinfo.get("c_lock") else None
-    c_df = L(jinfo["c_df"]) if jinfo and jinfo.get("c_df") else None
-
-    put(ws, 1, 1, title, st, st["f_head"], bold=True, size=14, align="left")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NC)
-    temps = sorted({t for lg in legs for t in lg.temps})
-    n_pts = sum(len(leg_series(lg, items[0])) for lg in legs) if items else 0
-    lt = "/".join(str(fmt_num(lg.lock_temp)) for lg in legs if lg.lock_temp is not None)
-    put(ws, 2, 1,
-        f"测试条件：{fmt_num(temps[0])} ~ {fmt_num(temps[-1])}℃ 共 {len(temps)} 个温度点，"
-        f"计入统计 {n_pts} 点；全程只在 {lt}℃ 重锁 "
-        f"{len([l for l in legs if l.lock_temp is not None])} 次，段内不重锁。"
-        if temps else "测试条件：见「汇总」页条件行",
-        st, None, align="left", size=9)
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=NC)
-
-    r = 4
-    # ---------- C1 锁定保持性 ----------
-    band(r, "C1　不重锁跨越整个温度范围，PLL 是否保持锁定")
-    r += 1
-    hdr(r)
-    r += 1
-    if c_df:
-        rng = f"{J}!${c_df}${j0}:${c_df}${j1}"
-        line(r, "输出频率最大漂移 |Δf|max",
-             f'=IF(COUNT({rng})=0,"",MAX(MAX({rng}),-MIN({rng})))', "kHz",
-             True, f'=IF($E{r}="","",IF($C{r}<=$E{r},"PASS","FAIL"))',
-             "判据填允许的频率偏差。频率没变＝环路仍锁在参考上；"
-             "若漂移小于原始记录的最小刻度，说明它小到测不出来")
-        r += 1
-    else:
-        line(r, "（源表没有频率列，无法判定）", None, "")
-        r += 1
-
-    # ---------- C2 压控余量 ----------
-    r += 1
-    band(r, "C2　压控余量还剩多少　★本测试的核心产出")
-    r += 1
-    hdr(r)
-    r += 1
-    if c_vt:
-        vrng = f"{J}!${c_vt}${j0}:${c_vt}${j1}"
-        r_lo, r_hi = r, r + 1
-        line(r, "压控范围　下轨", None, vt.unit, False, None,
-             "↙ 这两格要你填：环路/变容管实际可用的电压范围", val_input=True)
-        r += 1
-        line(r, "压控范围　上轨", None, vt.unit, False, None, "", val_input=True)
-        r += 1
-        r_min, r_max = r, r + 1
-        line(r, f"全温 {vt.label} 最小", f'=IF(COUNT({vrng})=0,"",MIN({vrng}))',
-             vt.unit, False, None, "整趟温巡里的最低点")
-        r += 1
-        line(r, f"全温 {vt.label} 最大", f'=IF(COUNT({vrng})=0,"",MAX({vrng}))',
-             vt.unit, False, None, "整趟温巡里的最高点")
-        r += 1
-        r_req = r + 2
-        line(r, "距下轨余量", f'=IF($C{r_lo}="","",$C{r_min}-$C{r_lo})', vt.unit, False,
-             f'=IF(OR($C{r}="",$E{r_req}=""),"",IF($C{r}>=$E{r_req},"PASS","FAIL"))',
-             "余量 = 最低点 − 下轨")
-        r += 1
-        line(r, "距上轨余量", f'=IF($C{r_hi}="","",$C{r_hi}-$C{r_max})', vt.unit, False,
-             f'=IF(OR($C{r}="",$E{r_req}=""),"",IF($C{r}>=$E{r_req},"PASS","FAIL"))',
-             "余量 = 上轨 − 最高点")
-        r += 1
-        line(r, "最小余量要求", None, vt.unit, True,
-             f'=IF(OR($C{r-2}="",$C{r-1}="",$E{r}=""),"",'
-             f'IF(MIN($C{r-2},$C{r-1})>=$E{r},"PASS","FAIL"))',
-             "↙ 填要求值；两侧余量都够才算过")
-        r += 1
-        # 每段：从锁定点出发，本段最坏漂出去多少。这才是"锁在这个温度、
-        # 跑到另一头会怎样"，也是决定余量够不够的那个量。
-        for lg in (jinfo.get("legs") or []):
-            seg = f"{J}!${c_vt}${lg['first']}:${c_vt}${lg['last']}"
-            if not lg["lock_row"]:
-                continue
-            lk = f"{J}!${c_vt}${lg['lock_row']}"
-            line(r, f"{lg['title']}（{lg['stage']}）锁定点起最大偏离",
-                 f'=IF(COUNT({seg})=0,"",MAX(MAX({seg})-{lk},{lk}-MIN({seg})))',
-                 vt.unit, False, None, None, indent="　")
-            put(ws, r, 7,
-                f'=IFERROR("锁定点 "&TEXT({lk},"0.####")&"　→　本段范围 "'
-                f'&TEXT(MIN({seg}),"0.####")&" ~ "&TEXT(MAX({seg}),"0.####"),"")',
-                st, st["f_res"], size=9, align="left")
-            r += 1
-    else:
-        line(r, "（源表没有压控电压列，无法判定）", None, "")
-        r += 1
-
-    # ---------- C3 重锁复位 ----------
-    r += 1
-    band(r, "C3　重锁能否把工作点复位")
-    r += 1
-    hdr(r)
-    r += 1
-    if c_lk:
-        lrng = f"{J}!${c_lk}${j0}:${c_lk}${j1}"
-        line(r, f"重锁后 {vt.label}（各次中位数）",
-             f'=IF(COUNT({lrng})=0,"",MEDIAN({lrng}))', vt.unit, False,
-             None, "重锁把工作点拉回到这里")
-        r += 1
-        line(r, "各次重锁复位极差",
-             f'=IF(COUNT({lrng})=0,"",MAX({lrng})-MIN({lrng}))', vt.unit, True,
-             f'=IF(OR($C{r}="",$E{r}=""),"",IF($C{r}<=$E{r},"PASS","FAIL"))',
-             "↙ 填允许的复位一致性；越小说明不管在什么温度重锁都回到同一点")
-        r += 1
-        for lg in (jinfo.get("legs") or []):
-            if not lg["lock_row"]:
-                continue
-            line(r, f"在 {fmt_num(lg['lock_temp'])}℃ 重锁后",
-                 f"={J}!${c_lk}${lg['lock_row']}", vt.unit, indent="　")
-            r += 1
-    else:
-        line(r, "（没有重锁点，无法判定）", None, "")
-        r += 1
-
-    # ---------- C4 性能合规 ----------
-    r += 1
-    band(r, "C4　各项性能在全温是否满足规格")
-    r += 1
-    hdr(r)
-    r += 1
-    if sinfo:
-        jr = (f"'{sinfo['sheet']}'!${sinfo['judge_col']}${sinfo['first']}"
-              f":${sinfo['judge_col']}${sinfo['last']}")
-        ir = (f"'{sinfo['sheet']}'!$B${sinfo['first']}:$B${sinfo['last']}")
-        line(r, "性能项总数", f"=COUNTA({ir})", "项", False, None,
-             "明细见「汇总」页；填了 Spec 与 limit 的项才参与判定")
-        r += 1
-        line(r, "已判定", f'=COUNTIF({jr},"PASS")+COUNTIF({jr},"FAIL")', "项")
-        r += 1
-        line(r, "PASS", f'=COUNTIF({jr},"PASS")', "项")
-        r += 1
-        line(r, "FAIL", f'=COUNTIF({jr},"FAIL")', "项", False,
-             f'=IF($C{r-1}+$C{r}=0,"",IF($C{r}=0,"PASS","FAIL"))',
-             "有 FAIL 就去「汇总」页看红格子")
-        r += 1
-
-    ws.sheet_view.showGridLines = False
-    return ws
 
 
 def write_audit(wb, meta, st):
@@ -1054,21 +874,7 @@ def write_journey(wb, legs, items, st, yranges, src_title):
                                 f"全程 |Δf| ≤ {max(dfs)} kHz，记录精度 1 kHz）",
                        "ytitle": "Δf (kHz)", "col": cols["fq"],
                        "bounds": b, "lblskip": lblskip})
-    # 结论页要按段引用这里的格子，把坐标一并交出去
-    lg_rows, i = [], 0
-    for lg in legs:
-        n = len(lg.rows)
-        if n:
-            lg_rows.append({"n": lg.n, "title": lg.title, "stage": lg.stage,
-                            "lock_temp": lg.lock_temp,
-                            "first": r0 + i, "last": r0 + i + n - 1,
-                            "lock_row": r0 + i if lg.lock_temp is not None else None})
-        i += n
     jinfo = {"first": r0, "last": r0 + len(seq) - 1, "c_temp": 4,
-             "sheet": ws.title, "legs": lg_rows,
-             "c_vt": cols.get("vt"), "c_lock": (cols["vt"] + 1) if vt else None,
-             "c_df": cols.get("fq"), "vt_item": vt, "fq_item": fq,
-             "df_max": max(dfs) if dfs else None,
              "charts": charts} if charts else None
     return ws, jinfo
 
@@ -1329,8 +1135,6 @@ def main():
                     help="手工钉死某张图的纵轴，如 \"Vtune_V=0.1:0.8,IPN_SSB=-60:-40\"；"
                          "键还可用 Δf（频率漂移图）/ PN（相噪-offset 图）。"
                          "不给就按数据自动算范围")
-    ap.add_argument("--title", default=None,
-                    help="结论页标题（默认「温度循环测试 · 结论」）")
     ap.add_argument("--no-audit", action="store_true",
                     help="连隐藏的「_审计」页都不要（排除行/告警只留在控制台输出）")
     ap.add_argument("--dry-run", action="store_true", help="只打印识别结果，不写文件")
@@ -1506,10 +1310,8 @@ def main():
                               "last": b["last"], "c_lo": b["c_lo"], "c_hi": b["c_hi"],
                               "room_row": b["room_row"], "n_legs": len(legs)}
             for b in blocks}
-    sinfo = write_summary(wb, legs, items, meta, st, room_t, dref)
+    write_summary(wb, legs, items, meta, st, room_t, dref)
     ws_j, jinfo = write_journey(wb, legs, items, st, yranges, ws.title)
-    write_conclusions(wb, legs, items, meta, st, jinfo, sinfo, room_t,
-                      args.title or "温度循环测试 · 结论")
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     if args.chart_items.strip().lower() == "all":
         chart_items = [it.label for it in items]
@@ -1522,8 +1324,8 @@ def main():
     if not args.no_audit:
         write_audit(wb, meta, st)
 
-    # 按阅读顺序排页：结论在最前，原始数据其次，支撑数据靠后
-    order = ["结论", ws.title, "汇总", "温巡过程", "图表", "相噪-offset",
+    # 按阅读顺序排页：汇总（＝这份簿的结论表）在最前，支撑数据靠后
+    order = ["汇总", ws.title, "温巡过程", "图表", "相噪-offset",
              "温度明细", "_审计"]
     wb._sheets.sort(key=lambda s: order.index(s.title)
                     if s.title in order else len(order))
