@@ -471,7 +471,40 @@ def build_conditions(legs, cols, rows, items, room_t):
     return conds
 
 
-def write_summary(wb, legs, items, meta, st, room_t, dref):
+def build_drift_rows(jinfo):
+    """「相对锁定点偏离」——每段一行，摆成和别的结果行一样的 MIN/TYP/MAX 形状。
+
+    这是这套温巡唯一一个别处算不出来的量：锁定在某个温度之后，一路跑到温度
+    另一端，工作点最多往负/正两个方向各偏出去多少、分别偏在哪个温度。
+    压控余量够不够就看它。
+    MIN = 本段最低点 − 锁定点，MAX = 本段最高点 − 锁定点（所以锁定点自己是 0）。
+    给这几行填 limit=range + Spec 上下限，就是"允许偏离多少"的判定。
+    """
+    from openpyxl.utils import get_column_letter as L
+    if not jinfo or not jinfo.get("c_vt") or not jinfo.get("legs"):
+        return []
+    vt = jinfo["vt_item"]
+    J, cv, ct = f"'{jinfo['sheet']}'", L(jinfo["c_vt"]), L(jinfo["c_temp"])
+    out = []
+    for lg in jinfo["legs"]:
+        f0, f1, k = lg["first"], lg["last"], lg["lock_row"]
+        seg = f"{J}!${cv}${f0}:${cv}${f1}"
+        tmp = f"{J}!${ct}${f0}:${ct}${f1}"
+        lock = f"{J}!${cv}${k}"
+        out.append({
+            "cat": f"{vt.label} 温漂",
+            "item": f"锁@{fmt_num(lg['lock_temp'])}℃ 后 {lg['stage']}",
+            "unit": vt.unit,
+            "m_min": f'=IF(COUNT({seg})=0,"",MIN({seg})-{lock})',
+            "m_max": f'=IF(COUNT({seg})=0,"",MAX({seg})-{lock})',
+            "m_lo_at": f'=IFERROR(INDEX({tmp},MATCH(MIN({seg}),{seg},0)),"")',
+            "m_hi_at": f'=IFERROR(INDEX({tmp},MATCH(MAX({seg}),{seg},0)),"")',
+            "m_typ": None,          # 锁定点自己就是 0，没有"典型值"可言
+        })
+    return out
+
+
+def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
     """compliance 版式的汇总页：上半条件行、下半结果行，轴 = MIN / TYP / MAX。
 
     照 report-forge 的 compliance table 来：
@@ -552,16 +585,12 @@ def write_summary(wb, legs, items, meta, st, room_t, dref):
         r += 1
 
     # ---- 结果行 ----
-    res_first = r
-    fill_in = {"s_min", "s_typ", "s_max", "limit", "sim"}   # 留给人填的格子
+    # 结果行 = 常规指标 + 「相对锁定点偏离」派生行。后者插在压控电压那一行后面，
+    # 因为它就是压控余量的量化。两种行在表里长得一模一样，读的人不用分辨。
+    specs = []
     for it in items:
-        for i, (k, _l, _w) in enumerate(plan):
-            put(ws, r, i + 1, None, st,
-                st["f_sep"] if k == "sep" else
-                st["f_in"] if k in fill_in else st["f_res"])
-        put(ws, r, C["item"], it.label, st, st["f_res"], align="left")
-        put(ws, r, C["unit"], it.unit, st, st["f_res"])
         b = dref.get(it.label)
+        s = {"cat": it.cat, "item": it.label, "unit": it.unit}
         if b:
             D, f0, f1 = b["sheet"], b["first"], b["last"]
             lo = f"{D}!${L(b['c_lo'])}${f0}:${L(b['c_lo'])}${f1}"
@@ -569,21 +598,36 @@ def write_summary(wb, legs, items, meta, st, room_t, dref):
             tcol = f"{D}!$A${f0}:$A${f1}"
             # 全部带护栏：一个数字都没有时给空白, 而不是 MIN 返回 0、
             # MATCH 再找不到 0 而甩出 #N/A。报告里不该出现错误值。
-            put(ws, r, C["m_min"], f'=IF(COUNT({lo})=0,"",MIN({lo}))', st, st["f_res"])
-            put(ws, r, C["m_lo_at"],
-                f'=IFERROR(INDEX({tcol},MATCH(MIN({lo}),{lo},0)),"")',
-                st, st["f_res"], size=9)
-            put(ws, r, C["m_max"], f'=IF(COUNT({hi})=0,"",MAX({hi}))', st, st["f_res"])
-            put(ws, r, C["m_hi_at"],
-                f'=IFERROR(INDEX({tcol},MATCH(MAX({hi}),{hi},0)),"")',
-                st, st["f_res"], size=9)
-            put(ws, r, C["m_d"],
-                f'=IF(OR({L(C["m_min"])}{r}="",{L(C["m_max"])}{r}=""),"",'
-                f'{L(C["m_max"])}{r}-{L(C["m_min"])}{r})', st, st["f_res"])
+            s["m_min"] = f'=IF(COUNT({lo})=0,"",MIN({lo}))'
+            s["m_lo_at"] = f'=IFERROR(INDEX({tcol},MATCH(MIN({lo}),{lo},0)),"")'
+            s["m_max"] = f'=IF(COUNT({hi})=0,"",MAX({hi}))'
+            s["m_hi_at"] = f'=IFERROR(INDEX({tcol},MATCH(MAX({hi}),{hi},0)),"")'
             if b["room_row"]:
                 rr = f"{D}!${L(2)}${b['room_row']}:${L(1 + b['n_legs'])}${b['room_row']}"
-                put(ws, r, C["m_typ"], f"=IF(COUNT({rr})=0,\"\",MEDIAN({rr}))",
-                    st, st["f_res"])
+                s["m_typ"] = f'=IF(COUNT({rr})=0,"",MEDIAN({rr}))'
+        specs.append(s)
+    drift = build_drift_rows(jinfo)
+    if drift:
+        vt_label = jinfo["vt_item"].label
+        at = next((i for i, s in enumerate(specs) if s["item"] == vt_label), len(specs) - 1)
+        specs[at + 1:at + 1] = drift
+
+    res_first = r
+    fill_in = {"s_min", "s_typ", "s_max", "limit", "sim"}   # 留给人填的格子
+    for sp in specs:
+        for i, (k, _l, _w) in enumerate(plan):
+            put(ws, r, i + 1, None, st,
+                st["f_sep"] if k == "sep" else
+                st["f_in"] if k in fill_in else st["f_res"])
+        put(ws, r, C["item"], sp["item"], st, st["f_res"], align="left")
+        put(ws, r, C["unit"], sp["unit"], st, st["f_res"])
+        for key in ("m_min", "m_lo_at", "m_typ", "m_max", "m_hi_at"):
+            if sp.get(key):
+                put(ws, r, C[key], sp[key], st, st["f_res"],
+                    size=9 if key.endswith("_at") else 10)
+        put(ws, r, C["m_d"],
+            f'=IF(OR({L(C["m_min"])}{r}="",{L(C["m_max"])}{r}=""),"",'
+            f'{L(C["m_max"])}{r}-{L(C["m_min"])}{r})', st, st["f_res"])
         mn, mx = f"{L(C['m_min'])}{r}", f"{L(C['m_max'])}{r}"
         sn, sx, lim = f"${L(C['s_min'])}{r}", f"${L(C['s_max'])}{r}", f"${L(C['limit'])}{r}"
         # 实测为空时不判（Excel 里 ""<=数字 会算成 FALSE，不挡住会误判成 FAIL）
@@ -608,9 +652,9 @@ def write_summary(wb, legs, items, meta, st, room_t, dref):
                 ws.merge_cells(start_row=i, start_column=1, end_row=j, end_column=1)
             i = j + 1
     merge_cat(cond_first, res_first - 1, lambda rr: meta["conditions"][rr - cond_first][0])
-    for n, it in enumerate(items):
-        put(ws, res_first + n, C["cat"], it.cat, st, st["f_res"], bold=True)
-    merge_cat(res_first, res_last, lambda rr: items[rr - res_first].cat)
+    for n, sp in enumerate(specs):
+        put(ws, res_first + n, C["cat"], sp["cat"], st, st["f_res"], bold=True)
+    merge_cat(res_first, res_last, lambda rr: specs[rr - res_first]["cat"])
 
     # limit 下拉，省得手打错
     dv = DataValidation(type="list", formula1='"le,ge,range"', allow_blank=True)
@@ -874,8 +918,18 @@ def write_journey(wb, legs, items, st, yranges, src_title):
                                 f"全程 |Δf| ≤ {max(dfs)} kHz，记录精度 1 kHz）",
                        "ytitle": "Δf (kHz)", "col": cols["fq"],
                        "bounds": b, "lblskip": lblskip})
+    # 汇总页的「相对锁定点偏离」那几行要按段引用这里的格子，把坐标交出去
+    lg_rows, i = [], 0
+    for lg in legs:
+        n = len(lg.rows)
+        if n and lg.lock_temp is not None:
+            lg_rows.append({"title": lg.title, "stage": lg.stage,
+                            "lock_temp": lg.lock_temp, "first": r0 + i,
+                            "last": r0 + i + n - 1, "lock_row": r0 + i})
+        i += n
     jinfo = {"first": r0, "last": r0 + len(seq) - 1, "c_temp": 4,
-             "charts": charts} if charts else None
+             "sheet": ws.title, "legs": lg_rows, "c_vt": cols.get("vt"),
+             "vt_item": vt, "charts": charts} if charts else None
     return ws, jinfo
 
 
@@ -1310,8 +1364,9 @@ def main():
                               "last": b["last"], "c_lo": b["c_lo"], "c_hi": b["c_hi"],
                               "room_row": b["room_row"], "n_legs": len(legs)}
             for b in blocks}
-    write_summary(wb, legs, items, meta, st, room_t, dref)
+    # 温巡过程要先建：汇总页的「相对锁定点偏离」几行按段引用它的格子
     ws_j, jinfo = write_journey(wb, legs, items, st, yranges, ws.title)
+    write_summary(wb, legs, items, meta, st, room_t, dref, jinfo)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     if args.chart_items.strip().lower() == "all":
         chart_items = [it.label for it in items]
