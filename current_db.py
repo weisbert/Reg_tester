@@ -80,6 +80,9 @@ DEFAULT_CONFIG = {
         "sim_label_ids": "仿真表里 Module 无数字前缀的合计/标签行 名->指派编号；留空则从 901 起按名排序自动指派（实测侧用 label_groups 把非数字标签指到该编号）",
         "sim_stage": "主对比列取哪个仿真阶段：post(后仿，默认) 或 pre(前仿)；若某阶段整片为 0，inspect 的零值审计会指出来",
         "sim_stage_fallback": "主阶段(sim_stage)某模块为 0/缺失时，是否改用另一阶段的值补上(逐模块判断，两边都是 0 则保持 0)；补过的格子在报告里标出",
+        "sim_zero_ua": "判「这一格等于没有」的阈值 µA（默认 1）：后仿漏接的模块未必是干净的 0，"
+                       "见过 0.006µA 这种数值残渣——真实模块电流都在几十~几百 µA，"
+                       "≤阈值一律当缺项处理（触发跨阶段补值 + inspect 零值审计）",
         "sim_tier": "参与对比的仿真电流档位（如 Tier2，与实测一致）；空=不过滤（多档共存会重复求和！）",
         "sim_temp_note": "仿真数据的温度/corner 标注，只用于表头展示（如 55C/TT/0.9V）",
         "delta_flag_pct": "汇总簿标红：|偏差%| 超过该值才可能标红（默认 20）",
@@ -103,6 +106,7 @@ DEFAULT_CONFIG = {
     "sim_label_ids": {},
     "sim_stage": "post",
     "sim_stage_fallback": True,
+    "sim_zero_ua": 1.0,
     "sim_tier": "Tier2",
     "sim_temp_note": "55C",
     "delta_flag_pct": 20,
@@ -887,7 +891,7 @@ def _inject_cached_values(xlsx_path, cache_by_sheet):
     os.replace(tmp, xlsx_path)
 
 
-def sim_lookup(conn, mode, ids, stage, tier="", fallback_stage=None):
+def sim_lookup(conn, mode, ids, stage, tier="", fallback_stage=None, zero_ua=0.0):
     """返回 (合计uA, 缺失ID列表, trim集合, tier集合, 用回退阶段取值的ID列表)。
     tier 非空时只取该档位；该档位没有但有无档位('')的旧数据时退回旧数据（兼容旧仿真表）。
     ids 含 "*" = 该 Mode 全部模块合计（跨模式 label_groups 用）。
@@ -895,7 +899,12 @@ def sim_lookup(conn, mode, ids, stage, tier="", fallback_stage=None):
     fallback_stage：主阶段（通常 post=后仿）某模块为 0 或无行时，改用该阶段（pre=前仿）
     的值。**逐模块判断**——一个组里只补后仿为 0 的那几个成员，其余仍用后仿。
     用户侧前提：前仿已做 back annotate，多数情况下前仿≈后仿，两者可比。
-    补过的 ID 会返回给调用方，报告里要标出来（口径可追溯）。"""
+    补过的 ID 会返回给调用方，报告里要标出来（口径可追溯）。
+
+    zero_ua（config.sim_zero_ua）：**后仿漏接的模块不一定是干净的 0**——真簿里见过千分之几
+    µA 的数值残渣（同模块前仿是三位数 µA）。判据写成 `== 0` 时这种残渣非零，于是它被当真值
+    用进对比，一组模块的仿真合计凭空少掉一个模块，偏差% 直接假到几十个百分点。
+    改成 `<= zero_ua` 才当缺项；回退阶段的值也要超过阈值才算「有值」。"""
     def rows_of(where, params):
         if tier:
             rows = conn.execute(f"SELECT current_ua,trim,tier FROM sim_current WHERE {where}"
@@ -910,13 +919,17 @@ def sim_lookup(conn, mode, ids, stage, tier="", fallback_stage=None):
     def total_of(rows):
         return sum(r[0] for r in rows)
 
+    def is_zero(rows):
+        """空 / 合计小到等于没有（阈值 zero_ua）"""
+        return not rows or abs(total_of(rows)) <= zero_ua
+
     total, missing, trims, tiers, fell_back = 0.0, [], set(), set(), []
     found_any = False
     if ids and any(str(x) == "*" for x in ids):
         rows = rows_of("mode=? AND stage=?", (mode, stage))
-        if (not rows or not total_of(rows)) and fallback_stage:
+        if is_zero(rows) and fallback_stage:
             alt = rows_of("mode=? AND stage=?", (mode, fallback_stage))
-            if alt and total_of(alt):
+            if not is_zero(alt):
                 rows, _ = alt, fell_back.append("*")
         if not rows:
             return None, ["*"], set(), set(), []
@@ -925,12 +938,12 @@ def sim_lookup(conn, mode, ids, stage, tier="", fallback_stage=None):
         buckets = []
         for mid in ids:
             rows = rows_of("mode=? AND module_id=? AND stage=?", (mode, mid, stage))
-            # 后仿该模块为 0（或整个没有行）时用前仿补——前仿有非零值才补，
+            # 后仿该模块为 0/残渣（或整个没有行）时用前仿补——前仿有真值才补，
             # 否则保持 0/缺失（"两边都是 0"是真结论，不该被掩盖）
-            if (not rows or not total_of(rows)) and fallback_stage:
+            if is_zero(rows) and fallback_stage:
                 alt = rows_of("mode=? AND module_id=? AND stage=?",
                               (mode, mid, fallback_stage))
-                if alt and total_of(alt):
+                if not is_zero(alt):
                     rows = alt
                     fell_back.append(mid)
             if not rows:
@@ -983,6 +996,7 @@ def latest_runs(conn, all_runs=False):
 def export_xlsx(conn, out_path, all_runs=False, config=None):
     tier = (config or {}).get("sim_tier") or ""
     fb_stage = bool((config or {}).get("sim_stage_fallback", True))
+    zero_ua = float((config or {}).get("sim_zero_ua") or 0)
     runs = latest_runs(conn, all_runs)
 
     wb = openpyxl.Workbook()
@@ -1042,9 +1056,9 @@ def export_xlsx(conn, out_path, all_runs=False, config=None):
             if sim_ids and lk_mode in sim_modes:
                 sim_pre, miss_pre, t1, r1, _fb1 = sim_lookup(conn, lk_mode, sim_ids, "pre", tier)
                 sim_post, miss_post, t2, r2, fb2 = sim_lookup(
-                    conn, lk_mode, sim_ids, "post", tier, fb_stage and "pre")
+                    conn, lk_mode, sim_ids, "post", tier, fb_stage and "pre", zero_ua)
                 if fb2:
-                    notes.append(f"仿真 {','.join(str(x) for x in fb2)} 后仿为0，用前仿补")
+                    notes.append(f"仿真 {','.join(str(x) for x in fb2)} 后仿为0/漏项，用前仿补")
                 trims, tiers = t1 | t2, r1 | r2
                 miss = sorted(set(miss_pre) & set(miss_post))
                 if miss:
@@ -1164,6 +1178,8 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False):
     tier = config.get("sim_tier") or ""
     stage_main = (config.get("sim_stage") or "post").strip().lower()
     fb_stage = bool(config.get("sim_stage_fallback", True))
+    zero_ua = float(config.get("sim_zero_ua") or 0)
+    other_stage = "pre" if stage_main == "post" else "post"
     sim_note = config.get("sim_temp_note") or ""
     thr = float(config.get("delta_flag_pct") or 20) / 100.0
     abs_thr = float(config.get("delta_flag_abs_ua") or 0)   # 双阈值绝对下限 µA
@@ -1269,10 +1285,10 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False):
             if ids and lk_mode in sim_modes:
                 # 主对比列取哪个阶段由 config.sim_stage 定（默认 post=后仿）；另一个阶段
                 # 仍算出来放明细页。两者差别很大时(某阶段整片为 0)靠 inspect 的零值审计发现。
-                other = "pre" if stage_main == "post" else "post"
                 sim_val[(key, mode)], _, _, _, fb = sim_lookup(
-                    conn, lk_mode, ids, stage_main, tier, fb_stage and other)
-                sim_pre_val[(key, mode)], _, _, _, _ = sim_lookup(conn, lk_mode, ids, other, tier)
+                    conn, lk_mode, ids, stage_main, tier, fb_stage and other_stage, zero_ua)
+                sim_pre_val[(key, mode)], _, _, _, _ = sim_lookup(
+                    conn, lk_mode, ids, other_stage, tier)
                 if fb:
                     sim_fb[(key, mode)] = fb
     # 标签行（DCO 等）排在末尾——Σ 分两段：LO 模块（可与仿真对）/ 总合计（含标签行，只有实测）
@@ -1299,7 +1315,7 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False):
         f"源文件 {', '.join(sorted(src_files))}",
         f"仿真：档位 {tier or '未过滤'} / {stage_main}-sim"
         f"（{'pre' if stage_main == 'post' else 'post'}-sim 在「对比明细」页）/ 温度 {sim_note or '未标注'}",
-        ((f"  仿真取值：优先 {stage_main}-sim；个别模块该阶段为 0/缺项时取"
+        ((f"  仿真取值：优先 {stage_main}-sim；个别模块该阶段为 0/缺项（≤{zero_ua:g}µA 计作缺项）时取"
           f"{'pre' if stage_main == 'post' else 'post'}-sim（前仿已做 back annotate，两者可比），"
           f"逐模块判断，两阶段都为 0 则留空。本簿共 {len(sim_fb)} 处，逐项见「对比明细」页备注列。")
          if (fb_stage and sim_fb) else
@@ -1644,11 +1660,19 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False):
                 fcell(ws, rr, 9, f'=IF(H{rr}="","",F{rr}-H{rr})',
                       rnd(diff, 1) if diff is not None else None, fmt=FMT_UA)
                 dv = dev_of(mv, sv)
-                fcell(ws, rr, 10, f'=IF(H{rr}="","",(F{rr}-H{rr})/H{rr})',
+                # 仿真两阶段都是真 0 时 H 列写的就是 0（不是空）——不加 =0 这道闸，
+                # 这一格在 Excel 里是 #DIV/0!，出现在给人 review 的簿子上
+                fcell(ws, rr, 10, f'=IF(OR(H{rr}="",H{rr}=0),"",(F{rr}-H{rr})/H{rr})',
                       rnd(dv, 4) if dv is not None else None, fmt=FMT_PCT)
                 if flag_red(dv, mv, sv, key):   # 双阈值 + 口径守卫，同总览
                     ws.cell(row=rr, column=10).font = red_font
-                _cell(ws, rr, 11, "；".join(sorted(notes.get(key, ()))), align="left")
+                # 说明页承诺"跨阶段补值逐项见本页备注列"——这里就是那一项，缺了说明页就是假话
+                row_notes = sorted(notes.get(key, ()))
+                fb_ids = sim_fb.get((key, mode))
+                if fb_ids:
+                    row_notes.append(f"仿真 {','.join(str(x) for x in fb_ids)} "
+                                     f"{stage_main} 为 0/缺项，取{other_stage}")
+                _cell(ws, rr, 11, "；".join(row_notes), align="left")
                 rr += 1
     if rr > 2:
         ws.auto_filter.ref = f"A1:K{rr - 1}"
@@ -1846,11 +1870,16 @@ def cmd_inspect(args):
     config, cfg_path, _ = load_config(root, args.config, create=False)
     tier = config.get("sim_tier") or ""
     stage_main = (config.get("sim_stage") or "post").strip().lower()
+    zero_ua = float(config.get("sim_zero_ua") or 0)
+    fb_stage = bool(config.get("sim_stage_fallback", True))
+    stage_alt = "pre" if stage_main == "post" else "post"
     print(f"根目录: {root}")
     print(f"配置:   {cfg_path}"
           f"{'' if os.path.exists(cfg_path) else '   ← 不存在，本次用内置默认值（build 时才会生成）'}")
     print(f"        sim_tier={tier or '(不过滤——多档共存会重复求和!)'}  sim_stage={stage_main}  "
           f"sim_sheet={config.get('sim_sheet')!r}  result_glob={config.get('result_glob')!r}")
+    print(f"        sim_zero_ua={zero_ua:g}µA（≤此值计作缺项）  "
+          f"sim_stage_fallback={'开 -> 缺项取 ' + stage_alt if fb_stage else '关 -> 缺项保持空'}")
 
     problems = []
 
@@ -1963,8 +1992,13 @@ def cmd_inspect(args):
     all_tiers = sorted(t for t in info["tiers"]) if info else []
     all_stages = sorted(s for s in info["stages"]) if info else []
 
+    def cell_is_zero(v):
+        """≤ sim_zero_ua 一律算「等于没有」——与 sim_lookup.is_zero 同一条判据。
+        两边判据必须一致，否则 inspect 说没事、build 却补了值（或反过来）。"""
+        return v is None or abs(v) <= zero_ua
+
     def zero_audit(mode, mid):
-        """返回 (报告用格子的值, [其他非零格子描述])。"""
+        """返回 (报告用格子的值, [其他有值格子描述])。"""
         target = sim_cell.get((mode, mid, tier, stage_main))
         others = []
         for t in all_tiers:
@@ -1972,7 +2006,7 @@ def cmd_inspect(args):
                 if (t, st) == (tier, stage_main):
                     continue
                 v = sim_cell.get((mode, mid, t, st))
-                if v:
+                if not cell_is_zero(v):
                     others.append(f"{t}/{st}={v:.1f}")
         return target, others
 
@@ -2041,25 +2075,37 @@ def cmd_inspect(args):
                       f"仿真表缺 {len(miss)} 个" + (f": {_ranges(miss)}" if miss else ""))
                 if miss:
                     problems.append(f"{mode}: {len(miss)}/{len(ids_used)} 个 NO. 编号仿真表里没有")
-                # 零值审计：报告只用 post×sim_tier 一格，为 0 时把其他 7 格摊开
+                # 零值审计：报告只用 post×sim_tier 一格，为 0/残渣 时把其他 7 格摊开
                 zeros = [(i, zero_audit(mode, i)) for i in ids_used
-                         if not sim_cell.get((mode, i, tier, stage_main))]
+                         if cell_is_zero(sim_cell.get((mode, i, tier, stage_main)))]
                 if zeros:
                     n_elsewhere = sum(1 for _i, (_v, o) in zeros if o)
-                    print(f"        ⚠ 仿真为 0/空的编号 {len(zeros)}/{len(ids_used)} 个"
+                    # 同档位另一阶段有值 = 跨阶段补值正好覆盖的情形，与"值在别的 Tier 上"分开报，
+                    # 否则已被 config 自动处理的事也进问题清单，把真问题淹了
+                    covered = [i for i, (_v, o) in zeros
+                               if fb_stage and not cell_is_zero(
+                                   sim_cell.get((mode, i, tier, stage_alt)))]
+                    print(f"        ⚠ 仿真为 0/缺项的编号 {len(zeros)}/{len(ids_used)} 个"
                           f"（报告取 {tier or '不限'}×{stage_main} 这一格）:")
-                    for i, (_v, others) in zeros:
+                    for i, (v, others) in zeros:
+                        residue = "" if not v else f"={v:g}(≤{zero_ua:g}µA 计作缺项)"
+                        tag = "  ✔ 同档位另一阶段有值，将自动补" if i in covered else ""
                         if others:
-                            print(f"            编号 {i:<4} 本格=0，但别的档位有值: {' '.join(others)}")
+                            print(f"            编号 {i:<4} 本格{residue or '=0'}，"
+                                  f"但别的档位有值: {' '.join(others)}{tag}")
                         else:
                             print(f"            编号 {i:<4} 全 8 个档位×阶段皆为 0/无值"
                                   f" -> 簿里认为该模块在此模式不工作")
-                    if n_elsewhere:
-                        problems.append(f"{mode}: {n_elsewhere} 个编号在 {tier}×{stage_main} 为 0 但"
-                                        f"别的 Tier/stage 有值 -> 可能取错档位")
-                    else:
-                        problems.append(f"{mode}: {len(zeros)} 个编号仿真全档位皆 0，"
+                    n_open = n_elsewhere - len(covered)
+                    if n_open > 0:
+                        problems.append(f"{mode}: {n_open} 个编号在 {tier}×{stage_main} 为 0/缺项，"
+                                        f"{stage_alt} 也没有、但别的 Tier 有值 -> 可能取错档位")
+                    if n_elsewhere < len(zeros):
+                        problems.append(f"{mode}: {len(zeros) - n_elsewhere} 个编号仿真全档位皆 0，"
                                         f"而实测有值 -> Σ 仿真与偏差% 不可信")
+                    if covered:
+                        print(f"            （其中 {len(covered)} 个由 sim_stage_fallback 用 "
+                              f"{stage_alt} 补上，不算问题）")
             if labels:
                 print(f"        非数字标签 {len(labels)} 个: {', '.join(labels[:8])}"
                       + (" …" if len(labels) > 8 else ""))
