@@ -41,7 +41,7 @@ import re
 import sys
 
 from sweep_lib import (
-    COLOR_FLAG, COLOR_PASS, FILL_FAIL, FILL_PASS,
+    COLOR_FLAG, COLOR_MUTED, COLOR_PASS, FILL_FAIL, FILL_PASS,
     LEG_STYLE, apply_y, as_text, axis_bounds, blank_policy,
     fmt_num, leg_series, legend_bottom, load_sweep, median, nice_step, num, put,
     stats_all, styles, style_series, txt,
@@ -223,18 +223,18 @@ def val_at(view, t):
     return median(vs) if vs else None
 
 
-def max_label(view, nd):
-    """(全温最大值, 它出现在哪) —— **并列要说出来**。
+def extreme_label(view, nd, which="max"):
+    """(全温极值, 它出现在哪) —— **并列要说出来**。
 
-    ★ 频率这类量记录精度只有 1 kHz，最大值经常在七八个温度上并列。
+    ★ 频率这类量记录精度只有 1 kHz，极值经常在七八个温度上并列。
       只报其中一个温度，评审会读成"最坏就发生在 85℃"，那是个不存在的结论。
       并列按**显示精度**判（表里看到的是取整后的数，标签得跟它对得上）。
     """
     if not view:
         return None, None
-    mx = max(v for vs in view.values() for v in vs)
-    disp = fmt_num(mx, nd)
-    hit = sorted(t for t, vs in view.items() if fmt_num(max(vs), nd) == disp)
+    agg = max if which == "max" else min
+    disp = fmt_num(agg(v for vs in view.values() for v in vs), nd)
+    hit = sorted(t for t, vs in view.items() if fmt_num(agg(vs), nd) == disp)
     if not hit:
         return disp, None
     if len(hit) == 1:
@@ -262,11 +262,14 @@ C_SPEC, C_GAP1 = 4, 7
 C_SIM, C_GAP2 = 8, 11
 C_SUM, C_JUDGE, C_GAP3 = 12, 15, 16
 C_CHIP0 = 17           # 第一颗芯片的第一列
-# ★ 每颗芯片 5 列：三个代表温度点 + 全温 MAX + MAX 出现在哪个温度。
+# ★ 每颗芯片 7 列：三个代表温度点 + 全温 MIN/MAX 各配一列"出现在哪个温度"。
 #   为什么不是 Min/Typ/Max：那三个数看不出"在哪一头坏"，而三个代表温度点
-#   （常温 / 最低 / 最高）本身就把趋势说清楚了，再给全温 MAX 收口。
-CHIP_AX = 5
+#   （常温 / 最低 / 最高）本身就把趋势说清楚了，再给全温极值收口。
+#   极值列各带 @℃ ——并列时那一列会写"等 N 处"，见 extreme_label()。
+CHIP_AX = 7
 CHIP_W = CHIP_AX + 1   # +1 = 组间间隔列
+# 芯片组里哪几列是数字（要套数字格式）：三个温度 + MIN + MAX
+CHIP_NUMCOL = (0, 1, 2, 3, 5)
 
 AXES = ["Min", "Typ", "Max"]
 
@@ -291,9 +294,50 @@ def note_col(n_chips):
     return chip_col(n_chips)
 
 
+def rail_cols(n_chips):
+    """组与组之间的"竖栏"列号。填成中灰＝把每一片界定成一个视觉区域。
+
+    ★ 40 列宽的表里最先丢的信息是"我现在看的是哪一颗芯片"。
+      一条实心竖栏比给整块上底色更省视觉预算（Gestalt 的 common region），
+      而且灰度打印下照样成立。
+    """
+    return [C_GAP1, C_GAP2, C_GAP3] + [chip_col(k) + CHIP_AX for k in range(n_chips)]
+
+
+def _edges(ws, r0, r1, c_first, c_last):
+    """给一个列组的左右两侧加中等粗细竖边框。
+
+    ★ 汇总组是全表唯一要"跳出来"的（判定就是对着它做的）。只靠底色不够：
+      灰度打印和色弱下几种浅色会撞，边框不会。
+    """
+    from openpyxl.styles import Border, Side
+    th, md = Side(style="thin", color="FF000000"), Side(style="medium", color="FF000000")
+    for r in range(r0, r1 + 1):
+        for c, which in ((c_first, "l"), (c_last, "r")):
+            b = ws.cell(r, c).border
+            ws.cell(r, c).border = Border(left=md if which == "l" else (b.left or th),
+                                          right=md if which == "r" else (b.right or th),
+                                          top=b.top, bottom=b.bottom)
+
+
+def _hguide(ws, r, c0, c1):
+    """一条横向导引线（中等粗细的下边框）。
+
+    ★ 人一眼能数清的上限是 4 个（subitizing）。SpotPN 有连续 8 行，
+      在 40 列宽的表上横着扫很容易串行。每 4 行给一条横线，不上底色——
+      竖向已经分区了，再加行斑马就成了网格噪声。
+    """
+    from openpyxl.styles import Border, Side
+    md = Side(style="medium", color="FF000000")
+    for c in range(c0, c1 + 1):
+        b = ws.cell(r, c).border
+        ws.cell(r, c).border = Border(left=b.left, right=b.right, top=b.top, bottom=md)
+
+
 def _chip_axes(tlabels):
-    """芯片组的 5 个轴名：三个代表温度点 + 全温 MAX + MAX 出现的温度。"""
-    return [(t or "—") for t in tlabels] + ["MAX\n(全温)", "MAX\n@℃"]
+    """芯片组的 7 个轴名：三个代表温度点 + 全温 MIN/MAX 各配一个 @℃。"""
+    return [(t or "—") for t in tlabels] + ["MIN\n(全温)", "MIN\n@℃",
+                                            "MAX\n(全温)", "MAX\n@℃"]
 
 
 def _header(ws, r0, chips, st, title, n_chips, tlabels):
@@ -325,12 +369,11 @@ def _header(ws, r0, chips, st, title, n_chips, tlabels):
         fill = st["f_in"] if col in (C_SPEC, C_SIM) else st["f_head"]
         for j, lb in enumerate(axes):
             put(ws, ar, col + j, lb, st, fill, bold=True, size=9)
-    for col in (C_GAP1, C_GAP2, C_GAP3):
+    # 竖栏只画在两行表头上——r0 是横跨整表的大标题，已经 merge 过，
+    # 往合并区里写会抛 MergedCell read-only
+    for col in rail_cols(n_chips):
         for r in (hr, ar):
-            put(ws, r, col, None, st, st["f_head"])
-    for n in range(n_chips):
-        for r in (hr, ar):
-            put(ws, r, chip_col(n) + CHIP_AX, None, st, st["f_head"])
+            put(ws, r, col, None, st, st["f_rail"])
     put(ws, hr, last, "备注", st, st["f_head"], bold=True)
     put(ws, ar, last, None, st, st["f_head"])
     ws.merge_cells(start_row=hr, start_column=last, end_row=ar, end_column=last)
@@ -341,9 +384,9 @@ def _header(ws, r0, chips, st, title, n_chips, tlabels):
 def _caption(ws, r, st, n_chips):
     """口径说明：这几个数是怎么取的。评审第一句必问，写在表头下面最省事。"""
     txt_ = ("每颗芯片：三个温度列＝该温度**全部经过点**的中位数（整趟温巡会多次经过同一温度）；"
-            "MAX＝全温最大值，右边一列给出它出现在哪个温度。都不含重锁瞬间的读数。　"
-            "汇总列：Max 取各片 MAX 的最大、Typ 取各片常温值的中位数、"
-            "Min 取各片全温最小（这一头各片列里没显示，只在这里给）。　"
+            "MIN / MAX＝全温极值，各配一列给出它出现在哪个温度（多个温度并列时写「等 N 处」）。"
+            "都不含重锁瞬间的读数。　"
+            "汇总列：Min 取各片 MIN 的最小、Max 取各片 MAX 的最大、Typ 取各片常温值的中位数。　"
             "判定只看 Spec 的 Min / Max 两头；Typ 与仿真列只作对照。")
     c = put(ws, r, C_ITEM, txt_, st, st["f_group"], align="left", size=9)
     ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r,
@@ -367,8 +410,10 @@ def _cond_rows(ws, r, chips, data, st, n_chips):
         put(ws, r, C_ITEM, label, st, st["f_group"], align="left")
         for c in (C_UNIT, C_LIMIT, C_JUDGE):
             put(ws, r, c, None, st, st["f_group"])
-        for c in list(range(C_SPEC, C_GAP2 + 1)) + list(range(C_SUM, C_GAP3 + 1)):
+        for c in list(range(C_SPEC, C_SUM + 3)) + [C_JUDGE]:
             put(ws, r, c, None, st, st["f_group"])
+        for c in rail_cols(n_chips):
+            put(ws, r, c, None, st, st["f_rail"])
         for n, chip in enumerate(chips):
             sw = data.get(chip)
             v = fn(sw) if sw is not None else "未测"
@@ -378,7 +423,6 @@ def _cond_rows(ws, r, chips, data, st, n_chips):
                 put(ws, r, c0 + j, None, st, st["f_group"])
             ws.merge_cells(start_row=r, start_column=c0, end_row=r,
                            end_column=c0 + CHIP_AX - 1)
-            put(ws, r, c0 + CHIP_AX, None, st, st["f_group"])
         put(ws, r, note_col(n_chips), None, st, st["f_group"])
         r += 1
 
@@ -431,8 +475,8 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
     for j in range(3):
         put(ws, r, C_SPEC + j, None, st, st["f_in"])
         put(ws, r, C_SIM + j, None, st, st["f_in"])
-    for c in (C_GAP1, C_GAP2, C_GAP3):
-        put(ws, r, c, None, st, st["f_res"])
+    for c in rail_cols(len(chips)):
+        put(ws, r, c, None, st, st["f_rail"])
 
     mins, typs, maxs, marks = [], [], [], []
     for n, chip in enumerate(chips):
@@ -445,21 +489,27 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
             # 同一个温度（四段各走一遍），取中位比随便挑一次稳。
             view = temp_view(sw, sw.item(label))
             vals = [fmt_num(val_at(view, t), nd) for t in tpick]
-            mx, at = max_label(view, nd)
-            vals += [mx, at]
+            vals += list(extreme_label(view, nd, "min"))
+            vals += list(extreme_label(view, nd, "max"))
             # ★ 汇总列从**各片显示出来的值**再聚合（先按显示精度取整再聚合）。
             #   满精度聚合更"准"，但会出现「表里那两格取一下 ≠ 汇总那格」的
             #   末位差 0.01，评审一眼看见就得解释。报表宁可自洽。
-            maxs.append(vals[3])
+            mins.append(vals[3])
+            maxs.append(vals[5])
             if vals[0] is not None:
                 typs.append(vals[0])          # tpick[0] 是常温
-            mins.append(fmt_num(s["min"], nd))
             marks.append((chip, s))
         for j, v in enumerate(vals):
-            cell = put(ws, r, c0 + j, v, st, st["f_res"])
-            if v is not None and j < CHIP_AX - 1:
+            # 前 3 列（温度）白底、后 4 列（极值）浅灰底 —— 7 列切成 3+4，
+            # 两边都在"一眼能数清"的 4 个以内（见 _hguide 的说明）。
+            num_col = j in CHIP_NUMCOL
+            cell = put(ws, r, c0 + j, v, st,
+                       st["f_res"] if j < 3 else st["f_zone"],
+                       align="right" if num_col else "center",
+                       size=10 if num_col else 9,
+                       color=None if num_col else COLOR_MUTED)
+            if v is not None and num_col:
                 cell.number_format = "0." + "0" * nd
-        put(ws, r, c0 + CHIP_AX, None, st, st["f_res"])
 
     # Max 就是某一片 MAX 列里的那个值（原样搬过来，对得上账）；
     # Typ 是各片常温值的中位数，**偶数片时不再取整**——两片的中位落在半个显示位上
@@ -468,24 +518,37 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
     agg = [min(mins) if mins else None, median(typs) if typs else None,
            max(maxs) if maxs else None]
     for j, v in enumerate(agg):
-        cell = put(ws, r, C_SUM + j, v, st, st["f_res"], bold=True)
+        cell = put(ws, r, C_SUM + j, v, st, st["f_sum"], bold=True, align="right")
         if v is not None:
             cell.number_format = "0." + "0" * nd
     put(ws, r, C_JUDGE, _judge_formula(r), st, st["f_res"], bold=True)
 
-    # 备注只写事实（最小那一头出在哪片哪个温度——各片列只显示 MAX 那一头），
-    # 不写解读
+    # 备注只写事实：包络的两头各出自哪一片（值本身各片列里就有，不重复写）。
+    # ★ 跟 @℃ 同一个道理——并列要说出来。量化过的量（频率）常常各片 MIN 一样，
+    #   写"Min 出自 TT015"会被读成"这片最差"，那是个不存在的结论。
+    def _who(vals, agg):
+        got = [(c, v) for (c, _s), v in zip(marks, vals) if v is not None]
+        if not got:
+            return None
+        tgt = agg(v for _c, v in got)
+        hit = [c for c, v in got if v == tgt]
+        if len(hit) == len(got) and len(got) > 1:
+            return "各片相同"
+        return "/".join(hit) if len(hit) <= 2 else f"{len(hit)} 片并列"
+
+    def _phrase(kind, w):
+        return f"{kind} 各片相同" if w == "各片相同" else f"{kind} 出自 {w}"
+
     note = ""
-    if marks:
-        lo = min(marks, key=lambda x: x[1]["min"])
-        note = (f"全温 Min {fmt_num(lo[1]['min'], nd)}"
-                f"@{fmt_num(lo[1]['min_t'])}℃ {lo[0]}")
-        have = {c for c, _s in marks}
-        gone = [c for c in chips if c not in have]
-        if gone:
-            note += f"；未测: {', '.join(gone)}"
+    if len(marks) > 1:
+        a, b = _who(mins, min), _who(maxs, max)
+        note = ("Min/Max 各片相同" if a == b == "各片相同"
+                else f"{_phrase('Min', a)} / {_phrase('Max', b)}")
+    gone = [c for c in chips if c not in {x[0] for x in marks}]
+    if gone:
+        note += ("；" if note else "") + f"未测: {', '.join(gone)}"
     put(ws, r, note_col(n_chips), as_text(note), st, st["f_res"],
-        align="left", size=9)
+        align="left", size=9, color=COLOR_MUTED)
     return r + 1
 
 
@@ -569,9 +632,10 @@ def write_summary(wb, tables, chips, st):
         ws.column_dimensions[_cl(c)].width = 2
     for k in range(n):
         for j in range(CHIP_AX):
-            ws.column_dimensions[_cl(chip_col(k) + j)].width = 10 if j < 3 else 9
+            ws.column_dimensions[_cl(chip_col(k) + j)].width = \
+                10 if j in CHIP_NUMCOL else 11        # @℃ 列要放得下"等 N 处"
         ws.column_dimensions[_cl(chip_col(k) + CHIP_AX)].width = 2
-    ws.column_dimensions[_cl(note_col(n))].width = 30
+    ws.column_dimensions[_cl(note_col(n))].width = 26
 
     r = 1
     judged = []
@@ -579,16 +643,24 @@ def write_summary(wb, tables, chips, st):
         sweeps = [s for s in data.values() if s is not None]
         items = canon_items(sweeps)
         tpick, tlabels = pick_temps(sweeps)
+        t0 = r                                   # 这张表的第一行（大标题）
         r = _header(ws, r, chips, st, f"{mod} PLL 性能汇总", n, tlabels)
         r = _caption(ws, r, st, n)
         r = _cond_rows(ws, r, chips, data, st, n)
         j0 = r
         for band, rows in items:
             r = _band(ws, r, band, st, n)
+            b0 = r
             for label, unit in rows:
                 r = _result_row(ws, r, label, unit, chips, data, st, n, tpick)
+            # 组内超过 4 行就每 4 行给一条横向导引线（SpotPN 有 8 行）
+            if r - b0 > 4:
+                for rr in range(b0 + 3, r - 1, 4):
+                    _hguide(ws, rr, C_ITEM, note_col(n))
         judged.append((j0, r - 1))
         _limit_dropdown(ws, j0, r - 1)
+        # 汇总组＝判定的依据，给它左右两道中等粗细竖框（灰度打印下也分得开）
+        _edges(ws, t0, r - 1, C_SUM, C_SUM + 2)
         r += 2
     for a, b in judged:
         _pass_fail_cf(ws, _cl(C_JUDGE), a, b, st)

@@ -34,6 +34,13 @@ COLOR_PASS = "006100"
 FILL_FAIL = "FFC7CE"
 FILL_PASS = "C6EFCE"
 FILL_INPUT = "FFF2CC"       # 要人填的格子（Spec / 仿真值 / 判据），浅黄一眼看得出
+# 宽表分区用的灰阶与低饱和色。★色相总数压在 3 个以内（黄=表头 / 浅黄=要人填 /
+# 浅蓝=判定依据），其余分区一律用灰阶深浅 + 分隔，否则 40 列的表变成花布，
+# 而且灰度打印和色弱下几种色相会互相撞。
+FILL_ZONE = "F2F2F2"        # 组内的第二个功能区（极值列）——极浅灰
+FILL_RAIL = "D9D9D9"        # 组与组之间的竖栏（中灰），界定"这一块是一片"
+FILL_SUM = "DDEBF7"         # 汇总组：全表唯一需要跳出来的东西
+COLOR_MUTED = "595959"      # 注释性文字（@℃ 这类），要退到背景里去
 
 # 表里表示"没测/不适用"的占位符，一律当空值
 BLANK_TOKENS = {"", "-", "--", "—", "n/a", "na", "null", "none", "#n/a"}
@@ -472,11 +479,17 @@ def styles():
         "border": Border(left=thin, right=thin, top=thin, bottom=thin),
         "center": Alignment(horizontal="center", vertical="center", wrap_text=True),
         "left": Alignment(horizontal="left", vertical="center", wrap_text=True),
+        # ★ 数字列右对齐：居中的数字列小数点不对齐，比大小得逐个读；右对齐后
+        #   位数差直接变成视觉长度差，扫一眼就知道谁大。这条比任何配色都管用。
+        "right": Alignment(horizontal="right", vertical="center", wrap_text=False),
         "f_head": PatternFill("solid", fgColor=FILL_HEADER, bgColor=FILL_HEADER),
         "f_group": PatternFill("solid", fgColor=FILL_GROUP, bgColor=FILL_GROUP),
         "f_res": PatternFill("solid", fgColor=FILL_RESULT, bgColor=FILL_RESULT),
         "f_sep": PatternFill("solid", fgColor=FILL_SEP, bgColor=FILL_SEP),
         "f_in": PatternFill("solid", fgColor=FILL_INPUT, bgColor=FILL_INPUT),
+        "f_zone": PatternFill("solid", fgColor=FILL_ZONE, bgColor=FILL_ZONE),
+        "f_rail": PatternFill("solid", fgColor=FILL_RAIL, bgColor=FILL_RAIL),
+        "f_sum": PatternFill("solid", fgColor=FILL_SUM, bgColor=FILL_SUM),
         "Font": Font,
     }
 
@@ -485,7 +498,7 @@ def put(ws, r, c, v, st, fill=None, bold=False, color=None, align="center", size
     cell = ws.cell(row=r, column=c)
     cell.value = v
     cell.border = st["border"]
-    cell.alignment = st["center"] if align == "center" else st["left"]
+    cell.alignment = st.get(align) or st["center"]
     cell.font = st["Font"](bold=bold, color=color, size=size)
     if fill is not None:
         cell.fill = fill
