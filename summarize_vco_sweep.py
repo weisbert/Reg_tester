@@ -2117,6 +2117,7 @@ def main():
     wb.calculation.fullCalcOnLoad = True
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     wb.save(out)
     n_fill, n_strip = VCACHE.inject(out)
     print("\n已写出: %s" % os.path.abspath(out))

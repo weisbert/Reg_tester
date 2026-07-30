@@ -708,6 +708,9 @@ def main():
                else "conds" if args.conds else args.level)
         out_path = f"{stem}.{tag}.probe.json"
     if out_path:
+        # private/ 之类目录在 .gitignore 里，换台机器 clone 后不存在——自己建
+        parent = os.path.dirname(os.path.abspath(out_path))
+        os.makedirs(parent, exist_ok=True)
         with open(out_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         print(f"已写出: {os.path.abspath(out_path)}  "
