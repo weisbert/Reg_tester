@@ -15,7 +15,8 @@ summarize_chips.py — 一个目录里的多颗芯片 → 一份给评审看的�
 
     PLL_Summary  上面一张 <模块A> PLL、下面一张 <模块B> PLL 的性能汇总表。
                  列 = 测试项 | Unit | Limit | Spec(Min/Typ/Max) | 仿真(Min/Typ/Max)
-                      | 汇总(Min/Typ/Max) | 判定 | 每颗芯片(Min/Typ/Max) | 备注
+                      | 汇总(Min/Typ/Max) | 判定 | 每颗芯片(常温/最低/最高温 + 全温MAX
+                      + MAX出现在哪) | 备注
                  Spec 与仿真列留空给人填，填完判定列（Excel 公式）自动出 PASS/FAIL。
     温巡          每颗芯片一个**竖条**，条内每个模块两张图（压控温巡 + 频率漂移），
                  一张图只画一颗芯片一个模块（不叠线）；图下面就是它们的数据源。
@@ -42,7 +43,7 @@ import sys
 from sweep_lib import (
     COLOR_FLAG, COLOR_PASS, FILL_FAIL, FILL_PASS,
     LEG_STYLE, apply_y, as_text, axis_bounds, blank_policy,
-    fmt_num, legend_bottom, load_sweep, median, nice_step, num, put,
+    fmt_num, leg_series, legend_bottom, load_sweep, median, nice_step, num, put,
     stats_all, styles, style_series, txt,
 )
 from xlsx_formula_cache import FormulaCache
@@ -202,6 +203,47 @@ def canon_items(sweeps):
     return rows
 
 
+def temp_view(sw, item):
+    """{温度: [该温度经过的每一次的值]}。整趟温巡四段各走一遍，同温会有 2~4 个值。"""
+    d = {}
+    if item is None:
+        return d
+    for lg in sw.legs:
+        for t, v in leg_series(lg, item).items():
+            d.setdefault(t, []).append(v)
+    return d
+
+
+def val_at(view, t):
+    """某个温度点的代表值＝该温度**全部经过点**的中位数。
+
+    取中位数比随便挑一次稳，跟「常温 Typ 取中位」是同一条规矩。
+    """
+    vs = view.get(t)
+    return median(vs) if vs else None
+
+
+def max_label(view, nd):
+    """(全温最大值, 它出现在哪) —— **并列要说出来**。
+
+    ★ 频率这类量记录精度只有 1 kHz，最大值经常在七八个温度上并列。
+      只报其中一个温度，评审会读成"最坏就发生在 85℃"，那是个不存在的结论。
+      并列按**显示精度**判（表里看到的是取整后的数，标签得跟它对得上）。
+    """
+    if not view:
+        return None, None
+    mx = max(v for vs in view.values() for v in vs)
+    disp = fmt_num(mx, nd)
+    hit = sorted(t for t, vs in view.items() if fmt_num(max(vs), nd) == disp)
+    if not hit:
+        return disp, None
+    if len(hit) == 1:
+        return disp, f"{fmt_num(hit[0])}℃"
+    if len(hit) <= 3:
+        return disp, "/".join(str(fmt_num(t)) for t in hit) + "℃"
+    return disp, f"{fmt_num(hit[0])}℃ 等 {len(hit)} 处"
+
+
 def chip_stat(sw, label):
     """一颗芯片一个指标的 (min, typ, max, min_t, max_t)；没这个指标返回 None。"""
     it = sw.item(label)
@@ -219,8 +261,12 @@ C_ITEM, C_UNIT, C_LIMIT = 1, 2, 3
 C_SPEC, C_GAP1 = 4, 7
 C_SIM, C_GAP2 = 8, 11
 C_SUM, C_JUDGE, C_GAP3 = 12, 15, 16
-C_CHIP0 = 17           # 第一颗芯片的 Min 列
-CHIP_W = 4             # 每颗芯片 3 个轴 + 1 个间隔列
+C_CHIP0 = 17           # 第一颗芯片的第一列
+# ★ 每颗芯片 5 列：三个代表温度点 + 全温 MAX + MAX 出现在哪个温度。
+#   为什么不是 Min/Typ/Max：那三个数看不出"在哪一头坏"，而三个代表温度点
+#   （常温 / 最低 / 最高）本身就把趋势说清楚了，再给全温 MAX 收口。
+CHIP_AX = 5
+CHIP_W = CHIP_AX + 1   # +1 = 组间间隔列
 
 AXES = ["Min", "Typ", "Max"]
 
@@ -245,7 +291,12 @@ def note_col(n_chips):
     return chip_col(n_chips)
 
 
-def _header(ws, r0, chips, st, title, n_chips):
+def _chip_axes(tlabels):
+    """芯片组的 5 个轴名：三个代表温度点 + 全温 MAX + MAX 出现的温度。"""
+    return [(t or "—") for t in tlabels] + ["MAX\n(全温)", "MAX\n@℃"]
+
+
+def _header(ws, r0, chips, st, title, n_chips, tlabels):
     """三行表头：大标题 / 组名 / 轴名。"""
     last = note_col(n_chips)
     c = put(ws, r0, C_ITEM, title, st, st["f_sep"], bold=True, align="left", size=12)
@@ -258,39 +309,41 @@ def _header(ws, r0, chips, st, title, n_chips):
         put(ws, hr, col, name, st, st["f_head"], bold=True)
         put(ws, ar, col, None, st, st["f_head"])
         ws.merge_cells(start_row=hr, start_column=col, end_row=ar, end_column=col)
-    groups = [(C_SPEC, "Spec（留空，填完自动判定）"),
-              (C_SIM, "仿真（留空）"),
-              (C_SUM, f"汇总 · {n_chips} 片")]
+    chip_ax = _chip_axes(tlabels)
+    groups = [(C_SPEC, "Spec（留空，填完自动判定）", AXES),
+              (C_SIM, "仿真（留空）", AXES),
+              (C_SUM, f"汇总 · {n_chips} 片",
+               ["Min\n(各片最小)", "Typ\n(各片中位)", "Max\n(各片最大)"])]
     for n, chip in enumerate(chips):
-        groups.append((chip_col(n), chip))
-    for col, name in groups:
+        groups.append((chip_col(n), chip, chip_ax))
+    for col, name, axes in groups:
         put(ws, hr, col, name, st, st["f_head"], bold=True)
-        for j in range(1, 3):
+        for j in range(1, len(axes)):
             put(ws, hr, col + j, None, st, st["f_head"])
-        ws.merge_cells(start_row=hr, start_column=col, end_row=hr, end_column=col + 2)
+        ws.merge_cells(start_row=hr, start_column=col, end_row=hr,
+                       end_column=col + len(axes) - 1)
         fill = st["f_in"] if col in (C_SPEC, C_SIM) else st["f_head"]
-        for j, ax in enumerate(AXES):
-            lb = {"Min": "Min\n(各片最小)", "Typ": "Typ\n(各片中位)",
-                  "Max": "Max\n(各片最大)"}[ax] if col == C_SUM else ax
+        for j, lb in enumerate(axes):
             put(ws, ar, col + j, lb, st, fill, bold=True, size=9)
     for col in (C_GAP1, C_GAP2, C_GAP3):
         for r in (hr, ar):
             put(ws, r, col, None, st, st["f_head"])
     for n in range(n_chips):
         for r in (hr, ar):
-            put(ws, r, chip_col(n) + 3, None, st, st["f_head"])
+            put(ws, r, chip_col(n) + CHIP_AX, None, st, st["f_head"])
     put(ws, hr, last, "备注", st, st["f_head"], bold=True)
     put(ws, ar, last, None, st, st["f_head"])
     ws.merge_cells(start_row=hr, start_column=last, end_row=ar, end_column=last)
-    ws.row_dimensions[ar].height = 26
+    ws.row_dimensions[ar].height = 30
     return ar + 1
 
 
 def _caption(ws, r, st, n_chips):
     """口径说明：这几个数是怎么取的。评审第一句必问，写在表头下面最省事。"""
-    txt_ = ("每颗芯片：Min / Max = 全温极值（不含重锁瞬间的读数），"
-            "Typ = 常温 25℃ 点的中位数。　"
-            "汇总列：Min 取各片最小、Max 取各片最大、Typ 取各片 Typ 的中位数。　"
+    txt_ = ("每颗芯片：三个温度列＝该温度**全部经过点**的中位数（整趟温巡会多次经过同一温度）；"
+            "MAX＝全温最大值，右边一列给出它出现在哪个温度。都不含重锁瞬间的读数。　"
+            "汇总列：Max 取各片 MAX 的最大、Typ 取各片常温值的中位数、"
+            "Min 取各片全温最小（这一头各片列里没显示，只在这里给）。　"
             "判定只看 Spec 的 Min / Max 两头；Typ 与仿真列只作对照。")
     c = put(ws, r, C_ITEM, txt_, st, st["f_group"], align="left", size=9)
     ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r,
@@ -321,10 +374,11 @@ def _cond_rows(ws, r, chips, data, st, n_chips):
             v = fn(sw) if sw is not None else "未测"
             c0 = chip_col(n)
             put(ws, r, c0, as_text(v), st, st["f_group"], size=9)
-            for j in (1, 2):
+            for j in range(1, CHIP_AX):
                 put(ws, r, c0 + j, None, st, st["f_group"])
-            ws.merge_cells(start_row=r, start_column=c0, end_row=r, end_column=c0 + 2)
-            put(ws, r, c0 + 3, None, st, st["f_group"])
+            ws.merge_cells(start_row=r, start_column=c0, end_row=r,
+                           end_column=c0 + CHIP_AX - 1)
+            put(ws, r, c0 + CHIP_AX, None, st, st["f_group"])
         put(ws, r, note_col(n_chips), None, st, st["f_group"])
         r += 1
 
@@ -367,7 +421,7 @@ def _judge_formula(r):
             f"IF(OR({over},{under}),\"FAIL\",\"PASS\"))")
 
 
-def _result_row(ws, r, label, unit, chips, data, st, n_chips):
+def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
     nd = ND.get(unit, 2)
     put(ws, r, C_ITEM, label, st, st["f_res"], align="left")
     put(ws, r, C_UNIT, unit, st, st["f_res"], size=9)
@@ -385,28 +439,31 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips):
         sw = data.get(chip)
         s = chip_stat(sw, label) if sw is not None else None
         c0 = chip_col(n)
-        vals = [None, None, None]
+        vals = [None] * CHIP_AX
         if s:
-            # ★ 汇总列从**各片显示出来的值**再聚合（先按显示精度取整，再取
-            #   最小/中位/最大）。用满精度聚合更"准"，但两片 Typ 取中位时会
-            #   出现「表里两个格子平均一下 ≠ 汇总那格」的末位差 0.01，
-            #   评审一眼看见就得解释。报表宁可自洽。
-            vals = [fmt_num(s["min"], nd), fmt_num(s.get("typ"), nd),
-                    fmt_num(s["max"], nd)]
-            mins.append(vals[0])
-            maxs.append(vals[2])
-            if vals[1] is not None:
-                typs.append(vals[1])
+            # 三个代表温度点：该温度**全部经过点**的中位数。整趟温巡会多次经过
+            # 同一个温度（四段各走一遍），取中位比随便挑一次稳。
+            view = temp_view(sw, sw.item(label))
+            vals = [fmt_num(val_at(view, t), nd) for t in tpick]
+            mx, at = max_label(view, nd)
+            vals += [mx, at]
+            # ★ 汇总列从**各片显示出来的值**再聚合（先按显示精度取整再聚合）。
+            #   满精度聚合更"准"，但会出现「表里那两格取一下 ≠ 汇总那格」的
+            #   末位差 0.01，评审一眼看见就得解释。报表宁可自洽。
+            maxs.append(vals[3])
+            if vals[0] is not None:
+                typs.append(vals[0])          # tpick[0] 是常温
+            mins.append(fmt_num(s["min"], nd))
             marks.append((chip, s))
         for j, v in enumerate(vals):
             cell = put(ws, r, c0 + j, v, st, st["f_res"])
-            if v is not None:
+            if v is not None and j < CHIP_AX - 1:
                 cell.number_format = "0." + "0" * nd
-        put(ws, r, c0 + 3, None, st, st["f_res"])
+        put(ws, r, c0 + CHIP_AX, None, st, st["f_res"])
 
-    # Min/Max 就是某一片的那个值（原样搬过来，对得上账）；
-    # Typ 是各片 Typ 的中位数，**偶数片时不再取整**——两片的中位落在半个显示位上
-    # （-85.42 与 -85.43 的中位 = -85.425），再取整就变成"两格平均一下对不上"。
+    # Max 就是某一片 MAX 列里的那个值（原样搬过来，对得上账）；
+    # Typ 是各片常温值的中位数，**偶数片时不再取整**——两片的中位落在半个显示位上
+    # （-85.42 与 -85.43 的中位 = -85.425），再取整就变成"两格取一下对不上"。
     # 格子里放真值，显示交给数字格式。
     agg = [min(mins) if mins else None, median(typs) if typs else None,
            max(maxs) if maxs else None]
@@ -416,13 +473,13 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips):
             cell.number_format = "0." + "0" * nd
     put(ws, r, C_JUDGE, _judge_formula(r), st, st["f_res"], bold=True)
 
-    # 备注只写事实（哪片哪个温度出的极值），不写解读
+    # 备注只写事实（最小那一头出在哪片哪个温度——各片列只显示 MAX 那一头），
+    # 不写解读
     note = ""
     if marks:
         lo = min(marks, key=lambda x: x[1]["min"])
-        hi = max(marks, key=lambda x: x[1]["max"])
-        note = (f"Min {fmt_num(lo[1]['min'], nd)}@{fmt_num(lo[1]['min_t'])}℃ {lo[0]}"
-                f" / Max {fmt_num(hi[1]['max'], nd)}@{fmt_num(hi[1]['max_t'])}℃ {hi[0]}")
+        note = (f"全温 Min {fmt_num(lo[1]['min'], nd)}"
+                f"@{fmt_num(lo[1]['min_t'])}℃ {lo[0]}")
         have = {c for c, _s in marks}
         gone = [c for c in chips if c not in have]
         if gone:
@@ -468,6 +525,27 @@ def _pass_fail_cf(ws, col_letter, r0, r1, st):
         font=st["Font"](bold=True, color=COLOR_PASS), stopIfTrue=False))
 
 
+def pick_temps(sweeps, room_target=25.0):
+    """挑三个代表温度：常温 / 最低 / 最高。从数据里取，不写死。
+
+    取全部芯片温度点的**交集**——只有大家都测过的温度，同一列横着比才有意义。
+    交集空了（各片温度栅格对不上）退回并集，缺的格子自然留空。
+    """
+    grids = [set(sw.temps) for sw in sweeps if sw.temps]
+    if not grids:
+        return [None] * 3, [None] * 3
+    common = set.intersection(*grids) or set.union(*grids)
+    ts = sorted(common)
+    room = min(ts, key=lambda t: abs(t - room_target))
+    pick = [room, ts[0], ts[-1]]
+    # 去重但保住列数（只测过 1~2 档温度时后面几列空着）
+    out, seen = [], set()
+    for t in pick:
+        out.append(None if t in seen else t)
+        seen.add(t)
+    return out, [f"{fmt_num(t)}℃" if t is not None else None for t in out]
+
+
 def _limit_dropdown(ws, r0, r1):
     from openpyxl.worksheet.datavalidation import DataValidation
     dv = DataValidation(type="list", formula1='"≤,≥,range"', allow_blank=True)
@@ -490,23 +568,25 @@ def write_summary(wb, tables, chips, st):
     for c in (C_GAP1, C_GAP2, C_GAP3):
         ws.column_dimensions[_cl(c)].width = 2
     for k in range(n):
-        for j in range(3):
-            ws.column_dimensions[_cl(chip_col(k) + j)].width = 10
-        ws.column_dimensions[_cl(chip_col(k) + 3)].width = 2
-    ws.column_dimensions[_cl(note_col(n))].width = 40
+        for j in range(CHIP_AX):
+            ws.column_dimensions[_cl(chip_col(k) + j)].width = 10 if j < 3 else 9
+        ws.column_dimensions[_cl(chip_col(k) + CHIP_AX)].width = 2
+    ws.column_dimensions[_cl(note_col(n))].width = 30
 
     r = 1
     judged = []
     for mod, data in tables:
-        items = canon_items([s for s in data.values() if s is not None])
-        r = _header(ws, r, chips, st, f"{mod} PLL 性能汇总", n)
+        sweeps = [s for s in data.values() if s is not None]
+        items = canon_items(sweeps)
+        tpick, tlabels = pick_temps(sweeps)
+        r = _header(ws, r, chips, st, f"{mod} PLL 性能汇总", n, tlabels)
         r = _caption(ws, r, st, n)
         r = _cond_rows(ws, r, chips, data, st, n)
         j0 = r
         for band, rows in items:
             r = _band(ws, r, band, st, n)
             for label, unit in rows:
-                r = _result_row(ws, r, label, unit, chips, data, st, n)
+                r = _result_row(ws, r, label, unit, chips, data, st, n, tpick)
         judged.append((j0, r - 1))
         _limit_dropdown(ws, j0, r - 1)
         r += 2
