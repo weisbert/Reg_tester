@@ -238,17 +238,28 @@ def val_at(view, t):
 
 
 def extreme_label(view, nd, which="max"):
-    """(全温极值, 它出现在哪) —— **并列要说出来**。
+    """(全温极值, 它出现在哪) —— **对「各温度代表值」取极值，不是对逐点取**。
 
-    ★ 频率这类量记录精度只有 1 kHz，极值经常在七八个温度上并列。
+    ★★ 这是整张表能不能自洽的关键。一个温度只有一格，那一格装的是该温度
+      **全部经过点的中位数**（整趟温巡同一温度会被经过 2~4 次）。如果极值改成
+      对逐点取，就会出现「−40℃ 那格写 −54.19，旁边说 MAX = −53.45 @−40℃」——
+      数学上都对（中位数 vs 那 3 次里最差的一次），可一行里放两种统计量、
+      还配一个 @℃ 指着同一个温度，读的人只会认为表算错了。
+      项目里这条教训是现成的："汇总报的极值在明细里查无此值 → 报表对不上账
+      就没人敢信"。代价是极值比"最坏单点"乐观一点，所以备注里给出同温重复性。
+
+    ★ 并列要说出来：频率这类量记录精度只有 1 kHz，极值经常在七八个温度上并列。
       只报其中一个温度，评审会读成"最坏就发生在 85℃"，那是个不存在的结论。
       并列按**显示精度**判（表里看到的是取整后的数，标签得跟它对得上）。
     """
     if not view:
         return None, None
     agg = max if which == "max" else min
-    disp = fmt_num(agg(v for vs in view.values() for v in vs), nd)
-    hit = sorted(t for t, vs in view.items() if fmt_num(agg(vs), nd) == disp)
+    reps = {t: median(vs) for t, vs in view.items() if vs}
+    if not reps:
+        return None, None
+    disp = fmt_num(agg(reps.values()), nd)
+    hit = sorted(t for t, v in reps.items() if fmt_num(v, nd) == disp)
     if not hit:
         return disp, None
     if len(hit) == 1:
@@ -256,6 +267,24 @@ def extreme_label(view, nd, which="max"):
     if len(hit) <= 3:
         return disp, "/".join(str(fmt_num(t)) for t in hit) + "℃"
     return disp, f"{fmt_num(hit[0])}℃ 等 {len(hit)} 处"
+
+
+def repeat_spread(view, nd):
+    """同温重复性：同一个温度多次经过，读数极差最大是多少、在哪个温度。
+
+    温度列放的是中位数、极值也从中位数来（见 extreme_label），所以"最坏单点"
+    不在表上。这个数把那部分信息补回来：极差越大，说明单点比代表值还能差更多。
+    """
+    best = None
+    for t, vs in view.items():
+        if len(vs) < 2:
+            continue
+        sp = max(vs) - min(vs)
+        if best is None or sp > best[0]:
+            best = (sp, t)
+    if best is None or not fmt_num(best[0], nd):
+        return None
+    return f"同温重复性 {fmt_num(best[0], nd)} @{fmt_num(best[1])}℃"
 
 
 def chip_stat(sw, label):
@@ -397,9 +426,10 @@ def _header(ws, r0, chips, st, title, n_chips, tlabels):
 
 def _caption(ws, r, st, n_chips):
     """口径说明：这几个数是怎么取的。评审第一句必问，写在表头下面最省事。"""
-    txt_ = ("每颗芯片：三个温度列＝该温度**全部经过点**的中位数（整趟温巡会多次经过同一温度）；"
-            "MIN / MAX＝全温极值，各配一列给出它出现在哪个温度（多个温度并列时写「等 N 处」）。"
-            "都不含重锁瞬间的读数。　"
+    txt_ = ("每颗芯片：三个温度列＝该温度**全部经过点的中位数**"
+            "（整趟温巡会多次经过同一温度）；MIN / MAX＝**对全部 16 个温度的这个代表值**"
+            "取极值，各配一列给出它出现在哪个温度（多个温度并列时写「等 N 处」）。"
+            "同一温度多次读数的散布见备注列的「同温重复性」。都不含重锁瞬间的读数。　"
             "汇总列：Min 取各片 MIN 的最小、Max 取各片 MAX 的最大、Typ 取各片常温值的中位数。　"
             "判定只看 Spec 的 Min / Max 两头；Typ 与仿真列只作对照。")
     c = put(ws, r, C_ITEM, txt_, st, st["f_group"], align="left", size=9)
@@ -492,7 +522,7 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
     for c in rail_cols(len(chips)):
         put(ws, r, c, None, st, st["f_rail"])
 
-    mins, typs, maxs, marks = [], [], [], []
+    mins, typs, maxs, marks, spreads = [], [], [], [], []
     for n, chip in enumerate(chips):
         sw = data.get(chip)
         s = chip_stat(sw, label) if sw is not None else None
@@ -510,6 +540,9 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
             #   末位差 0.01，评审一眼看见就得解释。报表宁可自洽。
             mins.append(vals[3])
             maxs.append(vals[5])
+            sp = repeat_spread(view, nd)
+            if sp:
+                spreads.append((chip, sp))
             if vals[0] is not None:
                 typs.append(vals[0])          # tpick[0] 是常温
             marks.append((chip, s))
@@ -557,6 +590,10 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
         a, b = _who(mins, min), _who(maxs, max)
         note = ("Min/Max 各片相同" if a == b == "各片相同"
                 else f"{_phrase('Min', a)} / {_phrase('Max', b)}")
+    if spreads:
+        # 各片里散布最大的那一个（一片时就是它自己）
+        worst = max(spreads, key=lambda x: num(x[1].split()[1]) or 0)
+        note = (note + "；" if note else "") +                (worst[1] if len(spreads) == 1 else f"{worst[1]}（{worst[0]}）")
     gone = [c for c in chips if c not in {x[0] for x in marks}]
     if gone:
         note += ("；" if note else "") + f"未测: {', '.join(gone)}"
