@@ -54,6 +54,8 @@ import re
 import sys
 from collections import OrderedDict
 
+from xlsx_formula_cache import FormulaCache
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -110,98 +112,13 @@ def fmt_num(x, nd=3):
     return round(x, nd)
 
 
-# 公式格的缓存值：{sheet 名: {单元格坐标: 数值}}。存盘后补写进 xlsx。
-VCACHE = {}
+# 公式格的缓存值：openpyxl 只写空的 <v></v>，不补真值的话别人打开是一片空白。
+# 详见 xlsx_formula_cache 的模块说明（那个坑值得读一遍）。
+VCACHE = FormulaCache()
 
 
 def cache(ws, row, col, value):
-    """记下某个公式格算出来的数，存盘后补进 <v> 缓存值。
-
-    ★ 为什么必须补：openpyxl 给公式格写的是 `<f>公式</f><v></v>`——一个**空的**
-    缓存值。这等于告诉 Excel"这公式的结果就是空"，于是打开直接显示空白，
-    要在格子里敲一次回车强制重算才出数。自己机器上看着正常（fullCalcOnLoad
-    触发了重算），发给别人就是一片空白（受保护视图 / 手动计算 / 某些阅读器
-    会信那个空缓存值）。
-    我们在 Python 侧本来就算过每个数，直接写进 <v>：任何环境打开都有值，
-    公式还在，原始数据改了照样能重算。
-    """
-    from openpyxl.utils import get_column_letter
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return
-    VCACHE.setdefault(ws.title, {})[f"{get_column_letter(col)}{row}"] = value
-
-
-def inject_cached_values(path, vcache):
-    """存盘后给公式格补缓存值：知道结果的写进 <v>，不知道的把空 <v> 删掉
-    （删掉反而好——Excel 见没有缓存值就必须自己算）。"""
-    import re
-    import shutil
-    import zipfile
-    from xml.etree import ElementTree as ET
-
-    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
-    RELNS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
-
-    with zipfile.ZipFile(path) as z:
-        parts = {n: z.read(n) for n in z.namelist()}
-
-    rels = {r.get("Id"): r.get("Target")
-            for r in ET.fromstring(parts["xl/_rels/workbook.xml.rels"])
-            if r.tag == RELNS + "Relationship"}
-    sheet_part = {}
-    for sh in ET.fromstring(parts["xl/workbook.xml"]).iter(NS + "sheet"):
-        tgt = rels.get(sh.get(RNS + "id"), "")
-        if not tgt:
-            continue
-        # Target 可能是包内绝对路径 /xl/worksheets/sheetN.xml，
-        # 也可能是相对 xl/ 的 worksheets/sheetN.xml——两种都得认
-        p = tgt.lstrip("/") if tgt.startswith("/") else "xl/" + tgt
-        sheet_part[sh.get("name")] = p if p in parts else None
-
-    cell_re = re.compile(rb"<c\b[^>]*?r=\"([A-Z]+[0-9]+)\"[^>]*>(.*?)</c>", re.S)
-    n_fill = n_strip = 0
-
-    def fmt(v):
-        # 收掉浮点减法的噪声尾巴（max-lock 之类会算出 -0.00046999999999997）。
-        # 只动第 12 位小数以后，肉眼与 Excel 重算结果都看不出差别。
-        if isinstance(v, float):
-            v = round(v, 12)
-            if v == int(v) and abs(v) < 1e15:
-                v = int(v)
-        return str(v) if isinstance(v, int) else repr(v)
-
-    for title, part in sheet_part.items():
-        if not part or part not in parts:
-            continue
-        vals = vcache.get(title, {})
-        xml = parts[part]
-
-        def repl(m):
-            nonlocal n_fill, n_strip
-            ref, inner = m.group(1).decode(), m.group(2)
-            if b"<f" not in inner:
-                return m.group(0)
-            v = vals.get(ref)
-            if v is None:
-                if b"<v></v>" in inner:                    # 不知道结果 -> 删空缓存
-                    n_strip += 1
-                    return m.group(0).replace(b"<v></v>", b"")
-                return m.group(0)
-            new = f"<v>{fmt(v)}</v>".encode()
-            n_fill += 1
-            if b"<v></v>" in inner:
-                return m.group(0).replace(b"<v></v>", new)
-            return m.group(0)[: -len(b"</c>")] + new + b"</c>"
-
-        parts[part] = cell_re.sub(repl, xml)
-
-    tmp = path + ".tmp"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-        for n, d in parts.items():
-            z.writestr(n, d)
-    shutil.move(tmp, path)
-    return n_fill, n_strip
+    VCACHE.remember(ws, row, col, value)
 
 
 def sref(title, col_idx0, xl_row, coerce=False):
@@ -1519,7 +1436,7 @@ def main():
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
     wb.save(out)
-    n_fill, n_strip = inject_cached_values(out, VCACHE)
+    n_fill, n_strip = VCACHE.inject(out)
     print(f"\n已写出: {os.path.abspath(out)}")
     print(f"  第 1 页「{ws.title}」= 原始数据原样保留；新增 "
           + " / ".join(n for n in wb.sheetnames if n != ws.title))

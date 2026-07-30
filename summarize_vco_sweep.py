@@ -31,8 +31,12 @@ summarize_vco_sweep.py — 开环压控扫描簿 → 带汇总页的 Excel
       结论 / 汇总  ──►  明细、斜率、温漂  ──►  原始表那一格
   评审时点开任何一个数，Excel 的「追踪引用单元格」能一路追到源头；原始数据
   改一格，整本跟着重算。要纯数值版用 --static。
-  代价：openpyxl 不算公式值，所以文件里没有缓存值——脚本已置 fullCalcOnLoad，
-  Excel 一打开就重算；用别的工具直接读单元格会读到公式字符串而不是数。
+  ★ 公式格必须自己补「缓存值」：openpyxl 写出来的是 `<f>公式</f><v></v>`，
+  那个**空的** `<v>` 等于告诉 Excel "结果就是空"——自己机器上因为
+  fullCalcOnLoad 重算了看着正常，**发给别人就是一片空白**，得在格子里敲一次
+  回车才出数。所以 emit() 把公式和算好的值成对交给 put()，存盘后由
+  `xlsx_formula_cache` 把值补进 `<v>`（结果未知的判定类公式则删掉空 `<v>`，
+  逼 Excel 自己算）。补完之后别的工具直接读单元格也能读到数。
 
 为什么单独有一页「结论」
     把每个指标的 Min/Max/Δ 都铺一遍，是数据搬运不是结论：十几个指标乘几个温度
@@ -67,6 +71,8 @@ import os
 import re
 import sys
 from collections import OrderedDict
+
+from xlsx_formula_cache import Formula, FormulaCache
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -118,10 +124,23 @@ def txt(v):
 # 格子里写引用公式（默认）还是写算好的死值（--static）。
 # 默认写公式：评审时点开任何一个数都能一路追回原始表那一格，原始数据改了整本跟着变。
 LIVE_REFS = True
+# 公式格的缓存值：不补真值的话别人打开是一片空白（见 xlsx_formula_cache）
+VCACHE = FormulaCache()
 
 
 def emit(formula, value):
-    return formula if (LIVE_REFS and formula is not None) else value
+    """公式态下返回 (公式, 值) 一对，交给 put() 落盘并记缓存值。
+
+    ★ 为什么要把值一起带上：openpyxl 给公式格写的是 `<f>公式</f><v></v>`——
+      一个**空的**缓存值，等于告诉 Excel "这公式的结果就是空"。自己机器上
+      看着正常（fullCalcOnLoad 触发了重算），**发给别人就是一片空白**，
+      得在格子里敲一次回车才出数。这里本来就两样都算好了，顺手把值
+      记进缓存，存盘后补进 <v>，任何环境打开都直接看见数。
+      细节见 xlsx_formula_cache 的模块说明。
+    """
+    if LIVE_REFS and formula is not None:
+        return Formula(formula, value)
+    return value
 
 
 def as_text(v):
@@ -550,6 +569,9 @@ def _styles():
 
 def put(ws, r, c, v, st, fill=None, bold=False, color=None, align="center", size=10):
     cell = ws.cell(row=r, column=c)
+    if isinstance(v, Formula):          # emit() 交来的 (公式, 值) 对
+        VCACHE.remember(ws, r, c, v.value)
+        v = v.formula
     cell.value = v
     cell.border = st["border"]
     cell.alignment = st["center"] if align == "center" else st["left"]
@@ -2090,13 +2112,17 @@ def main():
                   "温漂明细-CT", "相噪曲线"):
             if n in wb.sheetnames:
                 wb[n].sheet_state = "hidden"
-    # 格子里现在全是公式，openpyxl 不算值；让 Excel 一打开就重算，图才有数据
+    # 让 Excel 一打开就重算（图才有数据）。⚠ 这一条**不足以**解决"发给别人是
+    # 空格子"——那是 openpyxl 写了空的 <v></v> 缓存值，得靠下面 VCACHE.inject()
     wb.calculation.fullCalcOnLoad = True
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
     wb.save(out)
+    n_fill, n_strip = VCACHE.inject(out)
     print("\n已写出: %s" % os.path.abspath(out))
     print("  页：%s" % " / ".join(wb.sheetnames))
+    print("  公式格补了 %d 个缓存值、清掉 %d 个空缓存 —— 发给别人打开就能看见数，"
+          "不用敲回车重算。" % (n_fill, n_strip))
     # 下面这些是给做表的人看的，所以只打在控制台，不写进簿子
     print("\n怎么用（不写进簿子，只在这里说）：")
     print("  · 结论页 Spec 的 Min / Max 两列自己填；Limit 列提示该填哪边"
