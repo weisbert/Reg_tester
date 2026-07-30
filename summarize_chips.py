@@ -109,12 +109,19 @@ class Book:
 
 
 def discover(root, only_chips=None, only_modules=None):
-    """扫目录 -> (选中的 Book 列表, 同类被跳过的, 认不出来的)。"""
+    """扫目录 -> (选中的, 同类被跳过的, 认不出来的, 根目录下散放没被扫的)。"""
     dirs = sorted((d for d in os.listdir(root)
                    if os.path.isdir(os.path.join(root, d))), key=natkey)
+    loose = []
     if not dirs:
         # 根目录本身就装着一颗芯片的文件：目录名当芯片号
         dirs = [""]
+    else:
+        # ★ 有芯片目录时只扫子目录，根目录下的散放文件一律不读——但要报出来。
+        #   重组目录结构之前的旧文件常常还躺在根目录里，静默跳过等于少算一颗芯片。
+        loose = [f for f in sorted(os.listdir(root))
+                 if os.path.isfile(os.path.join(root, f))
+                 and f.lower().endswith((".xlsx", ".xlsm")) and not SKIP_RE.search(f)]
     picked, dropped, unknown = {}, [], []
     for d in dirs:
         chip = d or os.path.basename(os.path.abspath(root))
@@ -140,7 +147,7 @@ def discover(root, only_chips=None, only_modules=None):
                 dropped.append((old, b))          # 旧的那份让位
             else:
                 dropped.append((b, old))
-    return picked, dropped, unknown
+    return picked, dropped, unknown, loose
 
 
 # ---------------------------------------------------------------- 指标挑选
@@ -762,7 +769,7 @@ def main():
 
     want_mod = [m.strip() for m in args.modules.split(",") if m.strip()]
     only = {c.strip() for c in args.chips.split(",") if c.strip()} or None
-    picked, dropped, unknown = discover(root, only, set(want_mod) or None)
+    picked, dropped, unknown, loose = discover(root, only, set(want_mod) or None)
     if not picked:
         sys.exit(f"{root} 下没找到能认出来的 .xlsx —— 文件名要长成 "
                  f"`<模块><类型>_...`（类型＝ PLL / VCO / Current）")
@@ -789,6 +796,12 @@ def main():
         print(f"  ↷ 跳过 {b.chip}/{b.name}（同类里有更新的 {w.ts or w.name}）")
     for chip, f, why in unknown:
         print(f"  ? 认不出{why}，没读: {chip}/{f}")
+    if loose:
+        print(f"  ⚠ 根目录下还散放着 {len(loose)} 个 .xlsx **没有被扫**"
+              f"（有芯片目录时只扫子目录）——如果它们也是要算的芯片，"
+              f"各自挪进对应的芯片目录：")
+        for f in loose:
+            print(f"      {f}")
     n_cur = sum(len(v) for v in grid.get(KIND_CUR, {}).values())
     n_vco = sum(len(v) for v in grid.get(KIND_VCO, {}).values())
     if n_cur:
