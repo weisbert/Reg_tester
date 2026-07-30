@@ -1721,6 +1721,220 @@ def pick_ct_col(cols, data):
 
 # ---------------------------------------------------------------- main
 
+class VcoError(Exception):
+    """这份簿读不下去。调用方决定是退出还是跳过。"""
+
+
+class VcoSweep(object):
+    """一份读完的开环扫描簿。字段名跟原来 main() 里的局部变量一一对应。"""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
+             lock_pattern=r"lock$|close.?loop", sweep_mode_opt=None,
+             temp_col=None, vtune_col=None, ct_col_opt=None,
+             keep_test_item=None, ref_temp=25.0, fvco_opt=None, x_round=6,
+             show_addr=False, keep_original=True):
+    """把一份开环压控扫描簿读成 VcoSweep（行已过滤、组已切好、指标已识别）。
+
+    从 main() 原样抽出来的——跨芯片汇总要用同一套识别与分组口径，
+    两份实现必然漂移，漂出来的是"两份报表同一个指标报不同的数"。
+    keep_original=False 时不再读第二份工作簿（跨芯片汇总不需要"原表原样保留"）。
+    """
+    import openpyxl
+    # 读两份：一份取缓存值用来算，一份原封不动用来存。
+    # 只用 data_only=True 那份去存的话，原表里若有公式会被替换成计算结果——
+    # 「第 1 页保留原始 excel」就不成立了。
+    wb_val = openpyxl.load_workbook(path, data_only=True)
+    ws_val = wb_val[sheet] if sheet else wb_val[wb_val.sheetnames[0]]
+    wb = openpyxl.load_workbook(path, data_only=False) if keep_original else None
+    ws = wb[ws_val.title] if wb is not None else ws_val
+    all_rows = [list(r) for r in ws_val.iter_rows(values_only=True)]
+    if len(all_rows) < header_row + 1:
+        raise VcoError("表里没有数据行")
+    header = all_rows[header_row - 1]
+    data = all_rows[header_row:]
+
+    cols = Columns(header)
+    warnings = []
+    if cols.duplicates:
+        from openpyxl.utils import get_column_letter as gl
+        for k, v in cols.duplicates.items():
+            warnings.append("重复列名 %s：出现在 %s，按名字只取到第一个（%s）"
+                            % (k, ", ".join(gl(i + 1) for i in v), gl(v[0] + 1)))
+
+    if temp_col:
+        tname, tcol = temp_col, cols.idx(temp_col)
+    else:
+        tname, tcol = cols.find(r"temperature", r"^temp")
+    if tcol is None:
+        warnings.append("找不到温度列，全部行按同一个温度处理（--temp-col 可指定）")
+    mode_i = cols.idx(mode_col)
+    if mode_i is None:
+        warnings.append("没有 %s 列，无法分辨闭环/开环行" % mode_col)
+    ti_col = cols.idx("Test Item")
+
+    # 横轴列
+    if vtune_col:
+        vt_name, vt_col, vt_why = vtune_col, cols.idx(vtune_col), "命令行指定"
+        if vt_col is None:
+            raise VcoError("找不到 --vtune-col 指定的列: %s" % vtune_col)
+    else:
+        vt_name, vt_col, vt_why = pick_vtune_col(cols, data)
+    if vt_col is None:
+        raise VcoError("没找到 Vtune 横轴列，用 --vtune-col 指定")
+
+    ct_name = ct_col = None
+    ct_why = ""
+    if txt(ct_col_opt).lower() != "none":
+        if ct_col_opt:
+            ct_name, ct_col, ct_why = ct_col_opt, cols.idx(ct_col_opt), "命令行指定"
+            if ct_col is None:
+                raise VcoError("找不到 --ct-col 指定的列: %s" % ct_col_opt)
+        else:
+            ct_name, ct_col, ct_why = pick_ct_col(cols, data)
+    ct_addr = None
+    if ct_name:
+        m = re.search(r"(\d+)$", ct_name)
+        if m:
+            ai = cols.idx("REG ADDR%s" % m.group(1))
+            if ai is not None:
+                for r in data:
+                    if ai < len(r) and not is_blank(r[ai]):
+                        ct_addr = txt(r[ai])
+                        break
+
+    lock_re = re.compile(lock_pattern, re.I)
+
+    keep_ti = keep_test_item
+    if ti_col is not None and keep_ti is None:
+        cnt = {}
+        for r in data:
+            v = txt(r[ti_col]) if ti_col < len(r) else ""
+            if v:
+                cnt[v] = cnt.get(v, 0) + 1
+        if cnt:
+            keep_ti = max(cnt, key=lambda k: cnt[k])
+
+    sweep_mode = sweep_mode_opt
+    if mode_i is not None and sweep_mode is None:
+        cnt = {}
+        for r in data:
+            v = txt(r[mode_i]) if mode_i < len(r) else ""
+            if v and not lock_re.search(v):
+                cnt[v] = cnt.get(v, 0) + 1
+        if cnt:
+            sweep_mode = max(cnt, key=lambda k: cnt[k])
+
+    excluded, rows, locked, others = [], [], [], []
+    for n, raw in enumerate(data):
+        xl = header_row + 1 + n
+        if all(is_blank(v) for v in raw):
+            continue
+        mode = txt(raw[mode_i]) if mode_i is not None and mode_i < len(raw) else ""
+        temp = num(raw[tcol]) if tcol is not None and tcol < len(raw) else None
+        vt = qx(num(raw[vt_col]) if vt_col < len(raw) else None, x_round)
+        ct = qx(num(raw[ct_col]) if ct_col is not None and ct_col < len(raw) else None,
+                x_round)
+        r = Row(xl, temp, mode, vt, ct, raw)
+        if mode and lock_re.search(mode):
+            locked.append(r)
+            excluded.append((xl, "%s = %r，闭环/锁定行" % (mode_col, mode)))
+            continue
+        if ti_col is not None and keep_ti is not None:
+            v = txt(raw[ti_col]) if ti_col < len(raw) else ""
+            if v != keep_ti:
+                excluded.append((xl, "Test Item = %r，不是主测试项 %r" % (v, keep_ti)))
+                continue
+        if sweep_mode is not None and mode != sweep_mode:
+            others.append(r)
+            excluded.append((xl, "%s = %r，不是扫描模式 %r" % (mode_col, mode, sweep_mode)))
+            continue
+        rows.append(r)
+
+    skip = {vt_col} | ({ct_col} if ct_col is not None else set())
+    items, dropped = build_items(cols, [r.raw for r in rows + locked + others],
+                                 skip_cols=skip)
+    if not items:
+        raise VcoError("没识别出任何有数据的结果列")
+    for r in rows + locked + others:
+        for it in items:
+            r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+
+    # 扫描序列之外但确实量到东西的行：单列一页，别让「排除了 N 行」看着像丢了数据
+    extra = [(r, "锁定") for r in locked if any(v is not None for v in r.vals.values())]
+    extra += [(r, "其他模式") for r in others if any(v is not None for v in r.vals.values())]
+    extra.sort(key=lambda x: x[0].xl)
+
+    keep = []
+    for r in rows:
+        if all(v is None for v in r.vals.values()):
+            excluded.append((r.xl, "所有结果列都是空的（配置/开关行，不是测量点）"))
+        else:
+            keep.append(r)
+    rows = keep
+    if not rows:
+        raise VcoError("过滤完没有测量点了，检查 --sweep-mode / --keep-test-item")
+
+    groups = segment(rows)
+    # 横轴值大面积重复 = 组里还藏着另一个在动的变量（最常见：CT 列没识别出来，
+    # 于是 CT 扫那几行被并进 Vtune 扫，去重后只剩最后一个，把曲线上那个点悄悄换掉）
+    for g in groups:
+        xs = [g.x_of(r) for r in g.rows if g.x_of(r) is not None]
+        dup = len(xs) - len(set(xs))
+        # 少量重复是正常的（先粗扫一遍再回头细扫，几个点会重复量）；
+        # 大面积重复才是「组里还藏着另一个在动的变量」。
+        if dup >= 2 and dup > 0.2 * len(xs):
+            warnings.append("组「%s」有 %d 个点但横轴只有 %d 个不同取值——"
+                            "是不是还有一个没识别出来的扫描变量？(--ct-col 指定)"
+                            % (g.title, len(xs), len(set(xs))))
+
+    freq_item = next((it for it in items if it.src == "Freq_MHz"), None)
+    if freq_item is None:
+        freq_item = next((it for it in items if it.cat == "Frequency"), None)
+        if freq_item is None:
+            warnings.append("没有频率列，Kvco / 覆盖范围这些派生指标出不来")
+
+    by_kind = []
+    for kind in ("vtune", "ct", "point"):
+        gs = [g for g in groups if g.kind == kind]
+        if gs:
+            by_kind.append((kind, gs))
+    ref_by_kind = {}
+    for kind, gs in by_kind:
+        withtemp = [g for g in gs if g.temp is not None]
+        if withtemp:
+            ref_by_kind[kind] = min(withtemp, key=lambda g: abs(g.temp - ref_temp))
+
+    # 目标 VCO 频率：算覆盖余量要用。表里就有这一列，不写死在脚本里；
+    # 连结论页那一格也是指回原表的引用，不是抄过来的数。
+    fvco, fvco_ref = fvco_opt, None
+    _n, fc = cols.find(r"^fvco")
+    if fc is not None:
+        for r in rows:
+            v = num(r.raw[fc]) if fc < len(r.raw) else None
+            if v:
+                if fvco_opt is None:
+                    fvco = v
+                    fvco_ref = cref(ws.title, fc, r.xl)
+                break
+
+    excluded.sort(key=lambda x: x[0])
+    meta = {
+        "excluded": excluded, "warnings": warnings, "freq_item": freq_item,
+        "ref_by_kind": ref_by_kind,
+        "why_groups": ("(温度, 模式) 一变就切；组内再看这一步动的是 Vtune 还是 CT，"
+                       "两个一起动就是换扫法了，也切。横轴不是一回事的点混在一起统计没有意义。"),
+    }
+
+    return VcoSweep(**{k: v for k, v in locals().items()
+                      if k not in ("openpyxl",)})
+
+
+# ---------------------------------------------------------------- main
+
 def main():
     ap = argparse.ArgumentParser(description="开环压控扫描簿 → 带汇总页的 Excel")
     ap.add_argument("path", help="扫描簿 .xlsx")
@@ -1781,190 +1995,28 @@ def main():
     except ImportError:
         sys.exit("缺少 openpyxl，请先: pip install openpyxl")
 
-    # 读两份：一份取缓存值用来算，一份原封不动用来存。
-    # 只用 data_only=True 那份去存的话，原表里若有公式会被替换成计算结果——
-    # 「第 1 页保留原始 excel」就不成立了。
-    wb_val = openpyxl.load_workbook(args.path, data_only=True)
-    ws_val = wb_val[args.sheet] if args.sheet else wb_val[wb_val.sheetnames[0]]
-    wb = openpyxl.load_workbook(args.path, data_only=False)
-    ws = wb[ws_val.title]
-    all_rows = [list(r) for r in ws_val.iter_rows(values_only=True)]
-    if len(all_rows) < args.header_row + 1:
-        sys.exit("表里没有数据行")
-    header = all_rows[args.header_row - 1]
-    data = all_rows[args.header_row:]
 
-    cols = Columns(header)
-    warnings = []
-    if cols.duplicates:
-        from openpyxl.utils import get_column_letter as gl
-        for k, v in cols.duplicates.items():
-            warnings.append("重复列名 %s：出现在 %s，按名字只取到第一个（%s）"
-                            % (k, ", ".join(gl(i + 1) for i in v), gl(v[0] + 1)))
 
-    if args.temp_col:
-        tname, tcol = args.temp_col, cols.idx(args.temp_col)
-    else:
-        tname, tcol = cols.find(r"temperature", r"^temp")
-    if tcol is None:
-        warnings.append("找不到温度列，全部行按同一个温度处理（--temp-col 可指定）")
-    mode_i = cols.idx(args.mode_col)
-    if mode_i is None:
-        warnings.append("没有 %s 列，无法分辨闭环/开环行" % args.mode_col)
-    ti_col = cols.idx("Test Item")
 
-    # 横轴列
-    if args.vtune_col:
-        vt_name, vt_col, vt_why = args.vtune_col, cols.idx(args.vtune_col), "命令行指定"
-        if vt_col is None:
-            sys.exit("找不到 --vtune-col 指定的列: %s" % args.vtune_col)
-    else:
-        vt_name, vt_col, vt_why = pick_vtune_col(cols, data)
-    if vt_col is None:
-        sys.exit("没找到 Vtune 横轴列，用 --vtune-col 指定")
-
-    ct_name = ct_col = None
-    ct_why = ""
-    if txt(args.ct_col).lower() != "none":
-        if args.ct_col:
-            ct_name, ct_col, ct_why = args.ct_col, cols.idx(args.ct_col), "命令行指定"
-            if ct_col is None:
-                sys.exit("找不到 --ct-col 指定的列: %s" % args.ct_col)
-        else:
-            ct_name, ct_col, ct_why = pick_ct_col(cols, data)
-    ct_addr = None
-    if ct_name:
-        m = re.search(r"(\d+)$", ct_name)
-        if m:
-            ai = cols.idx("REG ADDR%s" % m.group(1))
-            if ai is not None:
-                for r in data:
-                    if ai < len(r) and not is_blank(r[ai]):
-                        ct_addr = txt(r[ai])
-                        break
-
-    lock_re = re.compile(args.lock_pattern, re.I)
-
-    keep_ti = args.keep_test_item
-    if ti_col is not None and keep_ti is None:
-        cnt = {}
-        for r in data:
-            v = txt(r[ti_col]) if ti_col < len(r) else ""
-            if v:
-                cnt[v] = cnt.get(v, 0) + 1
-        if cnt:
-            keep_ti = max(cnt, key=lambda k: cnt[k])
-
-    sweep_mode = args.sweep_mode
-    if mode_i is not None and sweep_mode is None:
-        cnt = {}
-        for r in data:
-            v = txt(r[mode_i]) if mode_i < len(r) else ""
-            if v and not lock_re.search(v):
-                cnt[v] = cnt.get(v, 0) + 1
-        if cnt:
-            sweep_mode = max(cnt, key=lambda k: cnt[k])
-
-    excluded, rows, locked, others = [], [], [], []
-    for n, raw in enumerate(data):
-        xl = args.header_row + 1 + n
-        if all(is_blank(v) for v in raw):
-            continue
-        mode = txt(raw[mode_i]) if mode_i is not None and mode_i < len(raw) else ""
-        temp = num(raw[tcol]) if tcol is not None and tcol < len(raw) else None
-        vt = qx(num(raw[vt_col]) if vt_col < len(raw) else None, args.x_round)
-        ct = qx(num(raw[ct_col]) if ct_col is not None and ct_col < len(raw) else None,
-                args.x_round)
-        r = Row(xl, temp, mode, vt, ct, raw)
-        if mode and lock_re.search(mode):
-            locked.append(r)
-            excluded.append((xl, "%s = %r，闭环/锁定行" % (args.mode_col, mode)))
-            continue
-        if ti_col is not None and keep_ti is not None:
-            v = txt(raw[ti_col]) if ti_col < len(raw) else ""
-            if v != keep_ti:
-                excluded.append((xl, "Test Item = %r，不是主测试项 %r" % (v, keep_ti)))
-                continue
-        if sweep_mode is not None and mode != sweep_mode:
-            others.append(r)
-            excluded.append((xl, "%s = %r，不是扫描模式 %r" % (args.mode_col, mode, sweep_mode)))
-            continue
-        rows.append(r)
-
-    skip = {vt_col} | ({ct_col} if ct_col is not None else set())
-    items, dropped = build_items(cols, [r.raw for r in rows + locked + others],
-                                 skip_cols=skip)
-    if not items:
-        sys.exit("没识别出任何有数据的结果列")
-    for r in rows + locked + others:
-        for it in items:
-            r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
-
-    # 扫描序列之外但确实量到东西的行：单列一页，别让「排除了 N 行」看着像丢了数据
-    extra = [(r, "锁定") for r in locked if any(v is not None for v in r.vals.values())]
-    extra += [(r, "其他模式") for r in others if any(v is not None for v in r.vals.values())]
-    extra.sort(key=lambda x: x[0].xl)
-
-    keep = []
-    for r in rows:
-        if all(v is None for v in r.vals.values()):
-            excluded.append((r.xl, "所有结果列都是空的（配置/开关行，不是测量点）"))
-        else:
-            keep.append(r)
-    rows = keep
-    if not rows:
-        sys.exit("过滤完没有测量点了，检查 --sweep-mode / --keep-test-item")
-
-    groups = segment(rows)
-    # 横轴值大面积重复 = 组里还藏着另一个在动的变量（最常见：CT 列没识别出来，
-    # 于是 CT 扫那几行被并进 Vtune 扫，去重后只剩最后一个，把曲线上那个点悄悄换掉）
-    for g in groups:
-        xs = [g.x_of(r) for r in g.rows if g.x_of(r) is not None]
-        dup = len(xs) - len(set(xs))
-        # 少量重复是正常的（先粗扫一遍再回头细扫，几个点会重复量）；
-        # 大面积重复才是「组里还藏着另一个在动的变量」。
-        if dup >= 2 and dup > 0.2 * len(xs):
-            warnings.append("组「%s」有 %d 个点但横轴只有 %d 个不同取值——"
-                            "是不是还有一个没识别出来的扫描变量？(--ct-col 指定)"
-                            % (g.title, len(xs), len(set(xs))))
-
-    freq_item = next((it for it in items if it.src == "Freq_MHz"), None)
-    if freq_item is None:
-        freq_item = next((it for it in items if it.cat == "Frequency"), None)
-        if freq_item is None:
-            warnings.append("没有频率列，Kvco / 覆盖范围这些派生指标出不来")
-
-    by_kind = []
-    for kind in ("vtune", "ct", "point"):
-        gs = [g for g in groups if g.kind == kind]
-        if gs:
-            by_kind.append((kind, gs))
-    ref_by_kind = {}
-    for kind, gs in by_kind:
-        withtemp = [g for g in gs if g.temp is not None]
-        if withtemp:
-            ref_by_kind[kind] = min(withtemp, key=lambda g: abs(g.temp - args.ref_temp))
-
-    # 目标 VCO 频率：算覆盖余量要用。表里就有这一列，不写死在脚本里；
-    # 连结论页那一格也是指回原表的引用，不是抄过来的数。
-    fvco, fvco_ref = args.fvco, None
-    _n, fc = cols.find(r"^fvco")
-    if fc is not None:
-        for r in rows:
-            v = num(r.raw[fc]) if fc < len(r.raw) else None
-            if v:
-                if args.fvco is None:
-                    fvco = v
-                    fvco_ref = cref(ws.title, fc, r.xl)
-                break
-
-    excluded.sort(key=lambda x: x[0])
-    meta = {
-        "excluded": excluded, "warnings": warnings, "freq_item": freq_item,
-        "ref_by_kind": ref_by_kind,
-        "why_groups": ("(温度, 模式) 一变就切；组内再看这一步动的是 Vtune 还是 CT，"
-                       "两个一起动就是换扫法了，也切。横轴不是一回事的点混在一起统计没有意义。"),
-    }
+    # 读取/过滤/分组/识别指标全在 load_vco 里（跨芯片汇总用同一份）
+    try:
+        sw = load_vco(args.path, sheet=args.sheet, header_row=args.header_row,
+                      mode_col=args.mode_col, lock_pattern=args.lock_pattern,
+                      sweep_mode_opt=args.sweep_mode, temp_col=args.temp_col,
+                      vtune_col=args.vtune_col, ct_col_opt=args.ct_col,
+                      keep_test_item=args.keep_test_item, ref_temp=args.ref_temp,
+                      fvco_opt=args.fvco, x_round=args.x_round,
+                      show_addr=args.show_addr)
+    except VcoError as e:
+        sys.exit(str(e))
+    by_kind, ct_addr, ct_name, ct_why = sw.by_kind, sw.ct_addr, sw.ct_name, sw.ct_why
+    data, dropped, excluded, extra = sw.data, sw.dropped, sw.excluded, sw.extra
+    freq_item, fvco, fvco_ref = sw.freq_item, sw.fvco, sw.fvco_ref
+    groups, header, items, keep_ti = sw.groups, sw.header, sw.items, sw.keep_ti
+    meta, others, ref_by_kind = sw.meta, sw.others, sw.ref_by_kind
+    sweep_mode, tcol, tname = sw.sweep_mode, sw.tcol, sw.tname
+    vt_col, vt_name, vt_why = sw.vt_col, sw.vt_name, sw.vt_why
+    warnings, wb, ws = sw.warnings, sw.wb, sw.ws
 
     # ---- 打印识别结果 ----
     # ws.max_row/max_column 是「声明尺寸」——模板预设过格式的空区域也算进去，
