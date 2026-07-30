@@ -506,7 +506,6 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
             num_col = j in CHIP_NUMCOL
             cell = put(ws, r, c0 + j, v, st,
                        st["f_res"] if j < 3 else st["f_zone"],
-                       align="right" if num_col else "center",
                        size=10 if num_col else 9,
                        color=None if num_col else COLOR_MUTED)
             if v is not None and num_col:
@@ -519,7 +518,7 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
     agg = [min(mins) if mins else None, median(typs) if typs else None,
            max(maxs) if maxs else None]
     for j, v in enumerate(agg):
-        cell = put(ws, r, C_SUM + j, v, st, st["f_sum"], bold=True, align="right")
+        cell = put(ws, r, C_SUM + j, v, st, st["f_sum"], bold=True)
         if v is not None:
             cell.number_format = "0." + "0" * nd
     put(ws, r, C_JUDGE, _judge_formula(r), st, st["f_res"], bold=True)
@@ -851,9 +850,23 @@ def write_journey(wb, tables, chips, st, no_charts=False):
 # 扫描拼出来、Margin 怎么算、Kvco 怎么逐区间取——都是逐轮改出来的，不重新发明）。
 # 这里只做两件事：删掉不进评审表的行、把它按芯片横排。
 VCO_DROP = {
-    "CT Band Step (avg)",     # 平均步长下不了判断，spec 只约束最坏情况
-    "Drift in CT Codes",      # 与 Freq Drift + CT Band Step 强冗余（≈ 前者÷后者）
-    "Current_mA",             # 电流另有专门的测试表格
+    "CT Band Step (avg)",       # 平均步长下不了判断，spec 只约束最坏情况
+    "Drift in CT Codes",        # 与 Freq Drift + CT Band Step 强冗余（≈ 前者÷后者）
+    "Current_mA",               # 电流另有专门的测试表格
+    "Margin to fVCO (low)",     # 用户 2026-07-30 删：Fmin/Fmax 直接对 Spec 判就够了
+    "Margin to fVCO (high)",
+    "Kvco max/min",             # 用户 2026-07-30 删
+}
+# 判定方向的补丁：build_conclusion 给 Kvco min/max 留空（单簿页只作对照），
+# 但跨芯片表要判定，方向得写明白：增益太小锁不住/带宽不够，太大杂散与噪声恶化。
+VCO_LIMIT_FIX = {"Kvco min": "≥", "Kvco max": "≤"}
+# 备注补一句"这是什么"。★ 只补定义，不补解读——评审要的是"这个数怎么来的"。
+VCO_NOTE_ADD = {
+    "Sub-band Tuning Range":
+        "＝一个电容码不动、调谐电压走全程能覆盖多宽（子带宽度）。"
+        "它必须大于相邻码的频率步长，否则两个子带之间有一段频率任何码任何电压都到不了",
+    "CT Band Coverage": "＝整个电容阵列能覆盖多宽（不含调谐电压那一维）",
+    "Tuning Range": "＝调谐电压与电容码合起来的总覆盖宽度",
 }
 VCO_DROP_PREFIX = ("Kvco @",)  # 工作点那个值落在 Kvco min/max 之间，判定上冗余
 # ★ 粗码温度下算不出真步长：高低温只测 5 个码（0/64/128/192/255），
@@ -876,7 +889,13 @@ def vco_rows(sw, ref_temp, op_vtune):
         if d["item"] in VCO_COARSE_BLANK:
             for t in coarse:
                 vals.pop(t, None)
-        out.append((d["cat"], d["item"], d["unit"], d["dir"], d["kind"], vals))
+        note = d.get("note") or ""
+        add = VCO_NOTE_ADD.get(d["item"])
+        if add:
+            note = f"{note}；{add}" if note else add
+        out.append({"cat": d["cat"], "item": d["item"], "unit": d["unit"],
+                    "dir": VCO_LIMIT_FIX.get(d["item"], d["dir"]),
+                    "kind": d["kind"], "vals": vals, "note": note})
     return out, temps
 
 
@@ -942,7 +961,7 @@ def write_vco_summary(wb, vtables, chips, st, vtemps):
         for j in range(nax):
             ws.column_dimensions[_cl(vchip(k) + j)].width = 11
         ws.column_dimensions[_cl(vchip(k) + nax)].width = 2
-    ws.column_dimensions[_cl(vnote())].width = 34
+    ws.column_dimensions[_cl(vnote())].width = 46
 
     r = 1
     judged = []
@@ -998,12 +1017,14 @@ def write_vco_summary(wb, vtables, chips, st, vtemps):
 
         # ---- 行序：按 (cat, item) 对齐各片；cat 变了插一条分组带 ----
         order, seen = [], set()
+        notes_of = {}
         for chip in chips:
-            for cat, item, unit, dr, kind, _v in (data.get(chip) or []):
-                key = (cat, item)
+            for d in (data.get(chip) or []):
+                key = (d["cat"], d["item"])
+                notes_of.setdefault(key, d["note"])
                 if key not in seen:
                     seen.add(key)
-                    order.append((cat, item, unit, dr, kind))
+                    order.append((d["cat"], d["item"], d["unit"], d["dir"], d["kind"]))
         j0 = None
         cur_cat = None
         band0 = None
@@ -1034,14 +1055,12 @@ def write_vco_summary(wb, vtables, chips, st, vtemps):
 
             allv, roomv = [], []
             for k, chip in enumerate(chips):
-                got = {(c_, i_): v_ for c_, i_, _u, _d, _k, v_ in (data.get(chip) or [])}
+                got = {(d["cat"], d["item"]): d["vals"] for d in (data.get(chip) or [])}
                 vals = got.get((cat, item), {})
                 for j, t in enumerate(vtemps):
                     v = vals.get(t)
                     disp = fmt_num(v, nd) if isinstance(v, (int, float)) else v
                     cell = put(ws, r, vchip(k) + j, disp, st, body,
-                               align="right" if isinstance(disp, (int, float))
-                               else "center",
                                size=10 if isinstance(disp, (int, float)) else 9)
                     if isinstance(disp, (int, float)):
                         cell.number_format = "0." + "0" * nd
@@ -1055,7 +1074,7 @@ def write_vco_summary(wb, vtables, chips, st, vtemps):
                    max(allv) if allv else None] if is_res else [None] * 3
             for j, v in enumerate(agg):
                 cell = put(ws, r, C_SUM + j, v, st,
-                           st["f_sum"] if is_res else body, bold=True, align="right")
+                           st["f_sum"] if is_res else body, bold=True)
                 if v is not None:
                     cell.number_format = "0." + "0" * nd
             put(ws, r, C_JUDGE, _judge_formula(r) if is_res else None, st,
@@ -1063,16 +1082,19 @@ def write_vco_summary(wb, vtables, chips, st, vtemps):
             # 备注只写"哪一片整行没数"。不要去说某一个温度格为什么空：
             # 有些空格是设计上的（温漂对参考温自己恒等于 0，那格不是测量结果；
             # 粗码温度算不出步长），写成"缺数据"是误报。
-            note = ""
+            # ★ 备注 = 这个数怎么算出来的（算式，来自单簿脚本的 note）。
+            #   评审第一句就是"这怎么算出来的"；不写算式就得每次口头解释一遍。
+            note = notes_of.get((cat, item), "")
             if is_res:
                 miss = []
                 for c_ in chips:
-                    got = {(a, b): v for a, b, _u, _d, _k, v in (data.get(c_) or [])}
+                    got = {(d["cat"], d["item"]): d["vals"]
+                           for d in (data.get(c_) or [])}
                     vals_ = got.get((cat, item)) or {}
                     if not any(isinstance(v, (int, float)) for v in vals_.values()):
                         miss.append(c_)
                 if miss:
-                    note = f"没有这一项: {', '.join(miss)}"
+                    note = (note + "；" if note else "") +                            f"没有这一项: {', '.join(miss)}"
             put(ws, r, vnote(), as_text(note), st, body, align="left", size=9,
                 color=COLOR_MUTED)
             r += 1
@@ -1180,13 +1202,11 @@ def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
                 maxn = max(maxn, len(xs))
                 idx = {x: i for i, x in enumerate(xs)}
                 for i, x in enumerate(xs):
-                    put(ws, head_row + 1 + i, c0, x, st, st["f_res"], size=9,
-                        align="right")
+                    put(ws, head_row + 1 + i, c0, x, st, st["f_res"], size=9)
                 for j, t in enumerate(vtemps):
                     for x, v in ser.get(t, []):
                         cell = put(ws, head_row + 1 + idx[x], c0 + 1 + j,
-                                   fmt_num(v, 3), st, st["f_res"], size=9,
-                                   align="right")
+                                   fmt_num(v, 3), st, st["f_res"], size=9)
                         cell.number_format = "0.000"
                 prepared.setdefault((mod, tag), {})[chip] = (head_row + 1, len(xs), ser)
             r_data = head_row + 1 + maxn + 1
@@ -1443,7 +1463,7 @@ def main():
             notes[id(b)] = f"{sw.ws_val.max_row}行×{sw.ws_val.max_column}列"
             coarse = coarse_temps(sw)
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
-                  f"结论行 {sum(1 for x in rows if x[4] == 'result')} 条 / "
+                  f"结论行 {sum(1 for x in rows if x['kind'] == 'result')} 条 / "
                   f"指标 {len(sw.items)} 个   [{b.name}]")
             if coarse:
                 print(f"     · CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
