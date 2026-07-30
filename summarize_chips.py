@@ -6,10 +6,10 @@ summarize_chips.py — 一个目录里的多颗芯片 → 一份给评审看的�
 输入是这样一棵树（一层芯片目录，芯片编号＝目录名）：
 
     <根目录>/
-        TT015/  <模块>PLL_Temperature_Sweep_*.xlsx     PLL 温度扫描
+        <芯片1>/  <模块>PLL_Temperature_Sweep_*.xlsx     PLL 温度扫描
                 <模块>VCO_*.xlsx                       VCO 开环压控
                 <模块>_Current_*.xlsx                  电流（本版只清点，不处理）
-        TT087/  ...
+        <芯片2>/  ...
 
 输出一份 .xlsx：
 
@@ -40,6 +40,7 @@ import os
 import re
 import sys
 
+from summarize_vco_sweep import load_vco
 from sweep_lib import (
     COLOR_FLAG, COLOR_MUTED, COLOR_PASS, FILL_FAIL, FILL_PASS,
     LEG_STYLE, apply_y, as_text, axis_bounds, blank_policy,
@@ -68,7 +69,7 @@ SKIP_RE = re.compile(r"(^~\$)|(_summary\.xlsx$)|(_chips_summary\.xlsx$)", re.I)
 
 
 def natkey(s):
-    """TT015 < TT087 < TT105：数字段按数值比，别按字符串比。"""
+    """A015 < A087 < A105：数字段按数值比，别按字符串比。"""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(s))]
 
 
@@ -525,7 +526,7 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
 
     # 备注只写事实：包络的两头各出自哪一片（值本身各片列里就有，不重复写）。
     # ★ 跟 @℃ 同一个道理——并列要说出来。量化过的量（频率）常常各片 MIN 一样，
-    #   写"Min 出自 TT015"会被读成"这片最差"，那是个不存在的结论。
+    #   写"Min 出自 某一片"会被读成"这片最差"，那是个不存在的结论。
     def _who(vals, agg):
         got = [(c, v) for (c, _s), v in zip(marks, vals) if v is not None]
         if not got:
@@ -844,6 +845,406 @@ def write_journey(wb, tables, chips, st, no_charts=False):
     return ws
 
 
+# ---------------------------------------------------------------- VCO 页
+
+# 结论行的定义全部复用 summarize_vco_sweep.build_conclusion（Fmin/Fmax 怎么由两段
+# 扫描拼出来、Margin 怎么算、Kvco 怎么逐区间取——都是逐轮改出来的，不重新发明）。
+# 这里只做两件事：删掉不进评审表的行、把它按芯片横排。
+VCO_DROP = {
+    "CT Band Step (avg)",     # 平均步长下不了判断，spec 只约束最坏情况
+    "Drift in CT Codes",      # 与 Freq Drift + CT Band Step 强冗余（≈ 前者÷后者）
+    "Current_mA",             # 电流另有专门的测试表格
+}
+VCO_DROP_PREFIX = ("Kvco @",)  # 工作点那个值落在 Kvco min/max 之间，判定上冗余
+# ★ 粗码温度下算不出真步长：高低温只测 5 个码（0/64/128/192/255），
+#   "相邻两码的频率差"实际是跨 64 个码的平均，跟常温那个数不是一回事。
+#   宁可留空——填一个差 50 倍的数比没有数糟得多。
+VCO_COARSE_BLANK = {"CT Band Step (max)"}
+
+
+def vco_rows(sw, ref_temp, op_vtune):
+    """一颗芯片一个模块的结论行 -> [(cat, item, unit, dir, kind, {温度: 值})]"""
+    from summarize_vco_sweep import build_conclusion
+    rows, temps = build_conclusion(sw.by_kind, sw.items, sw.freq_item, ref_temp,
+                                   sw.fvco, sw.fvco_ref, {}, op_vtune)
+    coarse = coarse_temps(sw)
+    out = []
+    for d in rows:
+        if d["item"] in VCO_DROP or d["item"].startswith(VCO_DROP_PREFIX):
+            continue
+        vals = dict(d["vals"])
+        if d["item"] in VCO_COARSE_BLANK:
+            for t in coarse:
+                vals.pop(t, None)
+        out.append((d["cat"], d["item"], d["unit"], d["dir"], d["kind"], vals))
+    return out, temps
+
+
+def coarse_temps(sw):
+    """CT 扫的码不是逐码密扫的那些温度。相邻码步长 > 1 就算粗扫。"""
+    from summarize_vco_sweep import group_series
+    out = set()
+    for kind, groups in sw.by_kind:
+        if kind != "ct":
+            continue
+        for g in groups:
+            xs = sorted(group_series(g, sw.freq_item))
+            if len(xs) < 2:
+                continue
+            if min(b - a for a, b in zip(xs, xs[1:])) > 1:
+                out.add(g.temp)
+    return out
+
+
+def op_vtune_of(sw):
+    """CT 扫把 Vtune 钉在哪个值上——工作点就取它。"""
+    for kind, groups in sw.by_kind:
+        if kind == "ct":
+            for g in groups:
+                xs = [r.vt for r in g.rows if r.vt is not None]
+                if xs:
+                    return xs[0]
+    return None
+
+
+def write_vco_summary(wb, vtables, chips, st, vtemps):
+    """VCO 汇总表：每颗芯片的组内轴＝三个温度（不是 Min/Typ/Max）。
+
+    ★ 为什么这里用温度当轴、PLL 那页用极值当轴：VCO 这些量本来就是"一个温度
+      算出一个数"，而温度只有 3 档。把 3 个数压成 Min/Typ/Max 还是占 3 列，
+      却把"哪个温度"丢了——纯信息损失。PLL 那边是 49 个测点压成 3 个数，
+      压缩有真收益。
+    """
+    ws = wb.create_sheet("VCO_Summary")
+    n = len(chips)
+    nax = len(vtemps)
+    cw = nax + 1
+
+    def vchip(k):
+        return C_CHIP0 + k * cw
+
+    def vnote():
+        return vchip(n)
+
+    def vrails():
+        return [C_GAP1, C_GAP2, C_GAP3] + [vchip(k) + nax for k in range(n)]
+
+    ws.column_dimensions[_cl(C_ITEM)].width = 26
+    ws.column_dimensions[_cl(C_UNIT)].width = 9
+    ws.column_dimensions[_cl(C_LIMIT)].width = 8
+    for c in list(range(C_SPEC, C_SPEC + 3)) + list(range(C_SIM, C_SIM + 3)) + \
+            list(range(C_SUM, C_SUM + 3)):
+        ws.column_dimensions[_cl(c)].width = 10
+    ws.column_dimensions[_cl(C_JUDGE)].width = 8
+    for c in (C_GAP1, C_GAP2, C_GAP3):
+        ws.column_dimensions[_cl(c)].width = 2
+    for k in range(n):
+        for j in range(nax):
+            ws.column_dimensions[_cl(vchip(k) + j)].width = 11
+        ws.column_dimensions[_cl(vchip(k) + nax)].width = 2
+    ws.column_dimensions[_cl(vnote())].width = 34
+
+    r = 1
+    judged = []
+    for mod, data in vtables:
+        t0 = r
+        # ---- 三行表头 ----
+        c = put(ws, r, C_ITEM, f"{mod} VCO 开环特性汇总", st, st["f_sep"],
+                bold=True, align="left", size=12)
+        ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
+        c.alignment = _align("left", wrap=False)
+        hr, ar = r + 1, r + 2
+        for col, name in ((C_ITEM, "测试项"), (C_UNIT, "Unit"),
+                          (C_LIMIT, "Limit"), (C_JUDGE, "判定")):
+            put(ws, hr, col, name, st, st["f_head"], bold=True)
+            put(ws, ar, col, None, st, st["f_head"])
+            ws.merge_cells(start_row=hr, start_column=col, end_row=ar, end_column=col)
+        groups = [(C_SPEC, "Spec（留空，填完自动判定）", AXES, 3),
+                  (C_SIM, "仿真（留空）", AXES, 3),
+                  (C_SUM, f"汇总 · {n} 片",
+                   ["Min\n(全部片全温)", "Typ\n(各片常温中位)", "Max\n(全部片全温)"], 3)]
+        for k, chip in enumerate(chips):
+            groups.append((vchip(k), chip,
+                           [f"{fmt_num(t)}℃" for t in vtemps], nax))
+        for col, name, axes, w in groups:
+            put(ws, hr, col, name, st, st["f_head"], bold=True)
+            for j in range(1, w):
+                put(ws, hr, col + j, None, st, st["f_head"])
+            ws.merge_cells(start_row=hr, start_column=col, end_row=hr,
+                           end_column=col + w - 1)
+            fill = st["f_in"] if col in (C_SPEC, C_SIM) else st["f_head"]
+            for j, lb in enumerate(axes):
+                put(ws, ar, col + j, lb, st, fill, bold=True, size=9)
+        for col in vrails():
+            for rr in (hr, ar):
+                put(ws, rr, col, None, st, st["f_rail"])
+        put(ws, hr, vnote(), "备注", st, st["f_head"], bold=True)
+        put(ws, ar, vnote(), None, st, st["f_head"])
+        ws.merge_cells(start_row=hr, start_column=vnote(), end_row=ar,
+                       end_column=vnote())
+        ws.row_dimensions[ar].height = 30
+        r = ar + 1
+
+        cap = ("每颗芯片三列＝三个温度各自算出来的值（不是极值，VCO 的量按温度报）。　"
+               "汇总列：Min / Max 取全部芯片全部温度的包络，Typ 取各片常温值的中位数。　"
+               "判定只看 Spec 的 Min / Max 两头。　"
+               "CT 全码扫只在常温做（条件行「CT Code Range (points)」括号里就是测点数），"
+               "所以按相邻码算的步长只有常温有。")
+        c = put(ws, r, C_ITEM, cap, st, st["f_group"], align="left", size=9)
+        ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
+        c.alignment = _align("left", wrap=True)
+        ws.row_dimensions[r].height = 30
+        r += 1
+
+        # ---- 行序：按 (cat, item) 对齐各片；cat 变了插一条分组带 ----
+        order, seen = [], set()
+        for chip in chips:
+            for cat, item, unit, dr, kind, _v in (data.get(chip) or []):
+                key = (cat, item)
+                if key not in seen:
+                    seen.add(key)
+                    order.append((cat, item, unit, dr, kind))
+        j0 = None
+        cur_cat = None
+        band0 = None
+        for cat, item, unit, dr, kind in order:
+            if cat != cur_cat:
+                if band0 is not None and r - band0 > 4:
+                    for rr in range(band0 + 3, r - 1, 4):
+                        _hguide(ws, rr, C_ITEM, vnote())
+                put(ws, r, C_ITEM, cat, st, st["f_sep"], bold=True, align="left")
+                for cc in range(C_ITEM + 1, vnote() + 1):
+                    put(ws, r, cc, None, st, st["f_sep"])
+                r += 1
+                cur_cat, band0 = cat, r
+            is_res = kind == "result"
+            if is_res and j0 is None:
+                j0 = r
+            nd = 3 if unit == "MHz" else 2
+            body = st["f_res"] if is_res else st["f_group"]
+            put(ws, r, C_ITEM, item, st, body, align="left")
+            put(ws, r, C_UNIT, unit, st, body, size=9)
+            put(ws, r, C_LIMIT, dr if is_res else None, st,
+                st["f_in"] if is_res else body, size=9)
+            for j in range(3):
+                put(ws, r, C_SPEC + j, None, st, st["f_in"] if is_res else body)
+                put(ws, r, C_SIM + j, None, st, st["f_in"] if is_res else body)
+            for cc in vrails():
+                put(ws, r, cc, None, st, st["f_rail"])
+
+            allv, roomv = [], []
+            for k, chip in enumerate(chips):
+                got = {(c_, i_): v_ for c_, i_, _u, _d, _k, v_ in (data.get(chip) or [])}
+                vals = got.get((cat, item), {})
+                for j, t in enumerate(vtemps):
+                    v = vals.get(t)
+                    disp = fmt_num(v, nd) if isinstance(v, (int, float)) else v
+                    cell = put(ws, r, vchip(k) + j, disp, st, body,
+                               align="right" if isinstance(disp, (int, float))
+                               else "center",
+                               size=10 if isinstance(disp, (int, float)) else 9)
+                    if isinstance(disp, (int, float)):
+                        cell.number_format = "0." + "0" * nd
+                        allv.append(disp)
+                        if t == _room_of(vtemps):
+                            roomv.append(disp)
+                put(ws, r, vchip(k) + nax, None, st, st["f_rail"])
+
+            agg = [min(allv) if allv else None,
+                   median(roomv) if roomv else None,
+                   max(allv) if allv else None] if is_res else [None] * 3
+            for j, v in enumerate(agg):
+                cell = put(ws, r, C_SUM + j, v, st,
+                           st["f_sum"] if is_res else body, bold=True, align="right")
+                if v is not None:
+                    cell.number_format = "0." + "0" * nd
+            put(ws, r, C_JUDGE, _judge_formula(r) if is_res else None, st,
+                st["f_res"] if is_res else body, bold=True)
+            # 备注只写"哪一片整行没数"。不要去说某一个温度格为什么空：
+            # 有些空格是设计上的（温漂对参考温自己恒等于 0，那格不是测量结果；
+            # 粗码温度算不出步长），写成"缺数据"是误报。
+            note = ""
+            if is_res:
+                miss = []
+                for c_ in chips:
+                    got = {(a, b): v for a, b, _u, _d, _k, v in (data.get(c_) or [])}
+                    vals_ = got.get((cat, item)) or {}
+                    if not any(isinstance(v, (int, float)) for v in vals_.values()):
+                        miss.append(c_)
+                if miss:
+                    note = f"没有这一项: {', '.join(miss)}"
+            put(ws, r, vnote(), as_text(note), st, body, align="left", size=9,
+                color=COLOR_MUTED)
+            r += 1
+        if band0 is not None and r - band0 > 4:
+            for rr in range(band0 + 3, r - 1, 4):
+                _hguide(ws, rr, C_ITEM, vnote())
+        if j0 is not None:
+            judged.append((j0, r - 1))
+            _limit_dropdown(ws, j0, r - 1)
+        _edges(ws, t0, r - 1, C_SUM, C_SUM + 2)
+        r += 2
+    for a, b in judged:
+        _pass_fail_cf(ws, _cl(C_JUDGE), a, b, st)
+        _over_spec_cf(ws, a, b, st)
+    ws.freeze_panes = f"{_cl(C_CHIP0)}1"
+    return ws
+
+
+def _room_of(vtemps, target=25.0):
+    return min(vtemps, key=lambda t: abs(t - target)) if vtemps else None
+
+
+# ---- VCO 图 --------------------------------------------------------------
+
+VSTRIP_W = 9            # 一颗芯片一竖条：8 列数据 + 1 列间隔
+VCHART_H = 20
+
+
+def _vco_series(sw, temps):
+    """{温度: [(Vtune, F), ...]} 与 {温度: [(Vtune中点, Kvco), ...]} 与 {温度: [(码, F), ...]}"""
+    from summarize_vco_sweep import group_series, slopes
+    fv, kv, fc = {}, {}, {}
+    for kind, groups in sw.by_kind:
+        for g in groups:
+            if g.temp is None:
+                continue
+            ser = group_series(g, sw.freq_item)
+            pts = sorted(ser.items())
+            if kind == "vtune":
+                fv[g.temp] = pts
+                kv[g.temp] = [(sl[0], abs(sl[1])) for sl in slopes(g, sw.freq_item)]
+            elif kind == "ct":
+                fc[g.temp] = pts
+    return fv, kv, fc
+
+
+def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
+    """一页里：每颗芯片一竖条，条内三张图（F-Vtune / Kvco-Vtune / F-CT码）+ 数据源。
+
+    横着一条 band = 同一张图的各片对照；同一模块各片共用纵轴范围，才能直接比。
+    """
+    ws = wb.create_sheet("VCO压控")
+    n = len(chips)
+    for k in range(n):
+        c0 = 1 + k * VSTRIP_W
+        for j in range(VSTRIP_W - 1):
+            ws.column_dimensions[_cl(c0 + j)].width = 10
+        ws.column_dimensions[_cl(c0 + VSTRIP_W - 1)].width = 2
+
+    c = put(ws, 1, 1, "VCO 开环压控 —— 一颗芯片一竖条，一张图只画一颗芯片的一个模块。"
+                      "同一模块各片共用纵轴范围，可以直接横向比。"
+                      "★CT 全码扫只在常温：高低温只测了几个粗码，那两条只打记号不连线"
+                      "（5 个点跨 64 个码直连出来是一条不存在的曲线）。",
+            st, st["f_sep"], bold=True, align="left")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n * VSTRIP_W)
+    c.alignment = _align("left", wrap=True)
+    ws.row_dimensions[1].height = 32
+    for k, chip in enumerate(chips):
+        put(ws, 2, 1 + k * VSTRIP_W, chip, st, st["f_head"], bold=True, size=12)
+        for j in range(1, VSTRIP_W):
+            put(ws, 2, 1 + k * VSTRIP_W + j, None, st, st["f_head"])
+        ws.merge_cells(start_row=2, start_column=1 + k * VSTRIP_W,
+                       end_row=2, end_column=(k + 1) * VSTRIP_W)
+
+    nb = 3 * len(vtables)          # 每个模块 3 个 band
+    r_data = 3 + (0 if no_charts else nb * VCHART_H)
+    prepared = {}
+    for mod, data in vtables:
+        for tag, cols_of in (("v", lambda ts: ["Vtune (V)"] + [f"F@{fmt_num(t)}℃"
+                                                               for t in ts]),
+                             ("k", lambda ts: ["Vtune (V)"] + [f"Kvco@{fmt_num(t)}℃"
+                                                               for t in ts]),
+                             ("c", lambda ts: ["CT code"] + [f"F@{fmt_num(t)}℃"
+                                                             for t in ts])):
+            head = cols_of(vtemps)
+            title = {"v": "频率 vs Vtune", "k": "Kvco vs Vtune",
+                     "c": "频率 vs CT 码"}[tag]
+            head_row = r_data + 1
+            maxn = 0
+            for k, chip in enumerate(chips):
+                c0 = 1 + k * VSTRIP_W
+                ser = (data.get(chip) or {}).get(tag) or {}
+                put(ws, r_data, c0, f"{mod} · {title}" if ser
+                    else f"{mod} · {title}：{chip} 未测", st, st["f_sep"],
+                    bold=True, align="left")
+                for j in range(1, VSTRIP_W):
+                    put(ws, r_data, c0 + j, None, st, st["f_sep"])
+                ws.merge_cells(start_row=r_data, start_column=c0,
+                               end_row=r_data, end_column=c0 + VSTRIP_W - 1)
+                for j, h in enumerate(head):
+                    put(ws, head_row, c0 + j, h, st, st["f_head"], bold=True, size=9)
+                if not ser:
+                    continue
+                xs = sorted({x for t in vtemps for x, _v in ser.get(t, [])})
+                maxn = max(maxn, len(xs))
+                idx = {x: i for i, x in enumerate(xs)}
+                for i, x in enumerate(xs):
+                    put(ws, head_row + 1 + i, c0, x, st, st["f_res"], size=9,
+                        align="right")
+                for j, t in enumerate(vtemps):
+                    for x, v in ser.get(t, []):
+                        cell = put(ws, head_row + 1 + idx[x], c0 + 1 + j,
+                                   fmt_num(v, 3), st, st["f_res"], size=9,
+                                   align="right")
+                        cell.number_format = "0.000"
+                prepared.setdefault((mod, tag), {})[chip] = (head_row + 1, len(xs), ser)
+            r_data = head_row + 1 + maxn + 1
+
+    if no_charts:
+        return ws
+
+    row = 3
+    for mod, _data in vtables:
+        for tag in ("v", "k", "c"):
+            got = prepared.get((mod, tag), {})
+            allv = [v for ch in got.values() for t in vtemps
+                    for _x, v in ch[2].get(t, [])]
+            bounds = axis_bounds(allv)
+            for k, chip in enumerate(chips):
+                if chip not in got:
+                    continue
+                first, cnt, ser = got[chip]
+                ws.add_chart(_vco_chart(ws, tag, chip, mod, 1 + k * VSTRIP_W,
+                                        first, cnt, vtemps, bounds, ser),
+                             f"{_cl(1 + k * VSTRIP_W)}{row}")
+            row += VCHART_H
+    return ws
+
+
+def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser):
+    from openpyxl.chart import Reference, ScatterChart, Series
+    ch = ScatterChart()
+    ch.title = f"{chip} · {mod} " + {"v": "频率 vs Vtune",
+                                     "k": "Kvco vs Vtune",
+                                     "c": "频率 vs CT 码"}[tag]
+    ch.style = 13
+    ch.height, ch.width = 8.2, 14.5
+    blank_policy(ch)
+    ch.x_axis.title = "CT code" if tag == "c" else "Vtune (V)"
+    ch.y_axis.title = {"v": "F (MHz)", "k": "Kvco (MHz/V)", "c": "F (MHz)"}[tag]
+    ch.x_axis.delete = False
+    ch.y_axis.delete = False
+    xref = Reference(ws, min_col=col0, min_row=r_data, max_row=r_data + n_rows - 1)
+    for j, t in enumerate(vtemps):
+        pts = ser.get(t, [])
+        if not pts:
+            continue
+        yref = Reference(ws, min_col=col0 + 1 + j, min_row=r_data - 1,
+                         max_row=r_data + n_rows - 1)
+        s = Series(yref, xref, title_from_data=True)
+        color, sym = LEG_STYLE[j % len(LEG_STYLE)]
+        # ★ 点数少的那几条只打记号不连线：高低温 CT 只测 5 个粗码，
+        #   跨 64 个码直连出来是一条不存在的曲线，看图的人会以为中间测过。
+        sparse = tag == "c" and len(pts) < max(8, n_rows // 4)
+        style_series(s, color, sym, line=not sparse,
+                     size=8 if sparse else (3 if len(pts) > 60 else 5))
+        ch.series.append(s)
+    apply_y(ch, bounds)
+    legend_bottom(ch)
+    return ch
+
+
 # ---------------------------------------------------------------- 审计页
 
 def write_audit(wb, picked, dropped, unknown, failed, notes, st):
@@ -906,7 +1307,13 @@ def main():
     ap.add_argument("--lock-pattern", default=r"_lock$",
                     help="该列匹配这个正则的行 = 一次重锁（默认 _lock$）")
     ap.add_argument("--temp-col", default=None, help="温度列（默认自动找 Temperature）")
-    ap.add_argument("--no-charts", action="store_true", help="温巡页只出数据不画图")
+    ap.add_argument("--no-charts", action="store_true", help="图都不画，只出数据块")
+    ap.add_argument("--no-vco", action="store_true",
+                    help="不做 VCO 两页（只出 PLL 温扫那两页）")
+    ap.add_argument("--ref-temp", type=float, default=25.0,
+                    help="VCO 温漂的参考温度（默认 25）")
+    ap.add_argument("--op-vtune", type=float, default=None,
+                    help="VCO 工作点调谐电压 V（默认取 CT 扫钉住的那个值）")
     ap.add_argument("--no-audit", action="store_true", help="连隐藏的 _审计 页都不要")
     ap.add_argument("--dry-run", action="store_true", help="只清点和核对识别结果")
     args = ap.parse_args()
@@ -955,16 +1362,12 @@ def main():
         for f in loose:
             print(f"      {f}")
     n_cur = sum(len(v) for v in grid.get(KIND_CUR, {}).values())
-    n_vco = sum(len(v) for v in grid.get(KIND_VCO, {}).values())
     if n_cur:
         print(f"  ⚠ 发现 {n_cur} 份电流文件——**本版不处理**（电流表格式未定，"
               f"定了再单独加页）")
-    if n_vco:
-        print(f"  ⚠ 发现 {n_vco} 份 VCO 开环文件——**本版不进这本簿**"
-              f"（单颗深挖用 summarize_vco_sweep.py）")
 
     # ---- 读 PLL 温扫 ----
-    tables, failed, notes, warn_seen = [], [], {}, {}
+    tables, failed, notes, warn_seen, vcharts = [], [], {}, {}, []
     for mod in modules:
         books = grid.get(KIND_PLL, {}).get(mod, {})
         if not books:
@@ -1007,8 +1410,59 @@ def main():
                   + (f"   （{len(who)}/{len(data)} 份都有）" if len(who) > 1
                      else f"   （{who[0]}）"))
         warn_seen.clear()
-    if not tables:
-        sys.exit("没有一份 PLL 温扫文件读成功")
+
+    # ---- 读 VCO 开环 ----
+    vtables, vtemps = [], []
+    for mod in modules:
+        books = grid.get(KIND_VCO, {}).get(mod, {})
+        if not books or args.no_vco:
+            continue
+        vdata, vrows = {}, {}
+        print()
+        print("=== %s VCO 开环 ===" % mod)
+        op = None
+        for chip in chips:
+            b = books.get(chip)
+            if b is None:
+                print(f"  {chip}: 没有这个模块的开环文件")
+                continue
+            try:
+                sw = load_vco(b.path, temp_col=args.temp_col, keep_original=False)
+            except Exception as e:                    # noqa: B902
+                failed.append((b, f"{type(e).__name__}: {e}"))
+                print(f"  {chip}: 读失败 —— {e}")
+                continue
+            # 工作点用第一颗芯片的（CT 扫钉住的那个 Vtune）统一喂给全部芯片：
+            # 否则各片的组名会变成「@ Vtune 0.4V」「@ Vtune 0.45V」，行对不齐
+            if op is None:
+                op = args.op_vtune if args.op_vtune else op_vtune_of(sw)
+            rows, temps = vco_rows(sw, args.ref_temp, op)
+            fv, kv, fc = _vco_series(sw, temps)
+            vrows[chip] = rows
+            vdata[chip] = {"v": fv, "k": kv, "c": fc}
+            notes[id(b)] = f"{sw.ws_val.max_row}行×{sw.ws_val.max_column}列"
+            coarse = coarse_temps(sw)
+            print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
+                  f"结论行 {sum(1 for x in rows if x[4] == 'result')} 条 / "
+                  f"指标 {len(sw.items)} 个   [{b.name}]")
+            if coarse:
+                print(f"     · CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
+                      f"（只测几个码，按相邻码算的步长那几格留空）")
+            for w in sw.warnings:
+                warn_seen.setdefault(w, []).append(chip)
+            for t in temps:
+                if t not in vtemps:
+                    vtemps.append(t)
+        for w, who in warn_seen.items():
+            print(f"  ⚠ {w}   （{'/'.join(who)}）")
+        warn_seen.clear()
+        if vrows:
+            vtables.append((mod, vrows))
+            vcharts.append((mod, vdata))
+    vtemps.sort()
+
+    if not tables and not vtables:
+        sys.exit("没有一份 PLL 温扫 / VCO 开环文件读成功")
 
     if args.dry_run:
         print("\n--dry-run：没有写文件。")
@@ -1018,8 +1472,12 @@ def main():
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     st = styles()
-    write_summary(wb, tables, chips, st)
-    write_journey(wb, tables, chips, st, no_charts=args.no_charts)
+    if tables:
+        write_summary(wb, tables, chips, st)
+        write_journey(wb, tables, chips, st, no_charts=args.no_charts)
+    if vtables:
+        write_vco_summary(wb, vtables, chips, st, vtemps)
+        write_vco_charts(wb, vcharts, chips, st, vtemps, no_charts=args.no_charts)
     if not args.no_audit:
         write_audit(wb, picked, dropped, unknown, failed, notes, st)
     wb.calculation.fullCalcOnLoad = True
@@ -1032,7 +1490,7 @@ def main():
     print(f"\n已写出: {os.path.abspath(out)}")
     print("  可见页: " + " / ".join(s.title for s in wb.worksheets
                                     if s.sheet_state == "visible"))
-    print("  PLL_Summary 的 Spec / 仿真 / Limit 列留空，填进 Spec Min/Max "
+    print("  各汇总页的 Spec / 仿真 / Limit 列留空，填进 Spec Min/Max "
           "判定列自动出 PASS/FAIL 并上色。")
     if n_strip:
         print(f"  判定列 {n_strip} 格清掉了空缓存值（Excel 打开自己算）。")
