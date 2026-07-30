@@ -1273,6 +1273,75 @@ def write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all=()):
     return ws
 
 
+# ---------------------------------------------------------------- 出稿自查
+
+def selfcheck(path):
+    """把刚写出来的簿子读回来自查两条。**跑完就查，不给人多敲一条命令的机会。**
+
+    ① 汇总列的每个数字都必须能在同一行的格子里找到。
+       （2026-07-30 翻过车：温度列放中位数、极值却对逐点取，出现「-40℃ 那格
+       写 -54.19，MAX 写 -53.45 @-40℃」，用户当场判成算错了。）
+    ② 判定列的公式格不能留下**空的缓存值**。openpyxl 有的版本会写
+       `<f>公式</f><v></v>`＝在文件里写着"这公式的结果就是空"，自己机器上打开
+       正常（触发了重算），发给别人就是一片空白。xlsx_formula_cache 负责清掉，
+       这里负责确认真的清掉了——不同 openpyxl 版本行为不一样，不能只信一台机器。
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path)
+    wv = openpyxl.load_workbook(path, data_only=True)
+    fails, n_agg, n_f = [], 0, 0
+
+    for name in ("PLL_Summary", "VCO_Summary"):
+        if name not in wb.sheetnames:
+            continue
+        ws, wsv = wb[name], wv[name]
+        ax = 0
+        while ws.cell(3, C_CHIP0 + ax).value not in (None, ""):
+            ax += 1
+        w = ax + 1
+        n = 0
+        while ws.cell(2, C_CHIP0 + n * w).value not in (None, "", "备注"):
+            n += 1
+        # 常温在组里的第几列（轴头写的就是温度，挑最接近 25 的）
+        ri, best = 0, None
+        for j in range(ax):
+            try:
+                d = abs(float(str(ws.cell(3, C_CHIP0 + j).value).replace("℃", "")) - 25)
+            except ValueError:
+                continue
+            if best is None or d < best:
+                ri, best = j, d
+        for r in range(1, ws.max_row + 1):
+            item = ws.cell(r, 1).value
+            got = [ws.cell(r, C_SUM + j).value for j in range(3)]
+            if not isinstance(item, str) or not all(
+                    v is None or isinstance(v, (int, float)) for v in got):
+                continue
+            jf = ws.cell(r, C_JUDGE).value
+            if isinstance(jf, str) and jf.startswith("="):
+                n_f += 1
+                if wsv.cell(r, C_JUDGE).value is not None:
+                    fails.append(f"{name} 第{r}行 判定列留了缓存值 "
+                                 f"{wsv.cell(r, C_JUDGE).value!r}——别人打开会看到它")
+            if all(v is None for v in got):
+                continue
+            cells = [v for v in (ws.cell(r, C_CHIP0 + k * w + j).value
+                                 for k in range(n) for j in range(ax))
+                     if isinstance(v, (int, float))]
+            room = [v for v in (ws.cell(r, C_CHIP0 + k * w + ri).value
+                                for k in range(n)) if isinstance(v, (int, float))]
+            exp = [min(cells) if cells else None,
+                   median(room) if room else None,
+                   max(cells) if cells else None]
+            for j, (x, y) in enumerate(zip(exp, got)):
+                n_agg += 1
+                if (x is None) != (y is None) or (
+                        x is not None and abs(float(x) - float(y)) > 1e-9):
+                    fails.append(f"{name}「{item}」第{j+1}个汇总格: "
+                                 f"表上的格子给出 {x}，写的是 {y}")
+    return fails, n_agg, n_f
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -1481,8 +1550,16 @@ def main():
                                     if s.sheet_state == "visible"))
     print("  各汇总页的 Spec / 仿真 / Limit 列留空，填进 Spec Min/Max "
           "判定列自动出 PASS/FAIL 并上色。")
-    if n_strip:
-        print(f"  判定列 {n_strip} 格清掉了空缓存值（Excel 打开自己算）。")
+    fails, n_agg, n_f = selfcheck(out)
+    print(f"  自查: {n_agg} 个汇总格子都能在同一行的格子里找到；"
+          f"{n_f} 个判定公式没有留下缓存值"
+          + (f"（清掉了 {n_strip} 个空缓存）" if n_strip else "") + "。")
+    if fails:
+        print()
+        print("  ✗ 自查没过，这份簿子先别发出去：")
+        for f in fails[:20]:
+            print(f"      {f}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
