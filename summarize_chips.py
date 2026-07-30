@@ -828,10 +828,19 @@ VCO_DROP = {
     "Sub-band Tuning Range",
     "CT Band Step (max)",
     "Target fVCO",              # 用户 2026-07-30 删（Margin 那两行已经没了，它成了孤立参照）
+    # ★ Kvco min/max 删（用户 2026-07-30）：它们是"逐区间斜率的极值"，回答的是
+    #   「带内增益平不平」——那是个**形状**问题，一条曲线一秒看明白、两个数字反而
+    #   看不明白（用户看着它们问"这到底是啥"就是证据）。而且表里那两个数**就是**
+    #   VCO压控 页 Kvco-vs-Vtune 那条曲线的最低点和最高点，同一件事说了两遍。
+    #   形状交给图（图上给最高/最低点打了数值标注），表里换成两个能下判断的数：
+    #   Kvco average（可核）+ Kvco @工作点（环路带宽真正用的那个）。
+    "Kvco min",
+    "Kvco max",
 }
-# 判定方向的补丁：build_conclusion 给 Kvco min/max 留空（单簿页只作对照），
-# 但跨芯片表要判定，方向得写明白：增益太小锁不住/带宽不够，太大杂散与噪声恶化。
-VCO_LIMIT_FIX = {"Kvco min": "≥", "Kvco max": "≤"}
+# 判定方向的补丁：build_conclusion 里 Kvco 那几行 dir 是空的（单簿页只作对照），
+# 跨芯片表要判定就得写明方向。Kvco 的 spec 通常给一个范围：
+# 太小则环路带宽不够/锁不住，太大则杂散与噪声恶化。
+VCO_LIMIT_FIX = {"Kvco average": "range"}
 # 备注补一句"这是什么"。★ 只补定义，不补解读——评审要的是"这个数怎么来的"。
 VCO_NOTE_ADD = {
     "CT Band Coverage": "＝整个电容阵列能覆盖多宽（不含调谐电压那一维）",
@@ -840,13 +849,18 @@ VCO_NOTE_ADD = {
 # ★ 备注整句改写：让算式里的每一项都**正好是表上某一行的名字**，
 #   这样导出来的数用眼睛就能核（用户原话："缺少了计算他们的中间值，我有些没安全感"）。
 VCO_NOTE_SET = {
+    "Kvco average": "［F(Vtune=最高) − F(Vtune=最低)］÷ Vtune 扫的跨度"
+                    "（两项都在上面的实测端点行里，可以直接核）",
     "Fmin": "CT 扫最低频 −［F(Vtune=0.4V) − F(Vtune=最低)］",
     "Fmax": "CT 扫最高频 +［F(Vtune=最高) − F(Vtune=0.4V)］",
     "Tuning Range": "Fmax − Fmin ＝调谐电压与电容码合起来的总覆盖宽度",
     "CT Band Coverage": "CT 扫最高频 − CT 扫最低频 ＝整个电容阵列能覆盖多宽"
                         "（不含调谐电压那一维）",
 }
-VCO_DROP_PREFIX = ("Kvco @",)  # 工作点那个值落在 Kvco min/max 之间，判定上冗余
+# ★ 空的：`Kvco @工作点` 请回来了。我当初提议删它的理由是"它落在 Kvco min/max
+#   之间、判定上冗余"——那个理由依赖 min/max 存在。min/max 一走，它就是环路带宽
+#   真正用的那个数，而且是全表唯一说得清"工作点增益"的行。
+VCO_DROP_PREFIX = ()
 
 
 def vco_rows(sw, ref_temp, op_vtune):
@@ -868,10 +882,82 @@ def vco_rows(sw, ref_temp, op_vtune):
                     "kind": d["kind"], "vals": vals, "note": note})
     # 原料行**各自插进自己那个组**的最前面（先摆实测端点、再摆拿它们算出来的数）。
     # 整块插在一处会让 Frequency Range / CT Band 两个组头各出现两次。
-    for ep in reversed(endpoint_rows(sw)):
+    eps = endpoint_rows(sw)
+    for ep in reversed(eps):
         i = next((k for k, x in enumerate(out) if x["cat"] == ep["cat"]), len(out))
         out.insert(i, ep)
+    out = _kvco_average(out, eps, sw)
+    out = _drift_at_op(out, ref_temp)
     return out, temps
+
+
+def _kvco_average(out, eps, sw):
+    """给 Kvco 组补一行 `Kvco average`＝端点算的全程平均斜率。
+
+    ★ 它是 Kvco 那一组里**唯一能用表上的格子核出来**的数：
+      ［F(Vtune=最高) − F(Vtune=最低)］÷ Vtune 扫的跨度，两项都在实测端点行里。
+      旁边的 `Kvco @工作点` 是工作点那一段的局部斜率——环路带宽用的是它，
+      但它推不出来，靠 VCO压控 页那张 Kvco-vs-Vtune 图作证。
+      两个都放：一个可核、一个有工程含义，缺哪个都不完整。
+    ★ 曲线弯的时候这两个数会差很多（真数据里逐区间斜率有 7 倍散布），
+      那不是矛盾——正是"一个数说不清 Kvco"的证据，图才是主证据。
+    """
+    lo = next((e for e in eps if e["item"] == "F(Vtune=最低)"), None)
+    hi = next((e for e in eps if e["item"] == "F(Vtune=最高)"), None)
+    if lo is None or hi is None:
+        return out
+    span = _vtune_span(sw)
+    if not span:
+        return out
+    vals = {t: (hi["vals"][t] - lo["vals"][t]) / span
+            for t in hi["vals"] if t in lo["vals"]}
+    if not vals:
+        return out
+    row = {"cat": "Kvco", "item": "Kvco average", "unit": "MHz/V",
+           "dir": VCO_LIMIT_FIX.get("Kvco average", ""), "kind": "result",
+           "vals": {t: abs(v) for t, v in vals.items()},
+           "note": VCO_NOTE_SET["Kvco average"]}
+    i = next((k for k, x in enumerate(out) if x["cat"] == "Kvco"), len(out))
+    out.insert(i, row)
+    return out
+
+
+def _vtune_span(sw):
+    from summarize_vco_sweep import group_series
+    xs = set()
+    for kind, groups in sw.by_kind:
+        if kind != "vtune":
+            continue
+        for g in groups:
+            xs |= set(group_series(g, sw.freq_item))
+    return (max(xs) - min(xs)) if len(xs) >= 2 else None
+
+
+def _drift_at_op(out, ref_temp):
+    """温漂改成**工作点**的漂移：Freq@T − Freq@常温，两项都是表上 `Freq` 那一行。
+
+    ★ 原来是"14 个 Vtune 点各算一个差、取绝对值最大的那个"——14 个中间量全在表外，
+      看的人只能选择信。改成工作点之后零新增行、完全可核，而且符合这条线早就定过的
+      规矩：性能按工作点报，不跨扫描取最差。
+      漂移量在不同 Vtune 上真差很多的话，那是另一个更该被单独看见的现象，
+      不该被一个"取最坏"悄悄吸收掉。
+    """
+    fr = next((x for x in out if x["cat"].startswith("@ Vtune")
+               and x["item"] == "Freq"), None)
+    di = next((k for k, x in enumerate(out)
+               if x["item"].startswith("Freq Drift")), None)
+    if fr is None or di is None:
+        return out
+    ts = [t for t, v in fr["vals"].items() if isinstance(v, (int, float))]
+    if not ts:
+        return out
+    ref = min(ts, key=lambda t: abs(t - ref_temp))
+    base = fr["vals"][ref]
+    out[di] = dict(out[di],
+                   item=f"Freq Drift vs {fmt_num(ref)}℃",
+                   vals={t: fr["vals"][t] - base for t in ts if t != ref},
+                   note=f"@工作点 那一行的 Freq：F(T) − F({fmt_num(ref)}℃)")
+    return out
 
 
 def flat_vtune_temps(sw, ratio=0.1):
@@ -1175,12 +1261,28 @@ def _room_of(vtemps, target=25.0):
 
 VSTRIP_W = 9            # 一颗芯片一竖条：8 列数据 + 1 列间隔
 VCHART_H = 20
+# 四张图：Vtune 轴给"值 + 斜率"，CT 轴也给"值 + 斜率"，对称
+VCO_TAGS = ("v", "k", "c", "d")
+VCO_TITLE = {"v": "频率 vs Vtune", "k": "Kvco vs Vtune", "c": "频率 vs CT 码",
+             "d": "相邻码频率差 vs CT 码（仅常温）"}
+VCO_XLABEL = {"v": "Vtune (V)", "k": "Vtune (V)", "c": "CT code", "d": "CT code"}
+VCO_YHEAD = {"v": "F", "k": "Kvco", "c": "F", "d": "ΔF"}
+VCO_YAXIS = {"v": "F (MHz)", "k": "Kvco (MHz/V)", "c": "F (MHz)",
+             "d": "|ΔF| (MHz/code)"}
+# 斜率图上给全图最低/最高两点打数值标注（值图点太密，标了反而糊）
+VCO_LABELED = ("k", "d")
 
 
 def _vco_series(sw, temps):
-    """{温度: [(Vtune, F), ...]} 与 {温度: [(Vtune中点, Kvco), ...]} 与 {温度: [(码, F), ...]}"""
+    """四组曲线：F-vs-Vtune / Kvco-vs-Vtune / F-vs-CT码 / ΔF-vs-CT码。
+
+    ★ ΔF-vs-CT码（相邻两个码的频率差）**只给密扫的那个温度**。高低温只测几个
+      粗码，"相邻两点"跨了几十个码，算出来是那几十个码的平均，跟常温的逐码步长
+      不是一个量——混在一张图上就是骗人。这也正是表里那一行被删掉的原因。
+    """
     from summarize_vco_sweep import group_series, slopes
-    fv, kv, fc = {}, {}, {}
+    fv, kv, fc, fd = {}, {}, {}, {}
+    coarse = coarse_temps(sw)
     for kind, groups in sw.by_kind:
         for g in groups:
             if g.temp is None:
@@ -1192,7 +1294,10 @@ def _vco_series(sw, temps):
                 kv[g.temp] = [(sl[0], abs(sl[1])) for sl in slopes(g, sw.freq_item)]
             elif kind == "ct":
                 fc[g.temp] = pts
-    return fv, kv, fc
+                if g.temp not in coarse:
+                    fd[g.temp] = [(sl[0], abs(sl[1]))
+                                  for sl in slopes(g, sw.freq_item)]
+    return fv, kv, fc, fd
 
 
 def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
@@ -1223,19 +1328,14 @@ def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
         ws.merge_cells(start_row=2, start_column=1 + k * VSTRIP_W,
                        end_row=2, end_column=(k + 1) * VSTRIP_W)
 
-    nb = 3 * len(vtables)          # 每个模块 3 个 band
+    nb = len(VCO_TAGS) * len(vtables)      # 每个模块几个 band
     r_data = 3 + (0 if no_charts else nb * VCHART_H)
     prepared = {}
     for mod, data in vtables:
-        for tag, cols_of in (("v", lambda ts: ["Vtune (V)"] + [f"F@{fmt_num(t)}℃"
-                                                               for t in ts]),
-                             ("k", lambda ts: ["Vtune (V)"] + [f"Kvco@{fmt_num(t)}℃"
-                                                               for t in ts]),
-                             ("c", lambda ts: ["CT code"] + [f"F@{fmt_num(t)}℃"
-                                                             for t in ts])):
-            head = cols_of(vtemps)
-            title = {"v": "频率 vs Vtune", "k": "Kvco vs Vtune",
-                     "c": "频率 vs CT 码"}[tag]
+        for tag in VCO_TAGS:
+            head = [VCO_XLABEL[tag]] + [f"{VCO_YHEAD[tag]}@{fmt_num(t)}℃"
+                                        for t in vtemps]
+            title = VCO_TITLE[tag]
             head_row = r_data + 1
             maxn = 0
             for k, chip in enumerate(chips):
@@ -1262,7 +1362,8 @@ def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
                         cell = put(ws, head_row + 1 + idx[x], c0 + 1 + j,
                                    fmt_num(v, 3), st, st["f_res"], size=9)
                         cell.number_format = "0.000"
-                prepared.setdefault((mod, tag), {})[chip] = (head_row + 1, len(xs), ser)
+                prepared.setdefault((mod, tag), {})[chip] = (head_row + 1, len(xs),
+                                                            ser, xs)
             r_data = head_row + 1 + maxn + 1
 
     if no_charts:
@@ -1270,50 +1371,68 @@ def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
 
     row = 3
     for mod, _data in vtables:
-        for tag in ("v", "k", "c"):
+        for tag in VCO_TAGS:
             got = prepared.get((mod, tag), {})
             allv = [v for ch in got.values() for t in vtemps
-                    for _x, v in ch[2].get(t, [])]
+                    for _x, v in ch[2].get(t, [])]      # ch[2] = ser
             bounds = axis_bounds(allv)
             for k, chip in enumerate(chips):
                 if chip not in got:
                     continue
-                first, cnt, ser = got[chip]
+                first, cnt, ser, xs = got[chip]
                 ws.add_chart(_vco_chart(ws, tag, chip, mod, 1 + k * VSTRIP_W,
-                                        first, cnt, vtemps, bounds, ser),
+                                        first, cnt, vtemps, bounds, ser, xs),
                              f"{_cl(1 + k * VSTRIP_W)}{row}")
             row += VCHART_H
     return ws
 
 
-def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser):
+def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs):
     from openpyxl.chart import Reference, ScatterChart, Series
+    # ★ 借单簿脚本那份数值标注（只标全图最低/最高两点——三条温度曲线在同一个
+    #   横轴端点上值挨得很近，各标各的会叠成一坨）。放在那边是因为它先写出来的，
+    #   这里不再抄一份，抄了必然漂移。
+    from summarize_vco_sweep import _label_points
+
     ch = ScatterChart()
-    ch.title = f"{chip} · {mod} " + {"v": "频率 vs Vtune",
-                                     "k": "Kvco vs Vtune",
-                                     "c": "频率 vs CT 码"}[tag]
+    ch.title = f"{chip} · {mod} " + VCO_TITLE[tag]
     ch.style = 13
     ch.height, ch.width = 8.2, 14.5
     blank_policy(ch)
-    ch.x_axis.title = "CT code" if tag == "c" else "Vtune (V)"
-    ch.y_axis.title = {"v": "F (MHz)", "k": "Kvco (MHz/V)", "c": "F (MHz)"}[tag]
+    ch.x_axis.title = VCO_XLABEL[tag]
+    ch.y_axis.title = VCO_YAXIS[tag]
     ch.x_axis.delete = False
     ch.y_axis.delete = False
     xref = Reference(ws, min_col=col0, min_row=r_data, max_row=r_data + n_rows - 1)
+    built = {}
     for j, t in enumerate(vtemps):
         pts = ser.get(t, [])
         if not pts:
             continue
         yref = Reference(ws, min_col=col0 + 1 + j, min_row=r_data - 1,
                          max_row=r_data + n_rows - 1)
-        s = Series(yref, xref, title_from_data=True)
+        sr = Series(yref, xref, title_from_data=True)
         color, sym = LEG_STYLE[j % len(LEG_STYLE)]
-        # ★ 点数少的那几条只打记号不连线：高低温 CT 只测 5 个粗码，
-        #   跨 64 个码直连出来是一条不存在的曲线，看图的人会以为中间测过。
+        # ★ 点数少的那几条只打记号不连线：高低温 CT 只测几个粗码，
+        #   跨几十个码直连出来是一条不存在的曲线，看图的人会以为中间测过。
         sparse = tag == "c" and len(pts) < max(8, n_rows // 4)
-        style_series(s, color, sym, line=not sparse,
+        style_series(sr, color, sym, line=not sparse,
                      size=8 if sparse else (3 if len(pts) > 60 else 5))
-        ch.series.append(s)
+        ch.series.append(sr)
+        built[t] = sr
+    if tag in VCO_LABELED and built:
+        pos = {x: i for i, x in enumerate(xs)}
+        allp = [(y, t, x) for t in built for x, y in ser.get(t, [])]
+        if allp:
+            # ★ 同一个系列上的多个标注要**一次交给它**：_label_points 每次调用都
+            #   重建 s.dLbls，分两次调等于第二次把第一次的覆盖掉（曲线是直线时
+            #   最低点和最高点落在同一条系列上，就会只剩一个标注）。
+            want = {}
+            for y, t, x in {min(allp), max(allp)}:
+                if x in pos:
+                    want.setdefault(t, []).append(pos[x])
+            for t, idxs in want.items():
+                _label_points(built[t], idxs, numfmt="0.##")
     apply_y(ch, bounds)
     legend_bottom(ch)
     return ch
@@ -1586,9 +1705,9 @@ def main():
             if op is None:
                 op = args.op_vtune if args.op_vtune else op_vtune_of(sw)
             rows, temps = vco_rows(sw, args.ref_temp, op)
-            fv, kv, fc = _vco_series(sw, temps)
+            fv, kv, fc, fd = _vco_series(sw, temps)
             vrows[chip] = rows
-            vdata[chip] = {"v": fv, "k": kv, "c": fc}
+            vdata[chip] = {"v": fv, "k": kv, "c": fc, "d": fd}
             notes[id(b)] = f"{sw.ws_val.max_row}行×{sw.ws_val.max_column}列"
             coarse = coarse_temps(sw)
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "

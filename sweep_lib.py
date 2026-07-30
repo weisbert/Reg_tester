@@ -566,7 +566,12 @@ def axis_bounds(vals, pad=0.10):
     if not vals:
         return None
     lo, hi = min(vals), max(vals)
-    if hi == lo:
+    # ★ 判"平"要用相对量。写 hi == lo 只挡得住完全相等的情况：一条常数曲线经过
+    #   浮点运算后跨度常是 1e-13 这种量级，于是下面 nice_step 算出个 1e-13 的步长、
+    #   floor/ceil 又把上下界压回同一个数 —— Excel 拿到 min == max 的坐标轴，
+    #   整张图画不出来。（ΔF-vs-CT 这种"步长恒定"的曲线、以及某个温度压控没生效
+    #   压成一条平线的情况，都会踩上。）
+    if hi - lo <= abs(hi) * 1e-9:
         d = abs(hi) * 0.05 or 1.0
         lo, hi = lo - d, hi + d
     m = (hi - lo) * pad
