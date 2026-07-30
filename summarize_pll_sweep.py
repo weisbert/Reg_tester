@@ -62,55 +62,15 @@ try:
 except Exception:
     pass
 
-# report-forge compliance 表的配色（黄表头 / 米色条件行 / 白结果行 / 红超规）
-FILL_HEADER = "FFFF00"
-FILL_GROUP = "EEECE1"
-FILL_RESULT = "FFFFFF"
-FILL_SEP = "B8CCE4"
-COLOR_FLAG = "FF0000"
-COLOR_PASS = "006100"
-FILL_FAIL = "FFC7CE"
-FILL_PASS = "C6EFCE"
-FILL_INPUT = "FFF2CC"       # 要人填的格子（Spec / 仿真值 / 判据），浅黄一眼看得出
-
-# 表里表示"没测/不适用"的占位符，一律当空值
-BLANK_TOKENS = {"", "-", "--", "—", "n/a", "na", "null", "none", "#n/a"}
-
-
-# ---------------------------------------------------------------- 取值
-
-def is_blank(v):
-    if v is None:
-        return True
-    if isinstance(v, str):
-        return v.strip().lower() in BLANK_TOKENS
-    return False
-
-
-def num(v):
-    """数值化；取不到数就返回 None。'-' 这类占位符算没测。"""
-    if is_blank(v) or isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip().replace(",", "")
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def txt(v):
-    return "" if v is None else str(v).strip()
-
-
-def fmt_num(x, nd=3):
-    if x is None:
-        return None
-    if abs(x - round(x)) < 1e-12:
-        return int(round(x))
-    return round(x, nd)
-
+# 读数 / 分段 / 统计 / 画格子 / 图表原语全在公共层 sweep_lib——
+# 跨芯片汇总 summarize_chips.py 用的是同一份，口径只能有一处。
+from sweep_lib import (                                          # noqa: E402
+    FILL_FAIL, FILL_PASS, COLOR_FLAG, COLOR_PASS,
+    is_blank, num, txt, fmt_num, leg_series, stats, stats_all,
+    load_sweep, SweepError, styles as _styles, put,
+    nice_step, axis_bounds, apply_y as _apply_y, legend_bottom as _legend_bottom,
+    style_series as _style, blank_policy, LEG_STYLE,
+)
 
 # 公式格的缓存值：openpyxl 只写空的 <v></v>，不补真值的话别人打开是一片空白。
 # 详见 xlsx_formula_cache 的模块说明（那个坑值得读一遍）。
@@ -139,268 +99,7 @@ def sref(title, col_idx0, xl_row, coerce=False):
     return f"=--{ref}" if coerce else f"={ref}"
 
 
-def fmt_hz(mhz):
-    """offset 频率 MHz -> 好读的标签：0.001->1kHz, 1->1MHz。"""
-    if mhz is None:
-        return "?"
-    if mhz < 1:
-        khz = mhz * 1000.0
-        return f"{fmt_num(khz)}kHz"
-    return f"{fmt_num(mhz)}MHz"
-
-
-# ---------------------------------------------------------------- 列定位
-
-class Columns:
-    """按表头名定位列；重名列会报出来。
-
-    这类原厂模板扩列时复制粘贴不改序号很常见（同名列出现两遍）。
-    按名字取只会一直拿到第一份，第二份永远读不到且不报错——
-    所以这里把重名的列位置全记下来，取第一份并留警告。
-    """
-
-    def __init__(self, header):
-        self.pos = OrderedDict()
-        for i, h in enumerate(header):
-            k = txt(h)
-            if k:
-                self.pos.setdefault(k, []).append(i)
-        self.duplicates = {k: v for k, v in self.pos.items() if len(v) > 1}
-
-    def idx(self, name):
-        v = self.pos.get(name)
-        return v[0] if v else None
-
-    def find(self, *patterns, exclude=()):
-        """按正则找第一个匹配的表头，返回 (名字, 列下标)。"""
-        for k in self.pos:
-            kl = k.lower()
-            if any(re.search(p, kl) for p in patterns) and \
-               not any(re.search(p, kl) for p in exclude):
-                return k, self.pos[k][0]
-        return None, None
-
-
-# ---------------------------------------------------------------- 指标识别
-
-class Item:
-    __slots__ = ("cat", "label", "unit", "col", "src", "text_src")
-
-    def __init__(self, cat, label, unit, col, src):
-        self.cat, self.label, self.unit, self.col, self.src = cat, label, unit, col, src
-        self.text_src = False       # 原始列是文本型数字？是的话引用要加双负号
-
-
-SIMPLE_ITEMS = [
-    # (表头, 分类, 单位)
-    ("Freq_MHz", "Frequency", "MHz"),
-    ("Power_dBm", "Output", "dBm"),
-    ("IPN_SSB", "Phase Noise", "dBc"),
-    ("IPN_Omit_SSB", "Phase Noise", "dBc"),
-    ("Vtune_V", "Tuning", "V"),
-    ("Vtemp_V", "Temp Sensor", "V"),
-    ("Current_mA", "Current", "mA"),
-]
-# 成对列：<前缀>Freq<i> 给频点、<前缀>Result<i> 给结果
-PAIRED_ITEMS = [
-    ("SpotPN", "Phase Noise", "dBc/Hz", "SpotPN@{f}"),
-    ("OtherSpur", "Spur", "dBc", "Spur@{f}"),
-]
-
-
-def build_items(cols, rows):
-    """识别有数据的结果列。结果列整片是空的（占位列）自动丢掉，并记在 dropped 里。"""
-    items, dropped = [], []
-
-    def nonempty(ci):
-        return sum(1 for r in rows if ci < len(r) and not is_blank(r[ci]))
-
-    for name, cat, unit in SIMPLE_ITEMS:
-        ci = cols.idx(name)
-        if ci is None:
-            continue
-        if nonempty(ci) == 0:
-            dropped.append((name, "整列没有数据"))
-            continue
-        items.append(Item(cat, name, unit, ci, name))
-
-    for prefix, cat, unit, tpl in PAIRED_ITEMS:
-        i = 1
-        while True:
-            fc, rc = cols.idx(f"{prefix}Freq{i}"), cols.idx(f"{prefix}Result{i}")
-            if fc is None and rc is None:
-                break
-            i += 1
-            if rc is None:
-                continue
-            n = nonempty(rc)
-            if n == 0:
-                dropped.append((f"{prefix}Result{i-1}", "整列没有数据"))
-                continue
-            freqs = {num(r[fc]) for r in rows
-                     if fc is not None and fc < len(r) and num(r[fc]) is not None}
-            f = fmt_hz(sorted(freqs)[0]) if len(freqs) == 1 else (
-                "/".join(fmt_hz(x) for x in sorted(freqs)[:3]) or f"#{i-1}")
-            items.append(Item(cat, tpl.format(f=f), unit, rc, f"{prefix}Result{i-1}"))
-
-    # 标出「文本型数字」列：Python 解得动、Excel 不认。不标出来的话，
-    # 引用过去 COUNT/MIN 全落空，极值温度那格直接 #N/A。
-    for it in items:
-        n_txt = sum(1 for r in rows
-                    if it.col < len(r) and isinstance(r[it.col], str)
-                    and num(r[it.col]) is not None)
-        it.text_src = n_txt > 0
-    return items, dropped
-
-
-# ---------------------------------------------------------------- 行分段
-
-class Row:
-    __slots__ = ("xl", "temp", "leg", "kind", "vals", "raw")
-
-    def __init__(self, xl, temp, kind, raw):
-        self.xl, self.temp, self.kind, self.raw = xl, temp, kind, raw
-        self.leg, self.vals = None, {}
-
-
-class Leg:
-    def __init__(self, n, lock_temp):
-        self.n, self.lock_temp = n, lock_temp
-        self.rows = []
-
-    @property
-    def temps(self):
-        return [r.temp for r in self.rows if r.temp is not None]
-
-    @property
-    def direction(self):
-        t = self.temps
-        if len(t) < 2:
-            return ""
-        return "↑" if t[-1] > t[0] else ("↓" if t[-1] < t[0] else "")
-
-    @property
-    def title(self):
-        lt = fmt_num(self.lock_temp)
-        return f"段{self.n} 锁@{lt}℃" if lt is not None else f"段{self.n}"
-
-    @property
-    def stage(self):
-        t = self.temps
-        if not t:
-            return ""
-        return f"{fmt_num(t[0])}→{fmt_num(t[-1])}℃ {self.direction}".strip()
-
-
-def segment(rows, leg_col_i, lock_re):
-    """按重锁事件切段。重锁行本身也是测量点（它有结果），算作本段第一个点。"""
-    legs, cur = [], None
-    orphan = []
-    for r in rows:
-        mode = txt(r.raw[leg_col_i]) if leg_col_i is not None and leg_col_i < len(r.raw) else ""
-        if lock_re.search(mode):
-            cur = Leg(len(legs) + 1, r.temp)
-            legs.append(cur)
-            r.kind = "lock"
-        if cur is None:
-            orphan.append(r)          # 第一次重锁之前的行
-            continue
-        r.leg = cur
-        cur.rows.append(r)
-    return legs, orphan
-
-
-# ---------------------------------------------------------------- 统计
-
-def leg_series(leg, item, with_lock=False):
-    """本段的「温度 -> 值」去重视图：同段同温有多个点时取最后一个。
-
-    ★ 默认剔掉重锁行。重锁是这组数据的**取得条件**，不是被考核的性能：
-    把锁定瞬间的读数混进"全温最坏值"里，等于拿锁的过程去判性能的规格。
-    重锁点的值在「温巡过程」「重锁对比」两页完整给出，一个都没丢。
-    （实际上每个重锁点后面都紧跟一个同温的稳定测量点，所以剔掉不丢温度。）
-
-    什么时候会同温多点：重锁行和它后面那个测量点是同一个温度（在端点停下来
-    重锁再测）。取后者＝重锁后稳定下来的那个点。
-
-    ★ 汇总统计和温度明细页**共用这一份**。否则汇总按全部行取极值、明细一格
-    只放得下一个值，就会出现「汇总报的极值在明细里查无此值」——报表一旦对不上账
-    就没人敢信了。
-    """
-    out = OrderedDict()
-    for r in leg.rows:
-        if r.kind == "lock" and not with_lock:
-            continue
-        v = r.vals.get(item.col)
-        if r.temp is not None and v is not None:
-            out[r.temp] = v
-    return out
-
-
-def _extremes(pairs):
-    if not pairs:
-        return None
-    lo = min(pairs, key=lambda x: x[0])
-    hi = max(pairs, key=lambda x: x[0])
-    return {"min": lo[0], "min_t": lo[1], "max": hi[0], "max_t": hi[1],
-            "delta": hi[0] - lo[0], "n": len(pairs)}
-
-
-def stats(leg, item):
-    return _extremes([(v, t) for t, v in leg_series(leg, item).items()])
-
-
-def stats_all(legs, item, room_t=None):
-    """全温统计。TYP 取常温点的中位数——常温在温巡里被经过好几次，
-    取中位数比随便挑一次稳。"""
-    s = _extremes([(v, t) for lg in legs
-                   for t, v in leg_series(lg, item).items()])
-    if s and room_t is not None:
-        rv = sorted(v for lg in legs
-                    for t, v in leg_series(lg, item).items() if t == room_t)
-        if rv:
-            s["typ"] = rv[len(rv) // 2] if len(rv) % 2 else \
-                (rv[len(rv) // 2 - 1] + rv[len(rv) // 2]) / 2.0
-            s["typ_n"] = len(rv)
-    return s
-
-
-# ---------------------------------------------------------------- 画格子
-
-def _styles():
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    thin = Side(style="thin", color="FF000000")
-    return {
-        "border": Border(left=thin, right=thin, top=thin, bottom=thin),
-        "center": Alignment(horizontal="center", vertical="center", wrap_text=True),
-        "left": Alignment(horizontal="left", vertical="center", wrap_text=True),
-        "f_head": PatternFill("solid", fgColor=FILL_HEADER, bgColor=FILL_HEADER),
-        "f_group": PatternFill("solid", fgColor=FILL_GROUP, bgColor=FILL_GROUP),
-        "f_res": PatternFill("solid", fgColor=FILL_RESULT, bgColor=FILL_RESULT),
-        "f_sep": PatternFill("solid", fgColor=FILL_SEP, bgColor=FILL_SEP),
-        "f_in": PatternFill("solid", fgColor=FILL_INPUT, bgColor=FILL_INPUT),
-        "Font": Font,
-    }
-
-
-def put(ws, r, c, v, st, fill=None, bold=False, color=None, align="center", size=10):
-    cell = ws.cell(row=r, column=c)
-    cell.value = v
-    cell.border = st["border"]
-    cell.alignment = st["center"] if align == "center" else st["left"]
-    cell.font = st["Font"](bold=bold, color=color, size=size)
-    if fill is not None:
-        cell.fill = fill
-    return cell
-
-
 # ---------------------------------------------------------------- 汇总页
-
-def _room_temp(legs):
-    """常温点：全部温度里最接近 25℃ 的那个。"""
-    ts = sorted({t for lg in legs for t in lg.temps})
-    return min(ts, key=lambda t: abs(t - 25)) if ts else None
-
 
 def build_conditions(legs, cols, rows, items, room_t):
     """从数据里生成「条件行」——这组数是在什么条件下取的。
@@ -984,36 +683,14 @@ def write_journey(wb, legs, items, st, yranges, src_title):
 
 # ---------------------------------------------------------------- 图表
 
-# 每段一个颜色 + 一个记号形状：4 条线叠在一张图上，光靠颜色分不开（打印/色弱都糊），
-# 形状也得不一样。
-LEG_STYLE = [("1F77B4", "circle"), ("D62728", "square"),
-             ("2CA02C", "triangle"), ("FF7F0E", "diamond")]
 # 默认只给这几个指标画 值-vs-温度 图。全画会出十几张，评审翻不动也问不出重点；
 # 其余指标的极值/Δ 汇总表里都有，要补画用 --chart-items。
 DEFAULT_CHART_ITEMS = ["Vtune_V", "IPN_SSB", "Current_mA", "Power_dBm"]
 
 
-def _style(series, color, symbol, line=True, dash=None, size=6):
-    from openpyxl.chart.marker import Marker
-    from openpyxl.chart.shapes import GraphicalProperties
-    from openpyxl.drawing.line import LineProperties
-    gp = GraphicalProperties()
-    gp.line = LineProperties(noFill=True) if not line else \
-        LineProperties(solidFill=color, w=20000, prstDash=dash)
-    series.graphicalProperties = gp
-    if symbol:
-        m = Marker(symbol=symbol, size=size)
-        m.graphicalProperties = GraphicalProperties(solidFill=color)
-        series.marker = m
-    else:
-        series.marker = Marker(symbol="none")
-    series.smooth = False
-
-
 def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
                  ws_j, jinfo, chart_items, yranges, st):
     from openpyxl.chart import Reference, ScatterChart, Series
-    from openpyxl.chart.marker import Marker
 
     ws = wb.create_sheet("图表")
     for i, line in enumerate([
@@ -1042,7 +719,7 @@ def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
         ch.x_axis.delete = False
         ch.y_axis.delete = False
         ch.height, ch.width = 9, 15
-        ch.dispBlanksAs = "gap"
+        blank_policy(ch)
         xref = Reference(ws_detail, min_col=1, min_row=first, max_row=last)
         vals = []
         for i, _lg in enumerate(legs):
@@ -1061,52 +738,6 @@ def write_charts(wb, ws_detail, blocks, legs, items, pn_items,
     if pn_items:
         _pn_offset_chart(wb, legs, pn_items, st, yranges)
     return ws
-
-
-def nice_step(span):
-    """给定跨度挑一个好看的刻度步长（1/2/2.5/5 × 10^n）。"""
-    import math
-    if span <= 0:
-        return 1.0
-    raw = span / 5.0
-    e = 10.0 ** math.floor(math.log10(raw))
-    for f in (1, 2, 2.5, 5, 10):
-        if raw <= f * e:
-            return f * e
-    return 10 * e
-
-
-def axis_bounds(vals, pad=0.10):
-    """按数据自己算 (min, max, 步长)，两头留一点余量再对齐到整刻度。
-
-    ★ 不要指望 Excel 自动缩放。它常把值轴从 0 起画，量本身只在 0.69~0.73
-    晃的话就被压成一条平线，什么都看不出来。范围必须由数据算出来钉死。
-    """
-    vals = [v for v in vals if v is not None]
-    if not vals:
-        return None
-    lo, hi = min(vals), max(vals)
-    if hi == lo:
-        d = abs(hi) * 0.05 or 1.0
-        lo, hi = lo - d, hi + d
-    m = (hi - lo) * pad
-    lo, hi = lo - m, hi + m
-    step = nice_step(hi - lo)
-    import math
-    return math.floor(lo / step) * step, math.ceil(hi / step) * step, step
-
-
-def _apply_y(chart, bounds):
-    if not bounds:
-        return
-    chart.y_axis.scaling.min, chart.y_axis.scaling.max = bounds[0], bounds[1]
-    chart.y_axis.majorUnit = bounds[2]
-
-
-def _legend_bottom(chart):
-    if chart.legend is not None:
-        chart.legend.position = "b"
-        chart.legend.overlay = False
 
 
 def _journey_charts(ws, ws_j, jinfo, st, row):
@@ -1128,7 +759,7 @@ def _journey_charts(ws, ws_j, jinfo, st, row):
         c.title = spec["title"]
         c.style = 13
         c.height, c.width = 9.5, 30
-        c.dispBlanksAs = "gap"
+        blank_policy(c)
         c.y_axis.title = spec["ytitle"]
         c.x_axis.title = "温度 (℃)　—　从左到右＝实际测试先后"
         c.x_axis.delete = False
@@ -1199,7 +830,7 @@ def _pn_offset_chart(wb, legs, pn_items, st, yranges):
     ch.y_axis.delete = False
     ch.x_axis.scaling.logBase = 10
     ch.height, ch.width = 10, 17
-    ch.dispBlanksAs = "gap"
+    blank_policy(ch)
     xref = Reference(ws, min_col=1, min_row=3, max_row=2 + len(pn_items))
     for j in range(len(pick)):
         yref = Reference(ws, min_col=2 + j, min_row=2, max_row=2 + len(pn_items))
@@ -1246,113 +877,23 @@ def main():
     if not os.path.isfile(args.path):
         sys.exit(f"找不到文件: {args.path}")
     try:
-        import openpyxl
+        import openpyxl  # noqa: F401
     except ImportError:
         sys.exit("缺少 openpyxl，请先: pip install openpyxl")
 
-    # 读两份：一份取缓存值用来算，一份原封不动用来存。
-    # 只用 data_only=True 那份去存的话，原表里若有公式会被替换成计算结果——
-    # 「第 1 页保留原始 excel」就不成立了。
-    wb_val = openpyxl.load_workbook(args.path, data_only=True)
-    ws_val = wb_val[args.sheet] if args.sheet else wb_val[wb_val.sheetnames[0]]
-    wb = openpyxl.load_workbook(args.path, data_only=False)
-    ws = wb[ws_val.title]
-    all_rows = [list(r) for r in ws_val.iter_rows(values_only=True)]
-    if len(all_rows) < args.header_row + 1:
-        sys.exit("表里没有数据行")
-    header = all_rows[args.header_row - 1]
-    data = all_rows[args.header_row:]
+    # 读取/过滤/分段/识别指标全在 sweep_lib.load_sweep 里（跨芯片汇总用同一份）
+    try:
+        sw = load_sweep(args.path, sheet=args.sheet, header_row=args.header_row,
+                        leg_col=args.leg_col, lock_pattern=args.lock_pattern,
+                        temp_col=args.temp_col, keep_test_item=args.keep_test_item,
+                        keep_mode=args.keep_mode, keep_original=True)
+    except SweepError as e:
+        sys.exit(str(e))
 
-    cols = Columns(header)
-    warnings = []
-    if cols.duplicates:
-        from openpyxl.utils import get_column_letter as gl
-        for k, v in cols.duplicates.items():
-            warnings.append(f"重复列名 {k}：出现在 {', '.join(gl(i+1) for i in v)}，"
-                            f"按名字只取到第一个（{gl(v[0]+1)}）")
-
-    # 温度列
-    if args.temp_col:
-        tname, tcol = args.temp_col, cols.idx(args.temp_col)
-    else:
-        tname, tcol = cols.find(r"temperature", r"^temp")
-    if tcol is None:
-        sys.exit("找不到温度列，用 --temp-col 指定")
-    leg_i = cols.idx(args.leg_col)
-    if leg_i is None:
-        warnings.append(f"没有 {args.leg_col} 列，无法按重锁切段——全部行算作一段")
-    ti_name, ti_col = (None, None)
-    if cols.idx("Test Item") is not None:
-        ti_name, ti_col = "Test Item", cols.idx("Test Item")
-
-    # 行过滤：Test Item 少数派（收尾行/模板遗留行）踢掉，但逐行记原因
-    excluded = []
-    keep_ti = args.keep_test_item
-    if ti_col is not None and keep_ti is None:
-        cnt = {}
-        for r in data:
-            v = txt(r[ti_col]) if ti_col < len(r) else ""
-            if v:
-                cnt[v] = cnt.get(v, 0) + 1
-        if cnt:
-            keep_ti = max(cnt, key=lambda k: cnt[k])
-
-    lock_re = re.compile(args.lock_pattern, re.I)
-
-    # 主模式：默认取出现最多的那个值（重锁行不参与统计，它带 _lock 后缀）
-    keep_mode = args.keep_mode
-    if leg_i is not None and keep_mode is None:
-        cnt = {}
-        for r in data:
-            v = txt(r[leg_i]) if leg_i < len(r) else ""
-            if v and not lock_re.search(v):
-                cnt[v] = cnt.get(v, 0) + 1
-        if cnt:
-            keep_mode = max(cnt, key=lambda k: cnt[k])
-
-    rows = []
-    for n, raw in enumerate(data):
-        xl = args.header_row + 1 + n
-        if all(is_blank(v) for v in raw):
-            continue
-        if ti_col is not None and keep_ti is not None:
-            v = txt(raw[ti_col]) if ti_col < len(raw) else ""
-            if v != keep_ti:
-                excluded.append((xl, f"{ti_name} = {v!r}，不是主测试项 {keep_ti!r}"))
-                continue
-        if leg_i is not None and keep_mode is not None:
-            v = txt(raw[leg_i]) if leg_i < len(raw) else ""
-            if v != keep_mode and not lock_re.search(v):
-                excluded.append((xl, f"{args.leg_col} = {v!r}，不是主模式 {keep_mode!r}"))
-                continue
-        rows.append(Row(xl, num(raw[tcol]) if tcol < len(raw) else None, "meas", raw))
-
-    items, dropped = build_items(cols, [r.raw for r in rows])
-    if not items:
-        sys.exit("没识别出任何有数据的结果列")
-    for r in rows:
-        for it in items:
-            r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
-
-    # 没有任何结果值的行（纯配置行）也踢掉
-    keep = []
-    for r in rows:
-        if all(v is None for v in r.vals.values()):
-            excluded.append((r.xl, "所有结果列都是空的（配置/开关行，不是测量点）"))
-        else:
-            keep.append(r)
-    rows = keep
-
-    legs, orphan = segment(rows, leg_i, lock_re)
-    for r in orphan:
-        excluded.append((r.xl, f"排在第一次重锁之前（{args.leg_col}={txt(r.raw[leg_i]) if leg_i is not None else '?'}）"))
-    if not legs:
-        legs = [Leg(1, None)]
-        legs[0].rows = rows
-        warnings.append(f"没有匹配 {args.lock_pattern!r} 的行，整表按一段处理")
-
-    excluded.sort(key=lambda x: x[0])
-    room_t = _room_temp(legs)
+    wb, ws, cols = sw.wb, sw.ws, sw.cols
+    rows, items, legs, dropped = sw.rows, sw.items, sw.legs, sw.dropped
+    excluded, warnings, room_t = sw.excluded, sw.warnings, sw.room_t
+    tname, keep_ti, keep_mode, ti_col = sw.temp_name, sw.keep_ti, sw.keep_mode, sw.ti_col
     meta = {
         "excluded": excluded,
         "warnings": warnings,
@@ -1435,6 +976,7 @@ def main():
                     if s.title in order else len(order))
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     wb.save(out)
     n_fill, n_strip = VCACHE.inject(out)
     print(f"\n已写出: {os.path.abspath(out)}")
