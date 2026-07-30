@@ -440,7 +440,10 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     for xl, why, raw in cut:
         k = sum(1 for it in items
                 if it.col < len(raw) and num(raw[it.col]) is not None)
-        excluded.append((xl, why + (f"（这行带 {k} 个结果值）" if k else
+        # 带 4/16 跟带 16/16 是两件事：前者是配置行顺手回读了几个量，
+        # 后者是**另一个配置下的一整套测量**（比如关掉 test mux 再测一遍）。
+        # 只打绝对个数分不出来，分母必须给。
+        excluded.append((xl, why + (f"（这行带 {k}/{len(items)} 个结果值）" if k else
                                     "（这行没有任何结果值）")))
 
     # 没有任何结果值的行（纯配置行）也踢掉

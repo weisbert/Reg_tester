@@ -1869,8 +1869,9 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
     for xl0, why, raw0 in cut:
         k = sum(1 for it in items
                 if it.col < len(raw0) and num(raw0[it.col]) is not None)
-        excluded.append((xl0, why + ("（这行带 %d 个结果值）" % k if k else
-                                     "（这行没有任何结果值）")))
+        # 带 4/15 跟带 15/15 是两件事——见 sweep_lib 里同一处的说明
+        excluded.append((xl0, why + ("（这行带 %d/%d 个结果值）" % (k, len(items))
+                                     if k else "（这行没有任何结果值）")))
 
     # 扫描序列之外但确实量到东西的行：单列一页，别让「排除了 N 行」看着像丢了数据
     extra = [(r, "锁定") for r in locked if any(v is not None for v in r.vals.values())]
