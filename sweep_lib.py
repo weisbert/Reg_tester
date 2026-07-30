@@ -408,7 +408,7 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     if leg_i is not None and keep_mode is None:
         keep_mode = _majority(data, leg_i, skip_re=lock_re)
 
-    rows = []
+    rows, cut = [], []          # cut: (行号, 原因, 原始行) —— 稍后补"带几个结果值"
     for n, raw in enumerate(data):
         xl = header_row + 1 + n
         if all(is_blank(v) for v in raw):
@@ -416,12 +416,12 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
         if ti_col is not None and keep_ti is not None:
             v = txt(raw[ti_col]) if ti_col < len(raw) else ""
             if v != keep_ti:
-                excluded.append((xl, f"{ti_name} = {v!r}，不是主测试项 {keep_ti!r}"))
+                cut.append((xl, f"{ti_name} = {v!r}，不是主测试项 {keep_ti!r}", raw))
                 continue
         if leg_i is not None and keep_mode is not None:
             v = txt(raw[leg_i]) if leg_i < len(raw) else ""
             if v != keep_mode and not lock_re.search(v):
-                excluded.append((xl, f"{leg_col} = {v!r}，不是主模式 {keep_mode!r}"))
+                cut.append((xl, f"{leg_col} = {v!r}，不是主模式 {keep_mode!r}", raw))
                 continue
         rows.append(Row(xl, num(raw[tcol]) if tcol < len(raw) else None, "meas", raw))
 
@@ -431,6 +431,17 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     for r in rows:
         for it in items:
             r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+
+    # ★ 被过滤掉的行到底有没有带测量结果，必须说出来。
+    #   "排除了 6 行"这句话本身不足以判断有没有丢数据——原厂模板常在数据后面
+    #   追加页脚/图例行（条件列全空），那种排掉是对的；但旁路自检行是**带部分
+    #   结果值**的，把它算进相邻那一段会把段的走向和极值带偏。两者只看行号
+    #   分不出来，得看它带不带结果。
+    for xl, why, raw in cut:
+        k = sum(1 for it in items
+                if it.col < len(raw) and num(raw[it.col]) is not None)
+        excluded.append((xl, why + (f"（这行带 {k} 个结果值）" if k else
+                                    "（这行没有任何结果值）")))
 
     # 没有任何结果值的行（纯配置行）也踢掉
     keep = []

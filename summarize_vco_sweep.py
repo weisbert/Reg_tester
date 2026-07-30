@@ -1829,6 +1829,7 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
             sweep_mode = max(cnt, key=lambda k: cnt[k])
 
     excluded, rows, locked, others = [], [], [], []
+    cut = []                    # (行号, 原因, 原始行) —— 稍后补"带几个结果值"
     for n, raw in enumerate(data):
         xl = header_row + 1 + n
         if all(is_blank(v) for v in raw):
@@ -1841,16 +1842,16 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
         r = Row(xl, temp, mode, vt, ct, raw)
         if mode and lock_re.search(mode):
             locked.append(r)
-            excluded.append((xl, "%s = %r，闭环/锁定行" % (mode_col, mode)))
+            cut.append((xl, "%s = %r，闭环/锁定行" % (mode_col, mode), raw))
             continue
         if ti_col is not None and keep_ti is not None:
             v = txt(raw[ti_col]) if ti_col < len(raw) else ""
             if v != keep_ti:
-                excluded.append((xl, "Test Item = %r，不是主测试项 %r" % (v, keep_ti)))
+                cut.append((xl, "Test Item = %r，不是主测试项 %r" % (v, keep_ti), raw))
                 continue
         if sweep_mode is not None and mode != sweep_mode:
             others.append(r)
-            excluded.append((xl, "%s = %r，不是扫描模式 %r" % (mode_col, mode, sweep_mode)))
+            cut.append((xl, "%s = %r，不是扫描模式 %r" % (mode_col, mode, sweep_mode), raw))
             continue
         rows.append(r)
 
@@ -1862,6 +1863,14 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
     for r in rows + locked + others:
         for it in items:
             r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+
+    # ★ 被过滤掉的行到底有没有带测量结果，必须说出来（同 sweep_lib.load_sweep）。
+    #   "排除了 N 行"这句话本身不足以判断有没有丢数据。
+    for xl0, why, raw0 in cut:
+        k = sum(1 for it in items
+                if it.col < len(raw0) and num(raw0[it.col]) is not None)
+        excluded.append((xl0, why + ("（这行带 %d 个结果值）" % k if k else
+                                     "（这行没有任何结果值）")))
 
     # 扫描序列之外但确实量到东西的行：单列一页，别让「排除了 N 行」看着像丢了数据
     extra = [(r, "锁定") for r in locked if any(v is not None for v in r.vals.values())]
