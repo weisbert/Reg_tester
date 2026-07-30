@@ -110,6 +110,100 @@ def fmt_num(x, nd=3):
     return round(x, nd)
 
 
+# 公式格的缓存值：{sheet 名: {单元格坐标: 数值}}。存盘后补写进 xlsx。
+VCACHE = {}
+
+
+def cache(ws, row, col, value):
+    """记下某个公式格算出来的数，存盘后补进 <v> 缓存值。
+
+    ★ 为什么必须补：openpyxl 给公式格写的是 `<f>公式</f><v></v>`——一个**空的**
+    缓存值。这等于告诉 Excel"这公式的结果就是空"，于是打开直接显示空白，
+    要在格子里敲一次回车强制重算才出数。自己机器上看着正常（fullCalcOnLoad
+    触发了重算），发给别人就是一片空白（受保护视图 / 手动计算 / 某些阅读器
+    会信那个空缓存值）。
+    我们在 Python 侧本来就算过每个数，直接写进 <v>：任何环境打开都有值，
+    公式还在，原始数据改了照样能重算。
+    """
+    from openpyxl.utils import get_column_letter
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return
+    VCACHE.setdefault(ws.title, {})[f"{get_column_letter(col)}{row}"] = value
+
+
+def inject_cached_values(path, vcache):
+    """存盘后给公式格补缓存值：知道结果的写进 <v>，不知道的把空 <v> 删掉
+    （删掉反而好——Excel 见没有缓存值就必须自己算）。"""
+    import re
+    import shutil
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    RELNS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+    with zipfile.ZipFile(path) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+
+    rels = {r.get("Id"): r.get("Target")
+            for r in ET.fromstring(parts["xl/_rels/workbook.xml.rels"])
+            if r.tag == RELNS + "Relationship"}
+    sheet_part = {}
+    for sh in ET.fromstring(parts["xl/workbook.xml"]).iter(NS + "sheet"):
+        tgt = rels.get(sh.get(RNS + "id"), "")
+        if not tgt:
+            continue
+        # Target 可能是包内绝对路径 /xl/worksheets/sheetN.xml，
+        # 也可能是相对 xl/ 的 worksheets/sheetN.xml——两种都得认
+        p = tgt.lstrip("/") if tgt.startswith("/") else "xl/" + tgt
+        sheet_part[sh.get("name")] = p if p in parts else None
+
+    cell_re = re.compile(rb"<c\b[^>]*?r=\"([A-Z]+[0-9]+)\"[^>]*>(.*?)</c>", re.S)
+    n_fill = n_strip = 0
+
+    def fmt(v):
+        # 收掉浮点减法的噪声尾巴（max-lock 之类会算出 -0.00046999999999997）。
+        # 只动第 12 位小数以后，肉眼与 Excel 重算结果都看不出差别。
+        if isinstance(v, float):
+            v = round(v, 12)
+            if v == int(v) and abs(v) < 1e15:
+                v = int(v)
+        return str(v) if isinstance(v, int) else repr(v)
+
+    for title, part in sheet_part.items():
+        if not part or part not in parts:
+            continue
+        vals = vcache.get(title, {})
+        xml = parts[part]
+
+        def repl(m):
+            nonlocal n_fill, n_strip
+            ref, inner = m.group(1).decode(), m.group(2)
+            if b"<f" not in inner:
+                return m.group(0)
+            v = vals.get(ref)
+            if v is None:
+                if b"<v></v>" in inner:                    # 不知道结果 -> 删空缓存
+                    n_strip += 1
+                    return m.group(0).replace(b"<v></v>", b"")
+                return m.group(0)
+            new = f"<v>{fmt(v)}</v>".encode()
+            n_fill += 1
+            if b"<v></v>" in inner:
+                return m.group(0).replace(b"<v></v>", new)
+            return m.group(0)[: -len(b"</c>")] + new + b"</c>"
+
+        parts[part] = cell_re.sub(repl, xml)
+
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, d in parts.items():
+            z.writestr(n, d)
+    shutil.move(tmp, path)
+    return n_fill, n_strip
+
+
 def sref(title, col_idx0, xl_row, coerce=False):
     """指向原始页某个格子的引用串，如 ='Sheet1'!CD5。
 
@@ -490,7 +584,10 @@ def build_drift_rows(jinfo):
         f0, f1, k = lg["first"], lg["last"], lg["lock_row"]
         seg = f"{J}!${cv}${f0}:${cv}${f1}"
         lock = f"{J}!${cv}${k}"
+        vv = lg.get("vt_vals") or []
+        lo_hi = ((min(vv) - vv[0], max(vv) - vv[0]) if vv else (None, None))
         out.append({
+            "_min": lo_hi[0], "_max": lo_hi[1],
             "cat": f"{vt.label} 温漂",
             "item": f"锁@{fmt_num(lg['lock_temp'])}℃ 后 {lg['stage']}",
             "unit": vt.unit,
@@ -596,6 +693,16 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
     for it in items:
         b = dref.get(it.label)
         s = {"cat": it.cat, "item": it.label, "unit": it.unit}
+        # 同时把 Python 侧算好的数留下来，存盘后补进公式格的缓存值
+        sa = stats_all(legs, it)
+        if sa:
+            s["_min"], s["_max"] = sa["min"], sa["max"]
+        for k, tt in tkeys:
+            vv = sorted(v for lg in legs
+                        for t, v in leg_series(lg, it).items() if t == tt)
+            if vv:
+                s["_" + k] = (vv[len(vv) // 2] if len(vv) % 2
+                              else (vv[len(vv) // 2 - 1] + vv[len(vv) // 2]) / 2.0)
         if b:
             D, f0, f1 = b["sheet"], b["first"], b["last"]
             lo = f"{D}!${L(b['c_lo'])}${f0}:${L(b['c_lo'])}${f1}"
@@ -629,9 +736,13 @@ def write_summary(wb, legs, items, meta, st, room_t, dref, jinfo):
         for key in [k for k, _ in tkeys] + ["m_min", "m_max"]:
             if sp.get(key):
                 put(ws, r, C[key], sp[key], st, st["f_res"])
+                cache(ws, r, C[key], sp.get("_" + key.replace("m_", "")
+                                            if key.startswith("m_") else "_" + key))
         put(ws, r, C["m_d"],
             f'=IF(OR({L(C["m_min"])}{r}="",{L(C["m_max"])}{r}=""),"",'
             f'{L(C["m_max"])}{r}-{L(C["m_min"])}{r})', st, st["f_res"])
+        if sp.get("_min") is not None and sp.get("_max") is not None:
+            cache(ws, r, C["m_d"], sp["_max"] - sp["_min"])
         mn, mx = f"{L(C['m_min'])}{r}", f"{L(C['m_max'])}{r}"
         sn, sx, lim = f"${L(C['s_min'])}{r}", f"${L(C['s_max'])}{r}", f"${L(C['limit'])}{r}"
         # 实测为空时不判（Excel 里 ""<=数字 会算成 FALSE，不挡住会误判成 FAIL）
@@ -742,17 +853,25 @@ def write_detail(wb, legs, items, st, src_title, room_t):
                     m[row.temp] = row.xl
             srcs.append(m)
         rows_by_temp = {}
+        series = [leg_series(lg, it) for lg in legs]
         for t in temps:
             put(ws, r, 1, fmt_num(t), st, st["f_res"])
             rows_by_temp[t] = r
+            row_vals = []
             for i, _lg in enumerate(legs):
                 xl = srcs[i].get(t)
                 put(ws, r, 2 + i,
                     sref(src_title, it.col, xl, it.text_src) if xl else None,
                     st, st["f_res"])
+                if xl:
+                    cache(ws, r, 2 + i, series[i].get(t))
+                    row_vals.append(series[i].get(t))
             rng = f"{L(2)}{r}:{L(1 + len(legs))}{r}"
             put(ws, r, c_lo, f"=IF(COUNT({rng})=0,\"\",MIN({rng}))", st, st["f_res"], size=9)
             put(ws, r, c_hi, f"=IF(COUNT({rng})=0,\"\",MAX({rng}))", st, st["f_res"], size=9)
+            if row_vals:
+                cache(ws, r, c_lo, min(row_vals))
+                cache(ws, r, c_hi, max(row_vals))
             r += 1
         blocks.append({"item": it, "head": head, "first": first, "last": r - 1,
                        "c_lo": c_lo, "c_hi": c_hi, "rows_by_temp": rows_by_temp})
@@ -856,6 +975,9 @@ def write_journey(wb, legs, items, st, yranges, src_title):
             ref = sref(src_title, vt.col, row.xl, vt.text_src) if v is not None else None
             put(ws, r, cols["vt"], ref, st, fill)
             put(ws, r, cols["vt"] + 1, ref if (is_lock and ref) else None, st, fill)
+            cache(ws, r, cols["vt"], v)
+            if is_lock:
+                cache(ws, r, cols["vt"] + 1, v)
         if fq:
             v = row.vals.get(fq.col)
             df = None if (v is None or f0 is None) else round((v - f0) * 1000.0, 3)
@@ -876,6 +998,10 @@ def write_journey(wb, legs, items, st, yranges, src_title):
             put(ws, r, cols["fq"] + 2,
                 sref(src_title, fq.col, row.xl, fq.text_src) if v is not None else None,
                 st, fill, size=9)
+            cache(ws, r, cols["fq"], df)
+            cache(ws, r, cols["fq"] + 2, v)
+            if is_lock:
+                cache(ws, r, cols["fq"] + 1, df)
 
     note = ("整趟温巡按测试顺序排；米色行 = 重锁点。"
             + (f"  Δf = 相对第 1 个测点（{fmt_num(f0, 6)}）的偏差，"
@@ -926,9 +1052,12 @@ def write_journey(wb, legs, items, st, yranges, src_title):
     for lg in legs:
         n = len(lg.rows)
         if n and lg.lock_temp is not None:
+            # vt_vals[0] 就是锁定点（本段第一行＝重锁行），后面是段内各点
+            vv = [r.vals.get(vt.col) for r in lg.rows] if vt else []
             lg_rows.append({"title": lg.title, "stage": lg.stage,
                             "lock_temp": lg.lock_temp, "first": r0 + i,
-                            "last": r0 + i + n - 1, "lock_row": r0 + i})
+                            "last": r0 + i + n - 1, "lock_row": r0 + i,
+                            "vt_vals": [v for v in vv if v is not None]})
         i += n
     jinfo = {"first": r0, "last": r0 + len(seq) - 1, "c_temp": 4,
              "sheet": ws.title, "legs": lg_rows, "c_vt": cols.get("vt"),
@@ -1390,10 +1519,13 @@ def main():
 
     out = args.out or os.path.splitext(args.path)[0] + "_summary.xlsx"
     wb.save(out)
+    n_fill, n_strip = inject_cached_values(out, VCACHE)
     print(f"\n已写出: {os.path.abspath(out)}")
     print(f"  第 1 页「{ws.title}」= 原始数据原样保留；新增 "
           + " / ".join(n for n in wb.sheetnames if n != ws.title))
     print("  汇总页的 Spec MIN/TYP/MAX 与 limit 列留空，填进去判定自动出、超规自动标红。")
+    print(f"  公式格补了 {n_fill} 个缓存值、清掉 {n_strip} 个空缓存 —— "
+          f"发给别人打开就能看见数，不用敲回车重算。")
 
 
 if __name__ == "__main__":
