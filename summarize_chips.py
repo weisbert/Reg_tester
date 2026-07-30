@@ -235,58 +235,6 @@ def val_at(view, t):
     """
     vs = view.get(t)
     return median(vs) if vs else None
-
-
-def extreme_label(view, nd, which="max"):
-    """(全温极值, 它出现在哪) —— **对「各温度代表值」取极值，不是对逐点取**。
-
-    ★★ 这是整张表能不能自洽的关键。一个温度只有一格，那一格装的是该温度
-      **全部经过点的中位数**（整趟温巡同一温度会被经过 2~4 次）。如果极值改成
-      对逐点取，就会出现「−40℃ 那格写 −54.19，旁边说 MAX = −53.45 @−40℃」——
-      数学上都对（中位数 vs 那 3 次里最差的一次），可一行里放两种统计量、
-      还配一个 @℃ 指着同一个温度，读的人只会认为表算错了。
-      项目里这条教训是现成的："汇总报的极值在明细里查无此值 → 报表对不上账
-      就没人敢信"。代价是极值比"最坏单点"乐观一点，所以备注里给出同温重复性。
-
-    ★ 并列要说出来：频率这类量记录精度只有 1 kHz，极值经常在七八个温度上并列。
-      只报其中一个温度，评审会读成"最坏就发生在 85℃"，那是个不存在的结论。
-      并列按**显示精度**判（表里看到的是取整后的数，标签得跟它对得上）。
-    """
-    if not view:
-        return None, None
-    agg = max if which == "max" else min
-    reps = {t: median(vs) for t, vs in view.items() if vs}
-    if not reps:
-        return None, None
-    disp = fmt_num(agg(reps.values()), nd)
-    hit = sorted(t for t, v in reps.items() if fmt_num(v, nd) == disp)
-    if not hit:
-        return disp, None
-    if len(hit) == 1:
-        return disp, f"{fmt_num(hit[0])}℃"
-    if len(hit) <= 3:
-        return disp, "/".join(str(fmt_num(t)) for t in hit) + "℃"
-    return disp, f"{fmt_num(hit[0])}℃ 等 {len(hit)} 处"
-
-
-def repeat_spread(view, nd):
-    """同温重复性：同一个温度多次经过，读数极差最大是多少、在哪个温度。
-
-    温度列放的是中位数、极值也从中位数来（见 extreme_label），所以"最坏单点"
-    不在表上。这个数把那部分信息补回来：极差越大，说明单点比代表值还能差更多。
-    """
-    best = None
-    for t, vs in view.items():
-        if len(vs) < 2:
-            continue
-        sp = max(vs) - min(vs)
-        if best is None or sp > best[0]:
-            best = (sp, t)
-    if best is None or not fmt_num(best[0], nd):
-        return None
-    return f"同温重复性 {fmt_num(best[0], nd)} @{fmt_num(best[1])}℃"
-
-
 def chip_stat(sw, label):
     """一颗芯片一个指标的 (min, typ, max, min_t, max_t)；没这个指标返回 None。"""
     it = sw.item(label)
@@ -305,14 +253,17 @@ C_SPEC, C_GAP1 = 4, 7
 C_SIM, C_GAP2 = 8, 11
 C_SUM, C_JUDGE, C_GAP3 = 12, 15, 16
 C_CHIP0 = 17           # 第一颗芯片的第一列
-# ★ 每颗芯片 7 列：三个代表温度点 + 全温 MIN/MAX 各配一列"出现在哪个温度"。
-#   为什么不是 Min/Typ/Max：那三个数看不出"在哪一头坏"，而三个代表温度点
-#   （常温 / 最低 / 最高）本身就把趋势说清楚了，再给全温极值收口。
-#   极值列各带 @℃ ——并列时那一列会写"等 N 处"，见 extreme_label()。
-CHIP_AX = 7
+# ★★ 每颗芯片只有三列：常温 / 最低温 / 最高温。
+#   曾经是 7 列（再带全温 MIN/MAX 各配一个 @℃），一轮轮加出来的，每列单看都有
+#   理由，加在一起就成了"要读说明才看得懂的表"——而这份簿子的第一条要求就是
+#   「不能出现给人 debug 用的信息」。被砍掉的是：@℃（极值在哪个温度，对下判断
+#   没有决策价值，还会写出"等 7 处"这种噪声）、逐片 MIN/MAX（跟三个温度列是
+#   两种统计量，摆在一行里读起来自相矛盾，得靠 caption 解释）、同温重复性。
+#   现在一行里只有一种数：**该温度的实测值**。汇总列就是对这三列取，
+#   谁都能用眼睛验证，不需要任何脚注。
+CHIP_AX = 3
 CHIP_W = CHIP_AX + 1   # +1 = 组间间隔列
-# 芯片组里哪几列是数字（要套数字格式）：三个温度 + MIN + MAX
-CHIP_NUMCOL = (0, 1, 2, 3, 5)
+CHIP_NUMCOL = (0, 1, 2)
 
 AXES = ["Min", "Typ", "Max"]
 
@@ -378,9 +329,8 @@ def _hguide(ws, r, c0, c1):
 
 
 def _chip_axes(tlabels):
-    """芯片组的 7 个轴名：三个代表温度点 + 全温 MIN/MAX 各配一个 @℃。"""
-    return [(t or "—") for t in tlabels] + ["MIN\n(全温)", "MIN\n@℃",
-                                            "MAX\n(全温)", "MAX\n@℃"]
+    """芯片组的轴名就是三个温度，别的什么都不放。"""
+    return [(t or "—") for t in tlabels]
 
 
 def _header(ws, r0, chips, st, title, n_chips, tlabels):
@@ -426,12 +376,8 @@ def _header(ws, r0, chips, st, title, n_chips, tlabels):
 
 def _caption(ws, r, st, n_chips):
     """口径说明：这几个数是怎么取的。评审第一句必问，写在表头下面最省事。"""
-    txt_ = ("每颗芯片：三个温度列＝该温度**全部经过点的中位数**"
-            "（整趟温巡会多次经过同一温度）；MIN / MAX＝**对全部 16 个温度的这个代表值**"
-            "取极值，各配一列给出它出现在哪个温度（多个温度并列时写「等 N 处」）。"
-            "同一温度多次读数的散布见备注列的「同温重复性」。都不含重锁瞬间的读数。　"
-            "汇总列：Min 取各片 MIN 的最小、Max 取各片 MAX 的最大、Typ 取各片常温值的中位数。　"
-            "判定只看 Spec 的 Min / Max 两头；Typ 与仿真列只作对照。")
+    txt_ = ("每片三列＝该温度的实测值。汇总列 Min / Max 就是这些格子里的最小 / 最大，"
+            "Typ 取各片常温值。填 Spec 的 Min / Max，判定列自动出 PASS / FAIL。")
     c = put(ws, r, C_ITEM, txt_, st, st["f_group"], align="left", size=9)
     ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r,
                    end_column=note_col(n_chips))
@@ -522,7 +468,7 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
     for c in rail_cols(len(chips)):
         put(ws, r, c, None, st, st["f_rail"])
 
-    mins, typs, maxs, marks, spreads = [], [], [], [], []
+    mins, typs, maxs, marks = [], [], [], []
     for n, chip in enumerate(chips):
         sw = data.get(chip)
         s = chip_stat(sw, label) if sw is not None else None
@@ -533,34 +479,22 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
             # 同一个温度（四段各走一遍），取中位比随便挑一次稳。
             view = temp_view(sw, sw.item(label))
             vals = [fmt_num(val_at(view, t), nd) for t in tpick]
-            vals += list(extreme_label(view, nd, "min"))
-            vals += list(extreme_label(view, nd, "max"))
-            # ★ 汇总列从**各片显示出来的值**再聚合（先按显示精度取整再聚合）。
-            #   满精度聚合更"准"，但会出现「表里那两格取一下 ≠ 汇总那格」的
-            #   末位差 0.01，评审一眼看见就得解释。报表宁可自洽。
-            mins.append(vals[3])
-            maxs.append(vals[5])
-            sp = repeat_spread(view, nd)
-            if sp:
-                spreads.append((chip, sp))
+            # ★ 汇总列就是对**表上这几个格子**取最小/最大/常温。用满精度、或者
+            #   改成对逐点取极值，都会出现"表里的格子跟汇总对不上"——那种表
+            #   没人敢信，而且解释起来要写一段 caption。宁可自洽。
+            got = [v for v in vals if v is not None]
+            if got:
+                mins.append(min(got))
+                maxs.append(max(got))
             if vals[0] is not None:
                 typs.append(vals[0])          # tpick[0] 是常温
             marks.append((chip, s))
         for j, v in enumerate(vals):
-            # 前 3 列（温度）白底、后 4 列（极值）浅灰底 —— 7 列切成 3+4，
-            # 两边都在"一眼能数清"的 4 个以内（见 _hguide 的说明）。
-            num_col = j in CHIP_NUMCOL
-            cell = put(ws, r, c0 + j, v, st,
-                       st["f_res"] if j < 3 else st["f_zone"],
-                       size=10 if num_col else 9,
-                       color=None if num_col else COLOR_MUTED)
-            if v is not None and num_col:
+            cell = put(ws, r, c0 + j, v, st, st["f_res"])
+            if v is not None:
                 cell.number_format = "0." + "0" * nd
 
-    # Max 就是某一片 MAX 列里的那个值（原样搬过来，对得上账）；
-    # Typ 是各片常温值的中位数，**偶数片时不再取整**——两片的中位落在半个显示位上
-    # （-85.42 与 -85.43 的中位 = -85.425），再取整就变成"两格取一下对不上"。
-    # 格子里放真值，显示交给数字格式。
+    # 三个数都是从上面那些格子里直接取的，看的人用眼睛就能验证
     agg = [min(mins) if mins else None, median(typs) if typs else None,
            max(maxs) if maxs else None]
     for j, v in enumerate(agg):
@@ -569,34 +503,10 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
             cell.number_format = "0." + "0" * nd
     put(ws, r, C_JUDGE, _judge_formula(r), st, st["f_res"], bold=True)
 
-    # 备注只写事实：包络的两头各出自哪一片（值本身各片列里就有，不重复写）。
-    # ★ 跟 @℃ 同一个道理——并列要说出来。量化过的量（频率）常常各片 MIN 一样，
-    #   写"Min 出自 某一片"会被读成"这片最差"，那是个不存在的结论。
-    def _who(vals, agg):
-        got = [(c, v) for (c, _s), v in zip(marks, vals) if v is not None]
-        if not got:
-            return None
-        tgt = agg(v for _c, v in got)
-        hit = [c for c, v in got if v == tgt]
-        if len(hit) == len(got) and len(got) > 1:
-            return "各片相同"
-        return "/".join(hit) if len(hit) <= 2 else f"{len(hit)} 片并列"
-
-    def _phrase(kind, w):
-        return f"{kind} 各片相同" if w == "各片相同" else f"{kind} 出自 {w}"
-
-    note = ""
-    if len(marks) > 1:
-        a, b = _who(mins, min), _who(maxs, max)
-        note = ("Min/Max 各片相同" if a == b == "各片相同"
-                else f"{_phrase('Min', a)} / {_phrase('Max', b)}")
-    if spreads:
-        # 各片里散布最大的那一个（一片时就是它自己）
-        worst = max(spreads, key=lambda x: num(x[1].split()[1]) or 0)
-        note = (note + "；" if note else "") +                (worst[1] if len(spreads) == 1 else f"{worst[1]}（{worst[0]}）")
+    # ★ 备注只在真的缺东西时才写。以前这里写「Min 出自 XX / 同温重复性 0.8@65℃」
+    #   那类工程内部信息——那是 debug 用的，不该出现在给人 review 的表上。
     gone = [c for c in chips if c not in {x[0] for x in marks}]
-    if gone:
-        note += ("；" if note else "") + f"未测: {', '.join(gone)}"
+    note = f"未测: {', '.join(gone)}" if gone else ""
     put(ws, r, note_col(n_chips), as_text(note), st, st["f_res"],
         align="left", size=9, color=COLOR_MUTED)
     return r + 1
