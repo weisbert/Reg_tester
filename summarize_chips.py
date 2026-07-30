@@ -827,6 +827,7 @@ VCO_DROP = {
     #   要查随时有：单簿脚本 summarize_vco_sweep.py 的结论页两行都还在。
     "Sub-band Tuning Range",
     "CT Band Step (max)",
+    "Target fVCO",              # 用户 2026-07-30 删（Margin 那两行已经没了，它成了孤立参照）
 }
 # 判定方向的补丁：build_conclusion 给 Kvco min/max 留空（单簿页只作对照），
 # 但跨芯片表要判定，方向得写明白：增益太小锁不住/带宽不够，太大杂散与噪声恶化。
@@ -835,6 +836,15 @@ VCO_LIMIT_FIX = {"Kvco min": "≥", "Kvco max": "≤"}
 VCO_NOTE_ADD = {
     "CT Band Coverage": "＝整个电容阵列能覆盖多宽（不含调谐电压那一维）",
     "Tuning Range": "＝调谐电压与电容码合起来的总覆盖宽度",
+}
+# ★ 备注整句改写：让算式里的每一项都**正好是表上某一行的名字**，
+#   这样导出来的数用眼睛就能核（用户原话："缺少了计算他们的中间值，我有些没安全感"）。
+VCO_NOTE_SET = {
+    "Fmin": "CT 扫最低频 −［F(Vtune=0.4V) − F(Vtune=最低)］",
+    "Fmax": "CT 扫最高频 +［F(Vtune=最高) − F(Vtune=0.4V)］",
+    "Tuning Range": "Fmax − Fmin ＝调谐电压与电容码合起来的总覆盖宽度",
+    "CT Band Coverage": "CT 扫最高频 − CT 扫最低频 ＝整个电容阵列能覆盖多宽"
+                        "（不含调谐电压那一维）",
 }
 VCO_DROP_PREFIX = ("Kvco @",)  # 工作点那个值落在 Kvco min/max 之间，判定上冗余
 
@@ -849,14 +859,69 @@ def vco_rows(sw, ref_temp, op_vtune):
         if d["item"] in VCO_DROP or d["item"].startswith(VCO_DROP_PREFIX):
             continue
         vals = dict(d["vals"])
-        note = d.get("note") or ""
-        add = VCO_NOTE_ADD.get(d["item"])
+        note = VCO_NOTE_SET.get(d["item"], d.get("note") or "")
+        add = VCO_NOTE_ADD.get(d["item"]) if d["item"] not in VCO_NOTE_SET else None
         if add:
             note = f"{note}；{add}" if note else add
         out.append({"cat": d["cat"], "item": d["item"], "unit": d["unit"],
                     "dir": VCO_LIMIT_FIX.get(d["item"], d["dir"]),
                     "kind": d["kind"], "vals": vals, "note": note})
+    # 原料行**各自插进自己那个组**的最前面（先摆实测端点、再摆拿它们算出来的数）。
+    # 整块插在一处会让 Frequency Range / CT Band 两个组头各出现两次。
+    for ep in reversed(endpoint_rows(sw)):
+        i = next((k for k, x in enumerate(out) if x["cat"] == ep["cat"]), len(out))
+        out.insert(i, ep)
     return out, temps
+
+
+def endpoint_rows(sw):
+    """两条扫描的四个端点频率。
+
+    ★ Fmin / Fmax / Tuning Range / CT Band Coverage 全是拿这四个数算出来的。
+      只给算出来的结果、不给原料，看的人没法核对，只能选择信或者不信——
+      用户原话「缺少了计算他们的中间值，我有些没安全感」。摆出来之后
+      备注里的算式每一项都能在表上找到对应的行。
+      这四行是**原料**不是被考核项，所以走条件行（米色），不带汇总和判定。
+    """
+    from summarize_vco_sweep import group_series
+    out = []
+    for kind, cat, lo_hi, note_fmt in (
+            ("vtune", "Frequency Range",
+             ("F(Vtune=最低)", "F(Vtune=最高)"),
+             "Vtune 扫的{}设定点（%s V，CT 码固定不动）"),
+            ("ct", "CT Band",
+             ("CT 扫最低频", "CT 扫最高频"),
+             "CT 扫{}的那一端（码 %s，Vtune 钉在 CT 扫用的那个值）")):
+        per_t = {}
+        for k, groups in sw.by_kind:
+            if k != kind:
+                continue
+            for g in groups:
+                if g.temp is None:
+                    continue
+                ser = group_series(g, sw.freq_item)
+                if ser:
+                    per_t[g.temp] = ser
+        if not per_t:
+            continue
+        xs = sorted({x for ser in per_t.values() for x in ser})
+        if len(xs) < 2:
+            continue
+        # CT 那条按"频率最低/最高"排（码号跟频率的方向不一定一致），Vtune 按设定值排
+        if kind == "ct":
+            f_of = {x: median([ser[x] for ser in per_t.values() if x in ser])
+                    for x in (xs[0], xs[-1])}
+            ends = sorted((xs[0], xs[-1]), key=lambda x: f_of[x])
+        else:
+            ends = [xs[0], xs[-1]]
+        for j, x in enumerate(ends):
+            out.append({
+                "cat": cat, "item": lo_hi[j], "unit": "MHz", "dir": "",
+                "kind": "cond",
+                "vals": {t: ser[x] for t, ser in per_t.items() if x in ser},
+                "note": note_fmt.format("最低" if j == 0 else "最高") % fmt_num(x, 4),
+            })
+    return out
 
 
 def coarse_temps(sw):
