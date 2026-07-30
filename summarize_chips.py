@@ -816,23 +816,27 @@ VCO_DROP = {
     "Margin to fVCO (low)",     # 用户 2026-07-30 删：Fmin/Fmax 直接对 Spec 判就够了
     "Margin to fVCO (high)",
     "Kvco max/min",             # 用户 2026-07-30 删
+    # ★★ 下面两行一起删（用户两次说 Sub-band Tuning Range 看不懂）。
+    #   它们唯一回答的问题是"有没有锁不上的盲区"（子带宽度必须大于相邻码步长），
+    #   而**这份测试已经用实测回答了那个问题**：闭环锁定行在三个温度都锁上了、
+    #   PLL 温扫在 16 个温度里一直保持锁定。真有盲区落在目标频率上，它就锁不上。
+    #   所以这两行是设计余量的话题，不是这颗芯片的判定项。
+    #   只删分子（子带宽度）会留下一个没有分子的分母，比两个都留更糟——
+    #   所以 CT Band Step (max) 一起走。它还有个毛病：只有常温算得出来，
+    #   一行三格里两格是空的，本身就长得像"缺数据"。
+    #   要查随时有：单簿脚本 summarize_vco_sweep.py 的结论页两行都还在。
+    "Sub-band Tuning Range",
+    "CT Band Step (max)",
 }
 # 判定方向的补丁：build_conclusion 给 Kvco min/max 留空（单簿页只作对照），
 # 但跨芯片表要判定，方向得写明白：增益太小锁不住/带宽不够，太大杂散与噪声恶化。
 VCO_LIMIT_FIX = {"Kvco min": "≥", "Kvco max": "≤"}
 # 备注补一句"这是什么"。★ 只补定义，不补解读——评审要的是"这个数怎么来的"。
 VCO_NOTE_ADD = {
-    "Sub-band Tuning Range":
-        "＝一个电容码不动、调谐电压走全程能覆盖多宽（子带宽度）。"
-        "它必须大于相邻码的频率步长，否则两个子带之间有一段频率任何码任何电压都到不了",
     "CT Band Coverage": "＝整个电容阵列能覆盖多宽（不含调谐电压那一维）",
     "Tuning Range": "＝调谐电压与电容码合起来的总覆盖宽度",
 }
 VCO_DROP_PREFIX = ("Kvco @",)  # 工作点那个值落在 Kvco min/max 之间，判定上冗余
-# ★ 粗码温度下算不出真步长：高低温只测 5 个码（0/64/128/192/255），
-#   "相邻两码的频率差"实际是跨 64 个码的平均，跟常温那个数不是一回事。
-#   宁可留空——填一个差 50 倍的数比没有数糟得多。
-VCO_COARSE_BLANK = {"CT Band Step (max)"}
 
 
 def vco_rows(sw, ref_temp, op_vtune):
@@ -840,15 +844,11 @@ def vco_rows(sw, ref_temp, op_vtune):
     from summarize_vco_sweep import build_conclusion
     rows, temps = build_conclusion(sw.by_kind, sw.items, sw.freq_item, ref_temp,
                                    sw.fvco, sw.fvco_ref, {}, op_vtune)
-    coarse = coarse_temps(sw)
     out = []
     for d in rows:
         if d["item"] in VCO_DROP or d["item"].startswith(VCO_DROP_PREFIX):
             continue
         vals = dict(d["vals"])
-        if d["item"] in VCO_COARSE_BLANK:
-            for t in coarse:
-                vals.pop(t, None)
         note = d.get("note") or ""
         add = VCO_NOTE_ADD.get(d["item"])
         if add:
