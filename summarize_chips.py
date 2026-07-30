@@ -874,6 +874,35 @@ def vco_rows(sw, ref_temp, op_vtune):
     return out, temps
 
 
+def flat_vtune_temps(sw, ratio=0.1):
+    """哪些温度的 Vtune 扫「频率几乎不动」。返回 [(温度, 该温度频率跨度, 各温中位)]。
+
+    ★ 为什么要专门查这个：Kvco 是逐区间 ΔF/ΔVtune 算的。如果某个温度实际上没真正
+      切到开环（环路还锁着 / DAC 没驱动到管子 / testmux 没切），那个温度的频率
+      就不跟 Vtune 走，Kvco 会算出接近 0 的值——而 0.00 MHz/V 这种数看着像
+      "低温增益低"，其实是"这个温度的扫描没生效"。工具不能安静地报它。
+      判据用相对量（跟其他温度的中位数比），不写死绝对阈值：不同 VCO 差几十倍。
+    """
+    from summarize_vco_sweep import group_series
+    spans = {}
+    for kind, groups in sw.by_kind:
+        if kind != "vtune":
+            continue
+        for g in groups:
+            if g.temp is None:
+                continue
+            ser = group_series(g, sw.freq_item)
+            if len(ser) >= 2:
+                xs = sorted(ser)
+                spans[g.temp] = abs(ser[xs[-1]] - ser[xs[0]])
+    if len(spans) < 2:
+        return []
+    med = median(list(spans.values()))
+    if not med:
+        return []
+    return [(t, sp, med) for t, sp in sorted(spans.items()) if sp < ratio * med]
+
+
 def endpoint_rows(sw):
     """两条扫描的四个端点频率。
 
@@ -1567,7 +1596,13 @@ def main():
                   f"指标 {len(sw.items)} 个   [{b.name}]")
             if coarse:
                 print(f"     · CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
-                      f"（只测几个码，按相邻码算的步长那几格留空）")
+                      f"（只测几个码）")
+            for t, sp, med in flat_vtune_temps(sw):
+                print(f"     ⚠⚠ {fmt_num(t)}℃ 的 Vtune 扫**频率几乎没动**："
+                      f"全程只变了 {fmt_num(sp, 4)} MHz，其他温度是 {fmt_num(med, 1)} MHz。"
+                      f"这个温度多半没真正切到开环（环路还锁着／DAC 没驱动／testmux "
+                      f"没切），它的 Kvco 会算出接近 0 的值——那不是低温增益低。"
+                      f"对照表上 F(Vtune=最低) 与 F(Vtune=最高) 这两行就能确认")
             print(f"     排除 {len(sw.excluded)} 行:")
             print_excluded(sw.excluded)
             excl_all.append((chip, mod, KIND_LABEL[KIND_VCO], sw.excluded))
