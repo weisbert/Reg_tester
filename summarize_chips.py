@@ -152,6 +152,19 @@ def discover(root, only_chips=None, only_modules=None):
     return picked, dropped, unknown, loose
 
 
+def print_excluded(excluded, indent="     ", cap=14):
+    """排除的行逐行列出原因，不静默丢弃。
+
+    ★ 只打一个"排除 N 行"是不够的：N 对不上预期时没法判断到底丢了什么。
+      这条纪律单簿脚本里一直有，跨芯片脚本一开始漏了——第一次跑真数据
+      就撞上了（预期 3 行、实际 6 行，只能靠猜）。
+    """
+    for xl, why in excluded[:cap]:
+        print(f"{indent}行{xl}: {why}")
+    if len(excluded) > cap:
+        print(f"{indent}…还有 {len(excluded) - cap} 行（全部内容在隐藏的 _审计 页）")
+
+
 # ---------------------------------------------------------------- 指标挑选
 
 # 只有这些进汇总表。★ 压控/片上温度/电流一律不进：
@@ -1267,7 +1280,7 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser):
 
 # ---------------------------------------------------------------- 审计页
 
-def write_audit(wb, picked, dropped, unknown, failed, notes, st):
+def write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all=()):
     """每个数出自哪份文件 + 哪些文件没用上。**隐藏页**——正表不写这些。"""
     ws = wb.create_sheet("_审计")
     ws.sheet_state = "hidden"
@@ -1296,7 +1309,10 @@ def write_audit(wb, picked, dropped, unknown, failed, notes, st):
             ("文件名认不出模块/类型，没读", [(c, "", "", f, f"认不出{why}")
                                             for c, f, why in unknown]),
             ("读失败", [(b.chip, b.module, KIND_LABEL[b.kind], b.name, why)
-                        for b, why in failed])):
+                        for b, why in failed]),
+            ("排除的行（逐行原因；这些行不进统计）",
+             [(chip, mod, kind, f"行{xl}", why)
+              for chip, mod, kind, ex in excl_all for xl, why in ex])):
         if not rowsrc:
             continue
         put(ws, r, 1, title, st, st["f_sep"], bold=True, align="left")
@@ -1388,6 +1404,7 @@ def main():
 
     # ---- 读 PLL 温扫 ----
     tables, failed, notes, warn_seen, vcharts = [], [], {}, {}, []
+    excl_all = []
     for mod in modules:
         books = grid.get(KIND_PLL, {}).get(mod, {})
         if not books:
@@ -1413,6 +1430,8 @@ def main():
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
                   f"{n_meas} 测点 / 指标 {len(sw.items)} 个 / 排除 {len(sw.excluded)} 行"
                   f"   [{b.name}]")
+            print_excluded(sw.excluded)
+            excl_all.append((chip, mod, KIND_LABEL[KIND_PLL], sw.excluded))
             flos = {txt(x.raw[sw.cols.idx('fLO_MHz')])
                     for lg in sw.legs for x in lg.rows
                     if sw.cols.idx('fLO_MHz') is not None} - {""}
@@ -1468,6 +1487,9 @@ def main():
             if coarse:
                 print(f"     · CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
                       f"（只测几个码，按相邻码算的步长那几格留空）")
+            print(f"     排除 {len(sw.excluded)} 行:")
+            print_excluded(sw.excluded)
+            excl_all.append((chip, mod, KIND_LABEL[KIND_VCO], sw.excluded))
             for w in sw.warnings:
                 warn_seen.setdefault(w, []).append(chip)
             for t in temps:
@@ -1499,7 +1521,7 @@ def main():
         write_vco_summary(wb, vtables, chips, st, vtemps)
         write_vco_charts(wb, vcharts, chips, st, vtemps, no_charts=args.no_charts)
     if not args.no_audit:
-        write_audit(wb, picked, dropped, unknown, failed, notes, st)
+        write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all)
     wb.calculation.fullCalcOnLoad = True
 
     out = args.out or os.path.join(os.path.dirname(root),
