@@ -670,7 +670,8 @@ def _journey_rows(sw):
     return out, (vt.unit if vt else "V"), f0
 
 
-def _jchart(ws, kind, chip, mod, col0, r_data, n_rows, bounds, st, title_extra=""):
+def _jchart(ws, kind, chip, mod, col0, r_data, n_rows, bounds, st, title_extra="",
+            rows=None):
     """一张温巡图：横轴=测试顺序（刻度标当时的温度），重锁点单独一条红三角。
 
     为什么不按"vs 温度"画：温巡是有先后的，同一个温度会经过好几次；
@@ -705,6 +706,15 @@ def _jchart(ws, kind, chip, mod, col0, r_data, n_rows, bounds, st, title_extra="
     skip = max(1, n_rows // 14)
     ch.x_axis.tickLblSkip = skip
     ch.x_axis.tickMarkSkip = skip
+    # ★ 压控温巡图标出全程最高/最低两点的数值：这张图的全部意义就是"压控走到哪了、
+    #   离轨还剩多少"，那两个数就是结论本身，不该让人在网格里用眼睛估。
+    #   （频率漂移那张不标：它故意用了远宽于数据的窗口——记录精度只有 1 kHz，
+    #   标出来是 ±1~2 kHz，等于给一条平线打标签。）
+    if kind == "vt" and rows:
+        from summarize_vco_sweep import _label_points
+        pts = [(x[3], i) for i, x in enumerate(rows) if x[3] is not None]
+        if pts:
+            _label_points(ch.series[0], [min(pts)[1], max(pts)[1]], numfmt="0.0###")
     return ch
 
 
@@ -794,11 +804,11 @@ def write_journey(wb, tables, chips, st, no_charts=False):
             for k, chip in enumerate(chips):
                 if chip not in got:
                     continue
-                first, cnt, _rows, f0 = got[chip]
+                first, cnt, _rows, f0 = got[chip]      # _rows 用来定位极值点
                 extra = (f"（相对首点 {fmt_num(f0, 6)} MHz）"
                          if kind == "df" and f0 is not None else "")
                 ch = _jchart(ws, kind, chip, mod, 1 + k * STRIP_W, first, cnt,
-                             bounds, st, extra)
+                             bounds, st, extra, rows=_rows)
                 ws.add_chart(ch, f"{_cl(1 + k * STRIP_W)}{row + band * CHART_H}")
         row += 2 * CHART_H
     return ws
@@ -1269,8 +1279,11 @@ VCO_XLABEL = {"v": "Vtune (V)", "k": "Vtune (V)", "c": "CT code", "d": "CT code"
 VCO_YHEAD = {"v": "F", "k": "Kvco", "c": "F", "d": "ΔF"}
 VCO_YAXIS = {"v": "F (MHz)", "k": "Kvco (MHz/V)", "c": "F (MHz)",
              "d": "|ΔF| (MHz/code)"}
-# 斜率图上给全图最低/最高两点打数值标注（值图点太密，标了反而糊）
-VCO_LABELED = ("k", "d")
+# 四张图都给**全图最低/最高两点**打数值标注。值图（F-vs-Vtune / F-vs-CT）的曲线
+# 是单调的，全图最低/最高点正好落在两个端点上，要的就是它们；
+# 斜率图上则是最平和最陡的那两个区间。
+# 只标两点是这条线定过的规矩——每条线各标首末点会在同一个横轴端点上叠成一坨。
+VCO_LABELED = ("v", "k", "c", "d")
 
 
 def _vco_series(sw, temps):
