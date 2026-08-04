@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter, OrderedDict
 
 import openpyxl
@@ -64,16 +65,52 @@ def _num(v):
         return None
 
 
-def find_header(ws, limit=40):
+def read_grid(ws, max_rows):
+    """整页一次性流式读成二维表，之后所有分析都在内存里做。
+
+    ★★ 不能用 `ws.cell(r, c)` 逐格扫：openpyxl 每次调用都要构造一个 Cell 对象，
+      而这类导出簿的"已使用区域"动不动就是几百列 × 几千行（列宽/底色刷过整行整列
+      也会把 max_column 顶到很大）。逐格扫 = 上百万次对象构造，看起来就是**卡死**。
+      `iter_rows(values_only=True)` 只吐元组，快两个数量级。
+      （2026-08-04：第一版就是逐格扫，用户在真文件上跑没有任何输出。）
+    """
+    rows = []
+    capped = False
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        rows.append(row)
+        if i + 1 >= max_rows:
+            capped = True
+            break
+    while rows and not any(_s(v) for v in rows[-1]):     # 掐掉末尾空行
+        rows.pop()
+    ncol = 0
+    for row in rows:
+        for j in range(len(row) - 1, ncol - 1, -1):
+            if _s(row[j]):
+                ncol = j + 1
+                break
+    return rows, ncol, capped
+
+
+def at(grid, r, c):
+    """1 基取值，越界给 None（各行长度不一定齐）。"""
+    if 1 <= r <= len(grid):
+        row = grid[r - 1]
+        if 1 <= c <= len(row):
+            return row[c - 1]
+    return None
+
+
+def find_header(grid, ncol, limit=40):
     """猜表头行：短文本最多的那一行。返回 (行号, 得分)。
 
     ★ 不按"第 1 行就是表头"处理：这类导出簿常在上面压几行标题 / 空行 / 合并单元格。
     """
     best, best_score = 1, -1
-    for r in range(1, min(limit, ws.max_row) + 1):
+    for r in range(1, min(limit, len(grid)) + 1):
         n_txt = n_num = 0
-        for c in range(1, ws.max_column + 1):
-            v = ws.cell(r, c).value
+        for c in range(1, ncol + 1):
+            v = at(grid, r, c)
             if v is None:
                 continue
             if _num(v) is not None and not isinstance(v, str):
@@ -86,23 +123,24 @@ def find_header(ws, limit=40):
     return best, best_score
 
 
-def last_data_row(ws, hdr):
+def last_data_row(grid, ncol, hdr):
     """真正有内容的最后一行。
 
     ★ 探查器报的 n_data_rows ≠ 工作表行数：导出脚本常在末尾追加页脚行
       （只有前一两列有字、没有任何结果值）。这条在温扫那边踩过，这里直接报出来。
     """
     last = hdr
-    for r in range(hdr + 1, ws.max_row + 1):
-        if any(_s(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)):
+    for r in range(len(grid), hdr, -1):
+        if any(_s(at(grid, r, c)) for c in range(1, ncol + 1)):
             last = r
+            break
     return last
 
 
-def profile(ws, hdr, r0, r1, c):
+def profile(grid, hdr, r0, r1, c):
     """一列的体检：名字、类型构成、样例、去重个数。"""
-    name = _s(ws.cell(hdr, c).value)
-    vals = [ws.cell(r, c).value for r in range(r0, r1 + 1)]
+    name = _s(at(grid, hdr, c))
+    vals = [at(grid, r, c) for r in range(r0, r1 + 1)]
     txt = [_s(v) for v in vals if _s(v) and _s(v).lower() not in NA]
     nums = [v for v in vals if _num(v) is not None]
     # 文本型数字：Python 解得动，Excel 的 COUNT/MIN/MATCH 一律不认
@@ -147,44 +185,52 @@ def guess_roles(cols, n_rows):
     return label, value, cond
 
 
-def probe_sheet(ws):
-    hdr, _ = find_header(ws)
+def probe_sheet(title, grid, ncol, capped):
+    hdr, _ = find_header(grid, ncol)
     r0 = hdr + 1
-    r1 = last_data_row(ws, hdr)
-    cols = [profile(ws, hdr, r0, r1, c) for c in range(1, ws.max_column + 1)]
+    r1 = last_data_row(grid, ncol, hdr)
+    cols = [profile(grid, hdr, r0, r1, c) for c in range(1, ncol + 1)]
     used = [p for p in cols if p["n_filled"] or p["name"]]
     dup = [n for n, k in Counter(p["name"] for p in used if p["name"]).items() if k > 1]
     label, value, cond = guess_roles(used, r1 - r0 + 1)
     # 尾部页脚行：只有零星几个格子有字、没有任何数
     foot = []
     for r in range(r1, max(r0, r1 - 8), -1):
-        filled = [c for c in range(1, ws.max_column + 1) if _s(ws.cell(r, c).value)]
-        nums = [c for c in filled if _num(ws.cell(r, c).value) is not None]
+        filled = [c for c in range(1, ncol + 1) if _s(at(grid, r, c))]
+        nums = [c for c in filled if _num(at(grid, r, c)) is not None]
         if filled and not nums and len(filled) <= 3:
-            foot.append((r, [_s(ws.cell(r, c).value) for c in filled][:3]))
+            foot.append((r, [_s(at(grid, r, c)) for c in filled][:3]))
         else:
             break
     return {
-        "sheet": ws.title, "max_row": ws.max_row, "max_col": ws.max_column,
+        "sheet": title, "max_row": len(grid), "max_col": ncol, "capped": capped,
         "header_row": hdr, "data_rows": [r0, r1], "n_data_rows": r1 - r0 + 1,
         "cols": used, "dup_names": dup, "footer_rows": foot,
         "label_col": label, "value_cols": value, "cond_cols": cond,
-        "merged": len(ws.merged_cells.ranges),
     }
 
 
-def probe_book(path, only_sheet=None):
-    wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
+def probe_book(path, only_sheet=None, max_rows=20000):
+    size = os.path.getsize(path) / 1e6
+    print(f"  读 {os.path.basename(path)}（{size:.1f} MB）…", end="", flush=True)
+    t0 = time.time()
+    # read_only=True：只取值、不建 Cell 对象树。大簿子上是能不能跑完的区别
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     out = {"path": path, "name": os.path.basename(path), "sheets": []}
-    for ws in wb.worksheets:
-        if only_sheet and ws.title != only_sheet:
-            continue
-        if ws.max_row < 2 or ws.max_column < 2:
-            out["sheets"].append({"sheet": ws.title, "empty": True,
-                                  "max_row": ws.max_row, "max_col": ws.max_column})
-            continue
-        out["sheets"].append(probe_sheet(ws))
-    wb.close()
+    try:
+        for ws in wb.worksheets:
+            if only_sheet and ws.title != only_sheet:
+                continue
+            grid, ncol, capped = read_grid(ws, max_rows)
+            print(f" [{ws.title}: {len(grid)}×{ncol}]", end="", flush=True)
+            if len(grid) < 2 or ncol < 2:
+                out["sheets"].append({"sheet": ws.title, "empty": True,
+                                      "max_row": len(grid), "max_col": ncol})
+                continue
+            out["sheets"].append(probe_sheet(ws.title, grid, ncol, capped))
+    finally:
+        wb.close()
+    print(f"  {time.time() - t0:.1f}s")
     return out
 
 
@@ -204,7 +250,8 @@ def show(rep, max_list):
         print(f"  [页 {sh['sheet']}] {sh['max_row']} 行 × {sh['max_col']} 列，"
               f"表头在第 {sh['header_row']} 行，数据 {sh['data_rows'][0]}~"
               f"{sh['data_rows'][1]}（{sh['n_data_rows']} 行）"
-              + (f"，合并单元格 {sh['merged']} 处" if sh["merged"] else ""))
+              + ("  ★只读了前 %d 行（--max-rows 调）" % sh["max_row"]
+                 if sh.get("capped") else ""))
         if sh["max_row"] != sh["data_rows"][1]:
             print(f"     · 工作表行数 {sh['max_row']} ≠ 有内容的最后一行 "
                   f"{sh['data_rows'][1]}（末尾有空行）")
@@ -256,6 +303,8 @@ def main():
     ap.add_argument("path", help="芯片目录的根，或单个 xlsx")
     ap.add_argument("--sheet", default=None, help="只看这一页")
     ap.add_argument("--max-list", type=int, default=80, help="标签最多列几个")
+    ap.add_argument("--max-rows", type=int, default=20000,
+                    help="每页最多读多少行（防超大簿子）")
     ap.add_argument("--json", default=None, help="结构写一份 JSON（不含数据值）")
     ap.add_argument("--emit-groups", default=None,
                     help="把标签列写成分组清单模板（★含真实名字，只能放 private/）")
@@ -286,7 +335,7 @@ def main():
     reps = []
     for chip, mod, p in files:
         try:
-            rep = probe_book(p, args.sheet)
+            rep = probe_book(p, args.sheet, args.max_rows)
         except Exception as e:                        # noqa: B902
             print(f"\n✗ 读失败 {os.path.basename(p)}: {type(e).__name__}: {e}")
             continue
