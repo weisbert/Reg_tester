@@ -1126,6 +1126,10 @@ def export_xlsx(conn, out_path, all_runs=False, config=None):
 
 # ---- 汇总簿视觉语言（参考评审报告表：黄表头带/条件行米色/结果白/合计蓝/超差红粗/细边框） ----
 C_HEADER, C_SETTING, C_RESULT, C_SEP, C_FLAG = "FFFF00", "EEECE1", "FFFFFF", "B8CCE4", "FF0000"
+# 宽表的视觉分区（与 sweep_lib 同一套值）：窄灰竖栏界定"这一块是一片"，
+# 浅蓝给全表唯一要跳出来的汇总组。人一眼能数清的上限是 4~5 个，超了就得数——
+# 分区不是好看，是让"我现在看的是哪一颗芯片"这条信息不丢。
+C_RAIL, C_SUM = "D9D9D9", "DDEBF7"
 FONT_NAME = "微软雅黑"
 _THIN = Side(style="thin", color="FF000000")
 BORDER_ALL = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
@@ -1751,17 +1755,31 @@ def cmd_chips_export(conn, out_path, config, chips=None):
     rows_of_mode = {m: [k for k in row_keys if any(has(k, m, c) for c in chip_ids)]
                     for m in modes}
 
-    # ---- 列几何：编号/模块/单位 | 仿真 | 每片 n_t 列 | [片间极差 极差%] | 均值@ 偏差% | 备注
-    FIX, C_SIM = 3, 4
-    C_CHIP = C_SIM + 1
-    after = C_CHIP + n_chip * n_t
+    # ---- 列几何。★组与组之间插一条窄灰竖栏（宽 2 的空列），不是为了好看：
+    #      40 列宽的表里最先丢的信息是「我现在看的是哪一颗芯片」，一条实心竖栏比给整块
+    #      上底色更省视觉预算（Gestalt common region），灰度打印下照样成立。
+    #      编号/模块/单位 ▏仿真 ▏片1 ▏片2 … ▏[极差 极差%] 均值 偏差% ▏备注
+    FIX = 3
+    C_R0, C_SIM, C_R1 = FIX + 1, FIX + 2, FIX + 3
+    C_CHIP = C_R1 + 1
+    CHIP_W = n_t + 1                         # 每片：n_t 个温度列 + 1 条竖栏
+    after = C_CHIP + n_chip * CHIP_W         # 最后一片的竖栏之后
     spread = n_chip > 1                      # 只有一颗芯片时「片间极差」是废列，不出
     C_SPREAD, C_SPCT = (after, after + 1) if spread else (None, None)
     C_MEAN = after + (2 if spread else 0)
-    C_DEV, C_NOTE = C_MEAN + 1, C_MEAN + 2
+    C_DEV = C_MEAN + 1
+    C_R2, C_NOTE = C_DEV + 1, C_DEV + 2
+    SUM_C0, SUM_C1 = (C_SPREAD if spread else C_MEAN), C_DEV   # 汇总组左右边界
 
     def cc(chip_i, ti):
-        return C_CHIP + chip_i * n_t + ti
+        return C_CHIP + chip_i * CHIP_W + ti
+
+    rails = [C_R0, C_R1, C_R2] + [C_CHIP + j * CHIP_W + n_t for j in range(n_chip)]
+
+    def paint_rails(ws_, r):
+        """把竖栏画到这一行上。band 行例外——它要横贯整表，不留缝。"""
+        for c in rails:
+            _cell(ws_, r, c, fill=C_RAIL)
 
     wb = openpyxl.Workbook()
     fcache = {}
@@ -1834,27 +1852,36 @@ def cmd_chips_export(conn, out_path, config, chips=None):
         _cell(ws, 1, c, title, bold=True, fill=C_HEADER)
         ws.column_dimensions[get_column_letter(c)].width = width
 
+    def head_group(c0, c1, title, sub, widths, fill=C_HEADER):
+        """两行表头：上行组名（跨列合并），下行分轴名。表头本身也按组切开，
+        眼睛先看到几个组、再看组里几列——比一排 15 个平铺的列名好数。"""
+        ws.merge_cells(start_row=1, start_column=c0, end_row=1, end_column=c1)
+        _cell(ws, 1, c0, title, bold=True, fill=C_HEADER)
+        for k, (s, w) in enumerate(zip(sub, widths)):
+            _cell(ws, 2, c0 + k, s, bold=True, fill=fill, size=9)
+            ws.column_dimensions[get_column_letter(c0 + k)].width = w
+
     for c, (title, w) in enumerate(zip(["编号", "模块 (OFF 步)", "单位"], [9, 30, 6]), 1):
         head_single(c, title, w)
     head_single(C_SIM, f"仿真\n{d.sim_note} {d.tier}", 11)
     for j, chip in enumerate(chip_ids):
-        ws.merge_cells(start_row=1, start_column=cc(j, 0), end_row=1, end_column=cc(j, n_t - 1))
-        _cell(ws, 1, cc(j, 0), chip, bold=True, fill=C_HEADER)
-        for ti, t in enumerate(temps):
-            _cell(ws, 2, cc(j, ti), _t(t) if t is not None else "?", bold=True, fill=C_HEADER)
-            ws.column_dimensions[get_column_letter(cc(j, ti))].width = 10
+        head_group(cc(j, 0), cc(j, n_t - 1), chip,
+                   [_t(t) if t is not None else "?" for t in temps], [10] * n_t)
     if spread:
-        head_single(C_SPREAD, "片间极差\nµA", 10)
-        head_single(C_SPCT, "片间极差\n%", 9)
-    head_single(C_MEAN, "各片均值\n@%g℃" % d.sim_temp_c, 11)
-    head_single(C_DEV, "偏差%\nvs 仿真", 10)
+        head_group(C_SPREAD, C_SPCT, "片间一致性", ["极差 µA", "极差 %"], [10, 9])
+    head_group(C_MEAN, C_DEV, "与仿真对比",
+               ["各片均值\n@%g℃" % d.sim_temp_c, "偏差%"], [11, 10])
     head_single(C_NOTE, "备注", 46)
+    for c in rails:
+        ws.column_dimensions[get_column_letter(c)].width = 2
     for r in (1, 2):
+        paint_rails(ws, r)
         for c in range(1, C_NOTE + 1):
             ws.cell(row=r, column=c).alignment = Alignment(
                 horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[1].height = 30
-    ws.freeze_panes = ref(3, C_SIM)
+    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[2].height = 24
+    ws.freeze_panes = ref(3, C_R0)
 
     red_font = Font(name=FONT_NAME, size=10, bold=True, color=C_FLAG)
     i25 = temps.index(_closest(temps, 25)) if temps[0] is not None else 0
@@ -1876,16 +1903,17 @@ def cmd_chips_export(conn, out_path, config, chips=None):
                 return f"({a}+{w:g}*({b}-{a}))"
         return ref(rr, cc(j, pts[-1][1]))
 
-    rr = 3
+    rr, guides = 3, []
     for mode in modes:
-        # -- band 行：模式分区（对齐 > 分隔 > 颜色：整行浅底 + 上边框，不做花哨）
+        # -- band 行：模式起点。**横贯整表、盖掉竖栏**——竖栏是分"片"的，
+        #    band 是分"模式"的，两者交叉会把表切成棋盘格，反而没有层次
         for c in range(1, C_NOTE + 1):
-            _cell(ws, rr, c, fill=C_SETTING)
+            _cell(ws, rr, c, fill=C_SEP)
         ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=FIX)
-        _cell(ws, rr, 1, mode, bold=True, fill=C_SETTING, align="left", size=11)
-        ws.merge_cells(start_row=rr, start_column=C_SIM, end_row=rr, end_column=C_NOTE)
+        _cell(ws, rr, 1, mode, bold=True, fill=C_SEP, align="left", size=11)
+        ws.merge_cells(start_row=rr, start_column=C_R0, end_row=rr, end_column=C_NOTE)
         freq = _mode_freq(mode, config)
-        _cell(ws, rr, C_SIM, f"测试频率 {freq}" if freq else "", fill=C_SETTING, align="left")
+        _cell(ws, rr, C_R0, f"测试频率 {freq}" if freq else "", fill=C_SEP, align="left")
         ws.row_dimensions[rr].height = 18
         rr += 1
 
@@ -1893,6 +1921,7 @@ def cmd_chips_export(conn, out_path, config, chips=None):
         for name, src in (("锁定后总电流", d.base_ma), ("全关残留电流", d.end_ma)):
             for c in range(1, C_NOTE + 1):
                 _cell(ws, rr, c, fill=C_SETTING)
+            paint_rails(ws, rr)
             _cell(ws, rr, 2, name, fill=C_SETTING, align="left")
             _cell(ws, rr, 3, "mA", fill=C_SETTING)
             present = []
@@ -1920,8 +1949,11 @@ def cmd_chips_export(conn, out_path, config, chips=None):
         mode_rows = rows_of_mode[mode]
         first_row = rr
         lo_rows, all_rows = [], []
-        for key in mode_rows:
+        for n_in_block, key in enumerate(mode_rows):
             disp, step_name = key
+            paint_rails(ws, rr)
+            for c in range(SUM_C0, SUM_C1 + 1):
+                _cell(ws, rr, c, fill=C_SUM)
             _cell(ws, rr, 1, disp)
             _cell(ws, rr, 2, sim_names.get(key) or step_name, align="left")
             _cell(ws, rr, 3, "µA")
@@ -1970,6 +2002,9 @@ def cmd_chips_export(conn, out_path, config, chips=None):
             all_rows.append(rr)
             if key in lo_keys:
                 lo_rows.append(rr)
+            # 每 4 个模块行一条横导引线（末行不画——紧接着就是 Σ，它自带边界）
+            if (n_in_block + 1) % 4 == 0 and n_in_block + 1 < len(mode_rows):
+                guides.append(rr)
             rr += 1
 
         # -- 段末 Σ
@@ -1978,9 +2013,10 @@ def cmd_chips_export(conn, out_path, config, chips=None):
             if not rws:
                 continue
             for c in range(1, C_NOTE + 1):
-                _cell(ws, rr, c, fill=C_SEP)
-            _cell(ws, rr, 2, title, bold=True, fill=C_SEP, align="left")
-            _cell(ws, rr, 3, "µA", fill=C_SEP)
+                _cell(ws, rr, c, fill=C_SUM)
+            paint_rails(ws, rr)
+            _cell(ws, rr, 2, title, bold=True, fill=C_SUM, align="left")
+            _cell(ws, rr, 3, "µA", fill=C_SUM)
             sum_of = lambda c: (f"=SUM({ref(rws[0], c)}:{ref(rws[-1], c)})"
                                 if rws == list(range(rws[0], rws[-1] + 1))
                                 else "=" + "+".join(ref(x, c) for x in rws))
@@ -1988,9 +2024,9 @@ def cmd_chips_export(conn, out_path, config, chips=None):
                                       if k in lo_keys) if v is not None)
                       if with_sim else None)
             if with_sim:
-                fcell(ws, rr, C_SIM, sum_of(C_SIM), rnd(sv_sum, 1), fill=C_SEP, fmt=FMT_UA)
+                fcell(ws, rr, C_SIM, sum_of(C_SIM), rnd(sv_sum, 1), fill=C_SUM, fmt=FMT_UA)
             else:
-                _cell(ws, rr, C_SIM, "", fill=C_SEP)
+                _cell(ws, rr, C_SIM, "", fill=C_SUM)
             present, sums = [], {}
             for j, chip in enumerate(chip_ids):
                 got = False
@@ -2000,7 +2036,7 @@ def cmd_chips_export(conn, out_path, config, chips=None):
                     vals = [v for v in vals if v is not None]
                     sums[(j, ti)] = sum(vals) if vals else None
                     fcell(ws, rr, cc(j, ti), sum_of(cc(j, ti)),
-                          rnd(sum(vals), 1) if vals else None, fill=C_SEP, fmt=FMT_UA)
+                          rnd(sum(vals), 1) if vals else None, fill=C_SUM, fmt=FMT_UA)
                     got = got or bool(vals)
                 if got:
                     present.append(j)
@@ -2008,7 +2044,7 @@ def cmd_chips_export(conn, out_path, config, chips=None):
             _spread_cells(ws, fcell, rr, present, cc, n_t,
                           getval=lambda j, ti, _s=sums: _s.get((j, ti)),
                           C_SPREAD=C_SPREAD, C_SPCT=C_SPCT, i25=i25, spread=spread,
-                          fill=C_SEP, fmt=FMT_UA, ref=ref)
+                          fill=C_SUM, fmt=FMT_UA, ref=ref)
             if with_sim and present:
                 expr = "+".join(interp_expr(rr, j) for j in present)
                 mv = _mean_at(d, [[
@@ -2016,26 +2052,56 @@ def cmd_chips_export(conn, out_path, config, chips=None):
                                     for k in mode_rows if k in lo_keys) if v is not None)
                     for ti in range(n_t)] for j in present])
                 fcell(ws, rr, C_MEAN, f"=({expr})/{len(present)}", rnd(mv, 1),
-                      fill=C_SEP, fmt=FMT_UA)
+                      fill=C_SUM, fmt=FMT_UA)
                 dv = (mv - sv_sum) / sv_sum if (mv is not None and sv_sum) else None
                 m_ref, s_ref = ref(rr, C_MEAN), ref(rr, C_SIM)
                 fcell(ws, rr, C_DEV,
                       f'=IF(OR({s_ref}="",{s_ref}=0,{m_ref}=""),"",({m_ref}-{s_ref})/{s_ref})',
-                      rnd(dv, 4) if dv is not None else None, fill=C_SEP, fmt=FMT_PCT)
+                      rnd(dv, 4) if dv is not None else None, fill=C_SUM, fmt=FMT_PCT)
                 if dv is not None and abs(dv) > d.thr and abs(mv - sv_sum) > d.abs_thr:
                     ws.cell(row=rr, column=C_DEV).font = red_font
-                _cell(ws, rr, C_NOTE, "口径与仿真一致（不含标签行）", fill=C_SEP, align="left")
+                _cell(ws, rr, C_NOTE, "口径与仿真一致（不含标签行）", fill=C_SUM, align="left")
             else:
-                _cell(ws, rr, C_MEAN, "", fill=C_SEP)
-                _cell(ws, rr, C_DEV, "", fill=C_SEP)
+                _cell(ws, rr, C_MEAN, "", fill=C_SUM)
+                _cell(ws, rr, C_DEV, "", fill=C_SUM)
                 _cell(ws, rr, C_NOTE, "含 DCO 等标签行，仿真未覆盖，无对比",
-                      fill=C_SEP, align="left")
+                      fill=C_SUM, align="left")
             rr += 1
         rr += 1     # 段间空行
+
+    # 边框最后统一加——_cell 每次写都会重置 border，先画会被后面的写覆盖掉
+    _vedges(ws, 1, rr, SUM_C0, SUM_C1)
+    for g in guides:
+        _hguide(ws, g, 1, C_NOTE)
 
     wb.save(out_path)
     _inject_cached_values(out_path, fcache)
     return len(d.runs), len(modes), n_chip
+
+
+_MEDIUM = Side(style="medium", color="FF000000")
+
+
+def _vedges(ws, r0, r1, c_first, c_last):
+    """给一个列组的左右两侧加中等粗细竖边框。
+    汇总组是全表唯一要「跳出来」的（判断就是对着它做的）。只靠底色不够——
+    灰度打印和色弱下几种浅色会撞，边框不会。"""
+    for r in range(r0, r1 + 1):
+        for c, which in ((c_first, "l"), (c_last, "r")):
+            b = ws.cell(row=r, column=c).border
+            ws.cell(row=r, column=c).border = Border(
+                left=_MEDIUM if which == "l" else b.left,
+                right=_MEDIUM if which == "r" else b.right, top=b.top, bottom=b.bottom)
+
+
+def _hguide(ws, r, c0, c1):
+    """一条横向导引线（中粗下边框）。
+    一眼能数清的上限是 4~5 行，再多横着扫就会串行。每 4 个模块行给一条线，
+    不上斑马底色——竖向已经分区了，再加行底色就成了网格噪声。"""
+    for c in range(c0, c1 + 1):
+        b = ws.cell(row=r, column=c).border
+        ws.cell(row=r, column=c).border = Border(left=b.left, right=b.right,
+                                                 top=b.top, bottom=_MEDIUM)
 
 
 def _closest(temps, target):
