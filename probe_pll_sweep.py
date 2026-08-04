@@ -494,6 +494,35 @@ def analyse_sheet(ws, level, reveal, hide, max_groups=25):
     return out
 
 
+def cols_map(ws, reveal, hide, start="A", header_row=1):
+    """逐列打一张「列字母 | 表头 | 分类 | 非空行数」的清单（纯文本，零数值）。
+
+    ★ 为什么 classify_only 不够：它**跳过表头为空的列**，于是列表里的第 n 项
+      跟表上的第 n 列对不上，没法反推列字母。而原厂模板的尾部常挂着一段
+      表头是数字、甚至干脆没表头的块（仪器搜出来的杂散清单就在那儿），
+      要按列位置去读它，就必须先知道它到底从哪个字母开始、到哪儿为止。
+    ★ 非空行数是计数不是数值，不破脱敏。
+    """
+    from openpyxl.utils import column_index_from_string as ci
+    from openpyxl.utils import get_column_letter as gl
+    all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    if not all_rows:
+        return ["（空表）"]
+    header = all_rows[header_row - 1]
+    data = all_rows[header_row:]
+    c0 = ci(start.strip().upper() or "A") - 1
+    out = ["%s: %d 行 × %d 列（表头第 %d 行）"
+           % (ws.title, ws.max_row, ws.max_column, header_row),
+           "列 | 表头 | 分类 | 非空行数"]
+    for c in range(c0, ws.max_column):
+        head = header[c] if c < len(header) else None
+        n = sum(1 for r in data if c < len(r) and not is_blank(r[c]))
+        cls = "-" if is_blank(head) else classify_header(head, reveal, hide)[0]
+        out.append("%s | %s | %s | %d"
+                   % (gl(c + 1), "（无表头）" if is_blank(head) else norm(head), cls, n))
+    return out
+
+
 def classify_only(ws, reveal, hide, max_patterns=4, max_empty_names=20):
     """最小输出：每种块只报一次 表头 -> 分类 -> 非空计数，先核对脱敏边界对不对。
 
@@ -660,6 +689,11 @@ def main():
                     help="逗号分隔的表头名，强制当性能列藏起来")
     ap.add_argument("--classify-only", action="store_true",
                     help="只输出「表头 -> 条件/性能」分类，最小体积，先核对脱敏边界")
+    ap.add_argument("--cols", nargs="?", const="A", default=None,
+                    metavar="起始列",
+                    help="逐列打一张「列字母|表头|分类|非空行数」清单（纯文本，零数值）。"
+                         "可给起始列字母，例 --cols GA 只看尾部那一段。"
+                         "认按列位置读的块（表头是数字或干脆没表头的）用这个")
     ap.add_argument("--conds", action="store_true",
                     help="只出条件面：条件列取值+出现次数 + 逐行条件表（零性能数值）；"
                          "用来看扫描维度怎么组合、同一条件是否重复测了多轮")
@@ -692,6 +726,12 @@ def main():
                          else "conds-only" if args.conds else args.level),
         "note": "cond/setpoint 列出全值；perf 列默认不出任何数值",
     }
+    if args.cols:
+        # 纯文本直接打，不走 JSON：这张表是给人肉眼看列位置的
+        for n in names:
+            print("\n".join(cols_map(wb[n], reveal, hide, start=args.cols)))
+            print()
+        return
     if args.classify_only:
         obj["sheets"] = [classify_only(wb[n], reveal, hide) for n in names]
     elif args.conds:
