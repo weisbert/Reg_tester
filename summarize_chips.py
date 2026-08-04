@@ -36,16 +36,18 @@ summarize_chips.py — 一个目录里的多颗芯片 → 一份给评审看的�
 """
 
 import argparse
+import json
 import os
 import re
 import sys
+from collections import OrderedDict
 
 from summarize_vco_sweep import load_vco
 from sweep_lib import (
     COLOR_FLAG, COLOR_MUTED, COLOR_PASS, FILL_FAIL, FILL_PASS,
-    LEG_STYLE, apply_y, as_text, axis_bounds, blank_policy,
-    fmt_num, leg_series, legend_bottom, load_sweep, median, nice_step, num, put,
-    stats_all, styles, style_series, txt,
+    LEG_STYLE, Columns, SweepError, apply_y, as_text, axis_bounds, blank_policy,
+    fmt_num, is_blank, leg_series, legend_bottom, load_sweep, median, nice_step,
+    num, put, stats_all, styles, style_series, txt,
 )
 from xlsx_formula_cache import FormulaCache
 
@@ -1111,7 +1113,20 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
       却把"哪个温度"丢了——纯信息损失。PLL 那边是 49 个测点压成 3 个数，
       压缩有真收益。
     """
-    ws = wb.create_sheet("VCO_Summary")
+    return write_grouped_page(wb, "VCO_Summary", "{mod} VCO 开环特性汇总",
+                              vtables, chips, st, vtemps, slim=slim)
+
+
+def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
+                       slim=False, item_w=26, note_w=46):
+    """「一行一个量 × 每片若干温度」这种页的通用写法。
+
+    ★ VCO 汇总页和电流页是同一个形状：行是结论量、组内轴是温度、汇总列对
+      全部片全温取。所以只留这一份实现——不是为了少打字，是因为出稿自查
+      （selfcheck）按这个骨架逐格反推汇总列，两份实现一漂移，自查就只护得住一页。
+      两页的差别只有：页名、大标题、行从哪儿来。
+    """
+    ws = wb.create_sheet(sheet)
     n = len(chips)
     nax = len(vtemps)
     cw = nax + 1
@@ -1125,7 +1140,7 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
     def vrails():
         return [C_GAP1, C_GAP2, C_GAP3] + [vchip(k) + nax for k in range(n)]
 
-    ws.column_dimensions[_cl(C_ITEM)].width = 26
+    ws.column_dimensions[_cl(C_ITEM)].width = item_w
     ws.column_dimensions[_cl(C_UNIT)].width = 9
     ws.column_dimensions[_cl(C_LIMIT)].width = 8
     for c in list(range(C_SPEC, C_SPEC + 3)) + list(range(C_SIM, C_SIM + 3)) + \
@@ -1138,14 +1153,14 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
         for j in range(nax):
             ws.column_dimensions[_cl(vchip(k) + j)].width = 11
         ws.column_dimensions[_cl(vchip(k) + nax)].width = 2
-    ws.column_dimensions[_cl(vnote())].width = 46
+    ws.column_dimensions[_cl(vnote())].width = note_w
 
     r = 1
     judged = []
     for mod, data in vtables:
         t0 = r
         # ---- 三行表头 ----
-        c = put(ws, r, C_ITEM, f"{mod} VCO 开环特性汇总", st, st["f_sep"],
+        c = put(ws, r, C_ITEM, title_fmt.format(mod=mod), st, st["f_sep"],
                 bold=True, align="left", size=12)
         ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
         c.alignment = _align("left", wrap=False)
@@ -1194,11 +1209,12 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
                 notes_of.setdefault(key, d["note"])
                 if key not in seen:
                     seen.add(key)
-                    order.append((d["cat"], d["item"], d["unit"], d["dir"], d["kind"]))
+                    order.append((d["cat"], d["item"], d["unit"], d["dir"],
+                              d["kind"], d.get("nd")))
         j0 = None
         cur_cat = None
         band0 = None
-        for cat, item, unit, dr, kind in order:
+        for cat, item, unit, dr, kind, nd_ in order:
             if cat != cur_cat:
                 if band0 is not None and r - band0 > 4:
                     for rr in range(band0 + 3, r - 1, 4):
@@ -1211,7 +1227,7 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
             is_res = kind == "result"
             if is_res and j0 is None:
                 j0 = r
-            nd = 3 if unit == "MHz" else 2
+            nd = nd_ or (3 if unit == "MHz" else 2)
             body = st["f_res"] if is_res else st["f_group"]
             put(ws, r, C_ITEM, item, st, body, align="left")
             put(ws, r, C_UNIT, unit, st, body, size=9)
@@ -1519,6 +1535,153 @@ def write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all=()):
     return ws
 
 
+# ---------------------------------------------------------------- 电流（逐级关断）
+
+class CurBook:
+    """一份逐级关断电流簿读出来的样子。"""
+    __slots__ = ("runs", "temps", "warnings", "excluded", "n_rows", "n_cols",
+                 "key_name", "val_name", "unit")
+
+    def __init__(self):
+        self.runs, self.temps, self.warnings, self.excluded = {}, [], [], []
+        self.n_rows = self.n_cols = 0
+        self.key_name = self.val_name = self.unit = ""
+
+
+def load_current(path, temp_col=None, key_col=None, val_col=None):
+    """读一份逐级关断电流簿 → 每个温度一趟「测量点阶梯」。
+
+    ★★ 值列装的是**每关掉一步之后的总电流**，不是那个模块自己的电流。
+      模块电流 ＝ 关它之前那个测量点 − 关它之后那个测量点。
+    ★★ 阶梯到哪儿为止**不靠"restore"这类字样去认**（那是模板里的人话，随时会改）：
+      逐级关断的总电流是**单调下降**的，第一个明显回升的测量点就是"恢复后复测"。
+      用形状判不用文字判——顺带这个复测点还是这趟数据的可信度证据
+      （它应该回到全开基线附近）。
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    wb.close()
+    if len(rows) < 2:
+        raise SweepError("表里没有数据行")
+    out = CurBook()
+    out.n_rows, out.n_cols = len(rows), max(len(r) for r in rows)
+    cols = Columns(rows[0])
+    out.warnings = list(cols.dup_report())
+
+    tname, ti = (temp_col, cols.idx(temp_col)) if temp_col else \
+        cols.find(r"temperature", r"^temp")
+    if ti is None:
+        raise SweepError("找不到温度列，用 --temp-col 指定")
+    vname, vi = (val_col, cols.idx(val_col)) if val_col else \
+        cols.find(r"current.*m\s*a", r"^i(dd|cc)", r"电流")
+    if vi is None:
+        raise SweepError("找不到电流值列，用 --cur-col 指定")
+    kname, ki = (key_col, cols.idx(key_col)) if key_col else (None, None)
+    if ki is None:
+        # 键列＝第一列那种"一步一个短名字"的列（模板里表头常叫 NO.）。
+        # 找不到就退回第一列，并报一句。
+        kname, ki = cols.find(r"^no\.?$", r"^item$", r"^block$", r"^step$")
+        if ki is None:
+            kname, ki = (txt(rows[0][0]) or "第一列"), 0
+            out.warnings.append(f"没认出步骤名那一列，按第一列（{kname}）用；"
+                                f"不对的话加 --key-col")
+    mname, mi = cols.find(r"^mode$", r"^desc", r"说明")
+    out.key_name, out.val_name = kname, vname
+    out.unit = "mA"
+
+    # 按温度分趟；同一温度里保持文件顺序
+    by_t = OrderedDict()
+    for n, raw in enumerate(rows[1:], start=2):
+        if all(is_blank(v) for v in raw):
+            continue
+        key = txt(raw[ki]) if ki < len(raw) else ""
+        t = num(raw[ti]) if ti < len(raw) else None
+        if t is None:
+            out.excluded.append((n, "没有温度值（多半是页脚行）", key))
+            continue
+        i_tot = num(raw[vi]) if vi < len(raw) else None
+        mode = txt(raw[mi]) if (mi is not None and mi < len(raw)) else ""
+        by_t.setdefault(t, []).append((n, key, mode, i_tot))
+
+    for t, seq in by_t.items():
+        pts = [(n, k, m, i) for n, k, m, i in seq if i is not None]
+        if not pts:
+            out.excluded.append((0, f"{fmt_num(t)}℃ 这一趟一个测量点都没有", ""))
+            continue
+        base = pts[0][3]
+        steps, recheck, prev = [], None, base
+        for n, k, m, i in pts[1:]:
+            # 回升超过基线 5% ＝ 恢复段的复测点，阶梯到此为止
+            if i - prev > abs(base) * 0.05:
+                recheck = (n, k, m, i)
+                break
+            steps.append((k, m, i, prev - i))
+            prev = i
+        out.runs[t] = {"baseline": base, "baseline_key": pts[0][1],
+                       "steps": steps, "recheck": recheck}
+    out.temps = sorted(out.runs)
+    return out
+
+
+def current_rows(cur, groups, chip_note=""):
+    """一份电流簿 → 页上的行（跟 VCO 页同形：cat/item/unit/dir/kind/vals/note）。
+
+    groups = [(组名, [键1, 键2, ...])]；给空就把所有关断步骤按文件顺序排成一组。
+    """
+    # 每个键在各温度下的 ΔI
+    dmap, order, modes = {}, [], {}
+    for t in cur.temps:
+        for k, m, _i, d in cur.runs[t]["steps"]:
+            dmap.setdefault(k, {})[t] = d
+            modes.setdefault(k, m)
+            if k not in order:
+                order.append(k)
+    if not groups:
+        groups = [("全部关断步骤", order)]
+
+    # 这趟测试自己的重复性 = |恢复后复测 − 全开基线|，取各温度里最大的那个
+    rep = 0.0
+    for t in cur.temps:
+        rc = cur.runs[t].get("recheck")
+        if rc:
+            rep = max(rep, abs(rc[3] - cur.runs[t]["baseline"]))
+
+    out = []
+    cond = [("全开基线电流", {t: cur.runs[t]["baseline"] for t in cur.temps},
+             "关断开始之前、所有模块都开着时的总电流"),
+            ("恢复后复测", {t: (cur.runs[t]["recheck"][3] if cur.runs[t].get("recheck")
+                            else None) for t in cur.temps},
+             "全部写回初始值并重锁之后再测一次的总电流"),
+            ("复测 − 基线", {t: ((cur.runs[t]["recheck"][3] - cur.runs[t]["baseline"])
+                              if cur.runs[t].get("recheck") else None)
+                          for t in cur.temps},
+             "恢复后复测 − 全开基线")]
+    for item, vals, note in cond:
+        out.append({"cat": "Condition", "item": item, "unit": "mA", "dir": "",
+                    "kind": "cond", "vals": vals, "note": note, "nd": 4})
+    out.append({"cat": "Condition", "item": "关断步数", "unit": "",
+                "dir": "", "kind": "cond",
+                "vals": {t: len(cur.runs[t]["steps"]) for t in cur.temps},
+                "note": "这一趟一共关了多少步；本表只列清单里的", "nd": 0})
+
+    for gname, keys in groups:
+        for k in keys:
+            vals = dmap.get(k, {})
+            note = "关它之前 − 关它之后的总电流"
+            if modes.get(k):
+                note = f"{modes[k]}｜{note}"
+            # ★ 哨兵：比这趟自己的重复性还小的数，不能当成"这个模块耗这么多"
+            got = [v for v in vals.values() if isinstance(v, (int, float))]
+            if rep and got and max(abs(v) for v in got) < rep:
+                note = (f"⚠ 比本趟重复性（复测−基线 {fmt_num(rep, 4)} mA）还小，"
+                        f"只能当上限看；" + note)
+            out.append({"cat": gname, "item": k, "unit": "mA", "dir": "≤",
+                        "kind": "result", "vals": vals, "note": note, "nd": 4})
+    return out
+
+
 # ---------------------------------------------------------------- 出稿自查
 
 def selfcheck(path):
@@ -1537,7 +1700,7 @@ def selfcheck(path):
     wv = openpyxl.load_workbook(path, data_only=True)
     fails, n_agg, n_f = [], 0, 0
 
-    for name in ("PLL_Summary", "VCO_Summary"):
+    for name in ("PLL_Summary", "VCO_Summary", "Current_Summary"):
         if name not in wb.sheetnames:
             continue
         ws, wsv = wb[name], wv[name]
@@ -1609,6 +1772,13 @@ def main():
     ap.add_argument("--slim", action="store_true",
                     help="两张汇总表每片只显示常温列，其余温度列折进 Excel 大纲"
                          "（点 ＋ 展开，数一个没少）；芯片多了用")
+    ap.add_argument("--groups", default=None,
+                    help="电流页的分组清单 JSON（{\"groups\": {\"组名\": [步骤键…]}}）。"
+                         "★含真实模块名，放黄区本地/private，别提交。"
+                         "不给＝所有关断步骤按文件顺序排成一组")
+    ap.add_argument("--cur-col", default=None, help="电流值列（默认自动找）")
+    ap.add_argument("--key-col", default=None, help="步骤名那一列（默认自动找）")
+    ap.add_argument("--no-current", action="store_true", help="不做电流页")
     ap.add_argument("--no-vco", action="store_true",
                     help="不做 VCO 两页（只出 PLL 温扫那两页）")
     ap.add_argument("--ref-temp", type=float, default=25.0,
@@ -1663,9 +1833,6 @@ def main():
         for f in loose:
             print(f"      {f}")
     n_cur = sum(len(v) for v in grid.get(KIND_CUR, {}).values())
-    if n_cur:
-        print(f"  ⚠ 发现 {n_cur} 份电流文件——**本版不处理**（电流表格式未定，"
-              f"定了再单独加页）")
 
     # ---- 读 PLL 温扫 ----
     tables, failed, notes, warn_seen, vcharts = [], [], {}, {}, []
@@ -1781,6 +1948,97 @@ def main():
         print("\n--dry-run：没有写文件。")
         return
 
+    # ---- 读电流（逐级关断）----
+    ctables, ctemps = [], []
+    if not args.no_current and grid.get(KIND_CUR):
+        wanted = []
+        if args.groups:
+            with open(args.groups, encoding="utf-8") as f:
+                gj = json.load(f)
+            wanted = [(g, list(ks)) for g, ks in (gj.get("groups") or gj).items()]
+            print()
+            print(f"分组清单: {args.groups} —— "
+                  + "，".join(f"{g} {len(ks)} 行" for g, ks in wanted))
+        cdata = {}
+        print()
+        print("=== 逐级关断电流 ===")
+        for mod, books in sorted(grid.get(KIND_CUR, {}).items()):
+            for chip in chips:
+                b = books.get(chip)
+                if b is None:
+                    continue
+                try:
+                    cur = load_current(b.path, temp_col=args.temp_col,
+                                       key_col=args.key_col, val_col=args.cur_col)
+                except Exception as e:                # noqa: B902
+                    failed.append((b, f"{type(e).__name__}: {e}"))
+                    print(f"  {chip}: 读失败 —— {e}")
+                    continue
+                notes[id(b)] = f"{cur.n_rows}行×{cur.n_cols}列"
+                # ★ 一个测量点都没有就别建页：模板复制品（表头齐、值全空）也能
+                #   一路读到底，出来是一张整页空表——比没有这页更糟
+                if not cur.temps:
+                    print(f"  {chip}: 认出了电流列但**一个测量点都没有**，"
+                          f"这份不进表   [{b.name}]")
+                    for n, why, _k in cur.excluded[:3]:
+                        print(f"     行{n}: {why}")
+                    continue
+                # ★ 再确认这份**像不像逐级关断**：一趟至少得有几步、而且总电流
+                #   要往下走。表头对得上不代表内容对得上——模板复制品、或者别的
+                #   测试用了同一套模板，都会一路读到底，出一张似是而非的表。
+                mx = max(len(cur.runs[t]["steps"]) for t in cur.temps)
+                down = sum(1 for t in cur.temps for _k, _m, _i, d in
+                           cur.runs[t]["steps"] if d > 0)
+                tot = sum(len(cur.runs[t]["steps"]) for t in cur.temps)
+                if mx < 3:
+                    print(f"  {chip}: 每趟只有 {mx} 个测量点，不像逐级关断"
+                          f"（多半是别的测试用了同一套模板），这份不进表"
+                          f"   [{b.name}]")
+                    continue
+                if tot and down < tot * 0.5:
+                    print(f"  {chip}: ⚠ {tot} 步里有 {tot - down} 步的电流不降反升——"
+                          f"这不像逐级关断，出来的数先别信")
+                cdata[chip] = cur
+                for t in cur.temps:
+                    if t not in ctemps:
+                        ctemps.append(t)
+                    run = cur.runs[t]
+                    rc = run.get("recheck")
+                    print(f"  {chip} {fmt_num(t)}℃: 基线 {fmt_num(run['baseline'], 4)} mA"
+                          f" / 关断 {len(run['steps'])} 步"
+                          + (f" / 恢复后复测 {fmt_num(rc[3], 4)} mA"
+                             f"（与基线差 {fmt_num(rc[3] - run['baseline'], 4)}）"
+                             if rc else " / **没有恢复后复测点**"))
+                if cur.excluded:
+                    print(f"     排除 {len(cur.excluded)} 行:")
+                    print_excluded([(n, why) for n, why, _k in cur.excluded])
+                    excl_all.append((chip, mod, KIND_LABEL[KIND_CUR],
+                                     [(n, why) for n, why, _k in cur.excluded]))
+                for w in cur.warnings:
+                    print(f"     ⚠ {w}")
+        ctemps.sort()
+        if cdata:
+            # 电流簿一份就同时装着两个 PLL 的步骤，所以这里的"组"来自清单、
+            # 不是来自文件名的模块
+            miss = {}
+            for gname, keys in (wanted or [("全部关断步骤", None)]):
+                rowsg = {}
+                for chip, cur in cdata.items():
+                    rows_ = current_rows(cur, [(gname, keys)] if keys else [])
+                    rowsg[chip] = rows_
+                    if keys:
+                        have = {r["item"] for r in rows_ if r["kind"] == "result"
+                                and any(isinstance(v, (int, float))
+                                        for v in r["vals"].values())}
+                        for k in keys:
+                            if k not in have:
+                                miss.setdefault(chip, []).append(k)
+                ctables.append((gname, rowsg))
+            for chip, ks in miss.items():
+                print(f"  ⚠ {chip}: 清单里这些步骤在文件里没找到（或没有电流值）: "
+                      + ", ".join(ks[:10])
+                      + (f" …共 {len(ks)} 个" if len(ks) > 10 else ""))
+
     # ★★ 每一页只列**这一页真有数据**的芯片，不拿全局芯片表去铺列。
     #   性能和电流常常不是同一个人测的、测的也不是同一颗 die（一个目录只有温扫、
     #   另一个只有电流）。用全局表铺列的话，只测了电流的那颗会在 PLL / VCO 四张页上
@@ -1794,6 +2052,7 @@ def main():
 
     chips_pll = _with_data(tables)
     chips_vco = _with_data(vtables)
+    chips_cur = _with_data(ctables)
 
     # ---- 写出 ----
     wb = openpyxl.Workbook()
@@ -1806,6 +2065,11 @@ def main():
         write_vco_summary(wb, vtables, chips_vco, st, vtemps, slim=args.slim)
         write_vco_charts(wb, vcharts, chips_vco, st, vtemps,
                          no_charts=args.no_charts)
+    # 电流页放最后：前四页是成对的（汇总+过程），别插进它们中间
+    if ctables:
+        write_grouped_page(wb, "Current_Summary", "{mod}（逐级关断电流）",
+                           ctables, chips_cur, st, ctemps, slim=args.slim,
+                           item_w=24, note_w=52)
     if not args.no_audit:
         write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all)
     wb.calculation.fullCalcOnLoad = True
@@ -1818,7 +2082,8 @@ def main():
     print(f"\n已写出: {os.path.abspath(out)}")
     print("  可见页: " + " / ".join(s.title for s in wb.worksheets
                                     if s.sheet_state == "visible"))
-    for nm, cs in (("PLL_Summary / 温巡", chips_pll), ("VCO 两页", chips_vco)):
+    for nm, cs in (("PLL_Summary / 温巡", chips_pll), ("VCO 两页", chips_vco),
+                   ("Current_Summary", chips_cur)):
         if cs and set(cs) != set(chips):
             gone = [c for c in chips if c not in cs]
             print(f"  {nm} 只列了 {', '.join(cs)}；{', '.join(gone)} 没有这类数据，"
