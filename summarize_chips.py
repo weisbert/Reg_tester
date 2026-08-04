@@ -344,6 +344,31 @@ def scale_title(info):
     return f"（折算 ×{n}：频率 ×{n}，相噪/杂散 {info['db']:+.1f} dB）"
 
 
+def spur_note(data_or_sw, label):
+    """杂散那两行的备注：这个数到底是在哪个偏移上取的。
+
+    ★ 值不再来自模板那个固定频点了（那一格量到的是噪底），所以"取自哪儿"
+      成了这一行**怎么算出来的**的一部分——评审第一句就是"你这 26M 是在哪测的"。
+      各片实测偏移不一样就都列出来，别只报第一片的。
+    """
+    sws = data_or_sw.values() if isinstance(data_or_sw, dict) else [data_or_sw]
+    offs, tgt, tol = [], None, None
+    for sw in sws:
+        if sw is None:
+            continue
+        it = next((x for x in sw.items if x.label == label), None)
+        if it is None or not it.pick_stats:
+            continue
+        tgt, tol = it.pick_stats.get("target"), it.pick_stats.get("tol")
+        o = it.pick_stats.get("off")
+        if o is not None and fmt_num(o) not in offs:
+            offs.append(fmt_num(o))
+    if not offs or tgt is None:
+        return ""
+    return (f"实测偏移 {' / '.join(str(x) for x in offs)} MHz"
+            f"（标称 {fmt_num(tgt)}，取 ±{fmt_num(tol)} MHz 内最大的一条）")
+
+
 def temp_view(sw, item):
     """{温度: [该温度经过的每一次的值]}。整趟温巡四段各走一遍，同温会有 2~4 个值。"""
     d = {}
@@ -664,7 +689,9 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
     # ★ 备注只在真的缺东西时才写。以前这里写「Min 出自 XX / 同温重复性 0.8@65℃」
     #   那类工程内部信息——那是 debug 用的，不该出现在给人 review 的表上。
     gone = [c for c in chips if c not in {x[0] for x in marks}]
-    note = f"未测: {', '.join(gone)}" if gone else ""
+    note = spur_note(data, label) if label.startswith("Spur@") else ""
+    if gone:
+        note = (note + "；" if note else "") + f"未测: {', '.join(gone)}"
     put(ws, r, note_col(n_chips), as_text(note), st, st["f_res"],
         align="left", size=9, color=COLOR_MUTED)
     return r + 1
@@ -1046,6 +1073,8 @@ def vco_rows(sw, ref_temp, op_vtune):
             continue
         vals = dict(d["vals"])
         note = VCO_NOTE_SET.get(d["item"], d.get("note") or "")
+        if d["item"].startswith("Spur@"):
+            note = spur_note(sw, d["item"]) or note
         add = VCO_NOTE_ADD.get(d["item"]) if d["item"] not in VCO_NOTE_SET else None
         if add:
             note = f"{note}；{add}" if note else add
@@ -1865,6 +1894,10 @@ def main():
                          "把那一组写成 {\"keys\": [步骤键…], \"note\": \"…\"}。"
                          "★含真实模块名，放黄区本地/private，别提交。"
                          "不给＝所有关断步骤按文件顺序排成一组")
+    ap.add_argument("--spur-tol", type=float, default=2.0,
+                    help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
+                         "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
+                         "认不出清单就退回读模板那一格，并在控制台说原因")
     ap.add_argument("--scale", default="",
                     help="把结果折算到倍频点上：`模块:类型=倍数`，逗号分隔，"
                          "类型＝pll/vco，模块与类型都可以写 *。"
@@ -1952,7 +1985,8 @@ def main():
             try:
                 sw = load_sweep(b.path, leg_col=args.leg_col,
                                 lock_pattern=args.lock_pattern,
-                                temp_col=args.temp_col, keep_original=False)
+                                temp_col=args.temp_col, keep_original=False,
+                                spur_tol=args.spur_tol)
             except Exception as e:                    # noqa: B902
                 failed.append((b, f"{type(e).__name__}: {e}"))
                 print(f"  {chip}: 读失败 —— {e}")
@@ -1965,6 +1999,8 @@ def main():
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
                   f"{n_meas} 测点 / 指标 {len(sw.items)} 个 / 排除 {len(sw.excluded)} 行"
                   f"   [{b.name}]")
+            for sn in getattr(sw, "spur_notes", ()):
+                print(f"     · {sn}")
             print_excluded(sw.excluded)
             excl_all.append((chip, mod, KIND_LABEL[KIND_PLL], sw.excluded))
             flos = {txt(x.raw[sw.cols.idx('fLO_MHz')])
@@ -2001,7 +2037,8 @@ def main():
                 print(f"  {chip}: 没有这个模块的开环文件")
                 continue
             try:
-                sw = load_vco(b.path, temp_col=args.temp_col, keep_original=False)
+                sw = load_vco(b.path, temp_col=args.temp_col, keep_original=False,
+                              spur_tol=args.spur_tol)
             except Exception as e:                    # noqa: B902
                 failed.append((b, f"{type(e).__name__}: {e}"))
                 print(f"  {chip}: 读失败 —— {e}")
@@ -2033,6 +2070,8 @@ def main():
                       f"没切），它的 Kvco 会算出接近 0 的值——那不是低温增益低。"
                       f"对照 Kvco 组里 F(Vtune=…) 那两行就能确认")
             print(f"     排除 {len(sw.excluded)} 行:")
+            for sn in getattr(sw, "spur_notes", ()):
+                print(f"     · {sn}")
             print_excluded(sw.excluded)
             excl_all.append((chip, mod, KIND_LABEL[KIND_VCO], sw.excluded))
             for w in sw.warnings:

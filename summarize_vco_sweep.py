@@ -72,6 +72,7 @@ import re
 import sys
 from collections import OrderedDict
 
+from sweep_lib import attach_spur_list
 from xlsx_formula_cache import Formula, FormulaCache
 
 try:
@@ -265,6 +266,7 @@ class Columns:
     """
 
     def __init__(self, header):
+        self.header = list(header)
         self.pos = OrderedDict()
         for i, h in enumerate(header):
             k = txt(h)
@@ -295,10 +297,16 @@ class Columns:
 # ---------------------------------------------------------------- 指标识别
 
 class Item:
-    __slots__ = ("cat", "label", "unit", "col", "src")
+    __slots__ = ("cat", "label", "unit", "col", "src", "text_src",
+                 "pick", "pick_note", "pick_stats")
 
     def __init__(self, cat, label, unit, col, src):
         self.cat, self.label, self.unit, self.col, self.src = cat, label, unit, col, src
+        # 跟 sweep_lib.Item 对齐——杂散清单那套 attach_spur_list 两边共用
+        self.text_src = False
+        self.pick = None
+        self.pick_note = ""
+        self.pick_stats = None
 
 
 SIMPLE_ITEMS = [
@@ -362,12 +370,17 @@ def build_items(cols, rows, skip_cols=()):
 # ---------------------------------------------------------------- 行 / 分组
 
 class Row:
-    __slots__ = ("xl", "temp", "mode", "vt", "ct", "group", "vals", "raw")
+    __slots__ = ("xl", "temp", "mode", "vt", "ct", "group", "vals", "raw", "src")
 
     def __init__(self, xl, temp, mode, vt, ct, raw):
         self.xl, self.temp, self.mode, self.raw = xl, temp, mode, raw
         self.vt, self.ct = vt, ct
         self.group, self.vals = None, {}
+        self.src = {}          # {指标键: 这一行实际读的那一列}，只有 pick 类指标有
+
+    def col_of(self, item):
+        """引用要指到这一行**实际读的那一格**：杂散是从表尾清单里逐行挑的。"""
+        return self.src.get(item.col, item.col)
 
 
 KIND_LABEL = {"vtune": "Vtune扫", "ct": "CT扫", "point": "单点"}
@@ -1311,7 +1324,8 @@ def write_detail(wb, name, groups, items, st, src_title, target=None,
                 else:
                     # ★ 不写死：指回原始表那一格。评审时点开就能追到源头。
                     put(ws, r, 2 + i,
-                        emit(vref(cref(src_title, it.col, sv[1].xl)), fmt_num(sv[0])),
+                        emit(vref(cref(src_title, sv[1].col_of(it), sv[1].xl)),
+                             fmt_num(sv[0])),
                         st, st["f_res"])
             if want_target:
                 put(ws, r, 2 + len(groups), emit(target_ref, target), st, st["f_res"])
@@ -1760,7 +1774,7 @@ def write_pn_chart(wb, grid, groups, pn_items, st, src_title, op_x=None):
         for j, (_g, _xm, row) in enumerate(picks):
             v = row.vals.get(it.col)
             put(ws, 3 + i, 2 + j,
-                emit(vref(cref(src_title, it.col, row.xl)), fmt_num(v))
+                emit(vref(cref(src_title, row.col_of(it), row.xl)), fmt_num(v))
                 if v is not None else None, st, st["f_res"])
     ws.column_dimensions["A"].width = 12
 
@@ -1872,7 +1886,7 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
              lock_pattern=r"lock$|close.?loop", sweep_mode_opt=None,
              temp_col=None, vtune_col=None, ct_col_opt=None,
              keep_test_item=None, ref_temp=25.0, fvco_opt=None, x_round=6,
-             show_addr=False, keep_original=True):
+             show_addr=False, keep_original=True, spur_tol=2.0):
     """把一份开环压控扫描簿读成 VcoSweep（行已过滤、组已切好、指标已识别）。
 
     从 main() 原样抽出来的——跨芯片汇总要用同一套识别与分组口径，
@@ -1996,9 +2010,23 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
                                  skip_cols=skip)
     if not items:
         raise VcoError("没识别出任何有数据的结果列")
+    # ★ 杂散：模板固定频点那一格量到的常常是噪底，真值在表尾的杂散清单里。
+    #   认不出清单就退回原来的行为（attach_spur_list 什么都不做，只回一句原因）。
+    spur_why = attach_spur_list(cols, [r.raw for r in rows + locked + others],
+                                items, tol=spur_tol)
+    spur_notes = ["没认出表尾的杂散清单（%s），Spur 仍按模板固定频点那一格取"
+                  % spur_why] if spur_why else \
+        ["%s 改从%s取" % (it.label, it.pick_note) for it in items if it.pick_note]
     for r in rows + locked + others:
         for it in items:
-            r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+            if it.pick is not None:
+                pc = it.pick(r.raw)
+                if pc is not None:
+                    r.src[it.col] = pc
+                ok = pc is not None and pc < len(r.raw)
+                r.vals[it.col] = num(r.raw[pc]) if ok else None
+            else:
+                r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
 
     # ★ 被过滤掉的行到底有没有带测量结果，必须说出来（同 sweep_lib.load_sweep）。
     #   "排除了 N 行"这句话本身不足以判断有没有丢数据。
@@ -2108,6 +2136,10 @@ def main():
     ap.add_argument("--op-vtune", type=float, default=None,
                     help="工作点调谐电压 V（默认取 CT 扫用的那个值）。相噪/功率这些"
                          "按这个点报，不跨整个扫描取极值——不同 Vtune 是不同振荡频率")
+    ap.add_argument("--spur-tol", type=float, default=2.0,
+                    help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
+                         "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
+                         "认不出清单就退回读模板那一格，并说明原因")
     ap.add_argument("--x-round", type=int, default=6,
                     help="横轴取值四舍五入到几位小数（默认 6）。扫描点常是累加出来的，"
                          "表里会是 0.39999999999999997 这种，不量化就跟别的段对不上点")
@@ -2152,7 +2184,7 @@ def main():
                       vtune_col=args.vtune_col, ct_col_opt=args.ct_col,
                       keep_test_item=args.keep_test_item, ref_temp=args.ref_temp,
                       fvco_opt=args.fvco, x_round=args.x_round,
-                      show_addr=args.show_addr)
+                      show_addr=args.show_addr, spur_tol=args.spur_tol)
     except VcoError as e:
         sys.exit(str(e))
     by_kind, ct_addr, ct_name, ct_why = sw.by_kind, sw.ct_addr, sw.ct_name, sw.ct_why
@@ -2163,6 +2195,8 @@ def main():
     sweep_mode, tcol, tname = sw.sweep_mode, sw.tcol, sw.tname
     vt_col, vt_name, vt_why = sw.vt_col, sw.vt_name, sw.vt_why
     warnings, wb, ws = sw.warnings, sw.wb, sw.ws
+    for _sn in sw.spur_notes:
+        print("杂散   : %s" % _sn)
 
     # ---- 打印识别结果 ----
     # ws.max_row/max_column 是「声明尺寸」——模板预设过格式的空区域也算进去，

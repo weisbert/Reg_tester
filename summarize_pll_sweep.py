@@ -459,6 +459,8 @@ def write_detail(wb, legs, items, st, src_title, room_t):
         r += 1
         first = r
         # 温度 -> 该段里取到这个值的那一行在原始页的行号
+        # ★ 存 (行号, 那一行实际读的列)：杂散是从表尾清单里逐行挑的，
+        #   挑中的列每行不一样，引用必须指到挑中的那一格，不能指 it.col。
         srcs = []
         for lg in legs:
             m = OrderedDict()
@@ -466,7 +468,7 @@ def write_detail(wb, legs, items, st, src_title, room_t):
                 if row.kind == "lock":
                     continue
                 if row.temp is not None and row.vals.get(it.col) is not None:
-                    m[row.temp] = row.xl
+                    m[row.temp] = (row.xl, row.col_of(it))
             srcs.append(m)
         rows_by_temp = {}
         series = [leg_series(lg, it) for lg in legs]
@@ -475,9 +477,9 @@ def write_detail(wb, legs, items, st, src_title, room_t):
             rows_by_temp[t] = r
             row_vals = []
             for i, _lg in enumerate(legs):
-                xl = srcs[i].get(t)
+                xl, sc = srcs[i].get(t) or (None, it.col)
                 put(ws, r, 2 + i,
-                    sref(src_title, it.col, xl, it.text_src) if xl else None,
+                    sref(src_title, sc, xl, it.text_src) if xl else None,
                     st, st["f_res"])
                 if xl:
                     cache(ws, r, 2 + i, series[i].get(t))
@@ -855,6 +857,10 @@ def main():
     ap.add_argument("--lock-pattern", default=r"_lock$",
                     help="该列匹配这个正则的行 = 一次重锁（默认 _lock$）")
     ap.add_argument("--temp-col", default=None, help="温度列（默认自动找含 Temperature 的列）")
+    ap.add_argument("--spur-tol", type=float, default=2.0,
+                    help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
+                         "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
+                         "认不出清单就退回读模板那一格，并说明原因")
     ap.add_argument("--keep-test-item", default=None,
                     help="只保留 Test Item 等于该值的行（默认取出现最多的那个值）")
     ap.add_argument("--keep-mode", default=None,
@@ -886,13 +892,16 @@ def main():
         sw = load_sweep(args.path, sheet=args.sheet, header_row=args.header_row,
                         leg_col=args.leg_col, lock_pattern=args.lock_pattern,
                         temp_col=args.temp_col, keep_test_item=args.keep_test_item,
-                        keep_mode=args.keep_mode, keep_original=True)
+                        keep_mode=args.keep_mode, keep_original=True,
+                        spur_tol=args.spur_tol)
     except SweepError as e:
         sys.exit(str(e))
 
     wb, ws, cols = sw.wb, sw.ws, sw.cols
     rows, items, legs, dropped = sw.rows, sw.items, sw.legs, sw.dropped
     excluded, warnings, room_t = sw.excluded, sw.warnings, sw.room_t
+    for _sn in sw.spur_notes:
+        print("杂散   : %s" % _sn)
     tname, keep_ti, keep_mode, ti_col = sw.temp_name, sw.keep_ti, sw.keep_mode, sw.ti_col
     meta = {
         "excluded": excluded,

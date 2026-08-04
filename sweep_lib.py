@@ -114,6 +114,7 @@ class Columns:
     """
 
     def __init__(self, header):
+        self.header = list(header)
         self.pos = OrderedDict()
         for i, h in enumerate(header):
             k = txt(h)
@@ -142,11 +143,17 @@ class Columns:
 
 
 class Item:
-    __slots__ = ("cat", "label", "unit", "col", "src", "text_src")
+    __slots__ = ("cat", "label", "unit", "col", "src", "text_src",
+                 "pick", "pick_note", "pick_stats")
 
     def __init__(self, cat, label, unit, col, src):
         self.cat, self.label, self.unit, self.col, self.src = cat, label, unit, col, src
         self.text_src = False       # 原始列是文本型数字？是的话引用要加双负号
+        # pick(raw) -> 这一行该读哪一列。给"值不在固定列上"的指标用（杂散清单）。
+        # 挑出来的仍然是**原表上的一个真格子**，所以引用照样指得回去。
+        self.pick = None
+        self.pick_note = ""
+        self.pick_stats = None
 
     @property
     def key(self):
@@ -169,6 +176,118 @@ PAIRED_ITEMS = [
     ("SpotPN", "Phase Noise", "dBc/Hz", "SpotPN@{f}"),
     ("OtherSpur", "Spur", "dBc", "Spur@{f}"),
 ]
+
+
+def find_spur_list(header, rows, min_pairs=2):
+    """表尾那段**没有表头**的成对数据 ＝ 仪器搜出来的杂散清单 (偏移MHz, 电平dBc)。
+
+    ★ 为什么要它：模板里的 `OtherSpurFreq<i>/Result<i>` 是**在标称频点上量一个数**。
+      真实杂散只要偏出去几百 kHz，那一格量到的就是**噪底**，
+      不是杂散——比真值低十几个 dB，报出去等于说"这颗片子杂散很干净"。
+      真值在这段清单里。
+
+    ★ 判据全是结构性的，不认列字母也不认表头名（不同批次导出列位会挪）：
+      ① 落在最后一个有表头的列**右边** ② 自己没有表头 ③ 成对出现、
+      两列的非空行数相等 ④ 偶数列非负（偏移频率）、奇数列为负（dBc）。
+      四条都过才认。认错了是**安静地把两列错位读成杂散**，比读不到糟得多。
+
+    返回 (pairs, why)：pairs=[(偏移列, 电平列), …]，认不出来时 pairs 为空、
+    why 说明卡在哪一条。
+    """
+    width = max((len(r) for r in rows), default=0)
+    last_head = max((i for i, h in enumerate(header) if not is_blank(h)), default=-1)
+    if last_head + 1 >= width:
+        return [], "表尾没有多余的列"
+
+    def has_data(c):
+        return any(c < len(r) and not is_blank(r[c]) for r in rows)
+
+    start = next((c for c in range(last_head + 1, width) if has_data(c)), None)
+    if start is None:
+        return [], "表头右边那些列全是空的"
+    end = start
+    for c in range(start + 1, width):
+        if has_data(c):
+            end = c
+        else:
+            break                       # 中间断开就到此为止
+    n_pairs = (end - start + 1) // 2
+    if n_pairs < min_pairs:
+        return [], f"只有 {end - start + 1} 列有数据，凑不满 {min_pairs} 对"
+
+    pairs, ok, bad = [], 0, 0
+    for k in range(n_pairs):
+        fc, lc = start + 2 * k, start + 2 * k + 1
+        nf = sum(1 for r in rows if fc < len(r) and not is_blank(r[fc]))
+        nl = sum(1 for r in rows if lc < len(r) and not is_blank(r[lc]))
+        if nf != nl:
+            return [], (f"第 {k + 1} 对两列的非空行数对不上（{nf} vs {nl}），"
+                        f"不像 (偏移, 电平) 成对")
+        for r in rows:
+            f = num(r[fc]) if fc < len(r) else None
+            v = num(r[lc]) if lc < len(r) else None
+            if f is None or v is None:
+                continue
+            ok, bad = (ok + 1, bad) if (f >= 0 and v < 0) else (ok, bad + 1)
+        pairs.append((fc, lc))
+    if not ok or bad > ok * 0.02:
+        return [], (f"偶数列非负/奇数列为负 这条不成立（{bad}/{ok + bad} 反例），"
+                    f"这段多半不是杂散清单")
+    return pairs, ""
+
+
+def spur_picker(pairs, target, tol):
+    """在标称频点 ±tol 的窗口里，挑**幅度最大**（dBc 最靠近 0）的那一条。
+
+    取最大不取最近：这一格是拿去跟 spec 比的，窗口里有两条时该报最坏的那条。
+    挑出来的是原表上的真格子，所以返回列号——引用还能指回去。
+    """
+    def pick(raw):
+        best = None
+        for fc, lc in pairs:
+            f = num(raw[fc]) if fc < len(raw) else None
+            v = num(raw[lc]) if lc < len(raw) else None
+            if f is None or v is None or abs(f - target) > tol:
+                continue
+            if best is None or v > best[1]:
+                best = (lc, v)
+        return best[0] if best else None
+    return pick
+
+
+def attach_spur_list(cols, rows, items, tol=2.0):
+    """把 Spur@<标称> 那几行的取值改成"从尾部杂散清单里挑"。
+
+    标称频点仍然从模板的 `OtherSpurFreq<i>` 来（那是这份测试要看哪几个频点的声明），
+    只是**值**不再读它旁边那一格。找不到清单就什么都不做，退回原来的行为。
+    """
+    pairs, why = find_spur_list(cols.header, rows)
+    if not pairs:
+        return why
+    from openpyxl.utils import get_column_letter as gl
+    where = f"{gl(pairs[0][0] + 1)}..{gl(pairs[-1][1] + 1)}（{len(pairs)} 对）"
+    for it in items:
+        if not it.label.startswith("Spur@"):
+            continue
+        fc = cols.idx(it.src.replace("Result", "Freq"))
+        if fc is None:
+            continue
+        tgts = {num(r[fc]) for r in rows if fc < len(r) and num(r[fc]) is not None}
+        if len(tgts) != 1:
+            continue                    # 标称频点在这份簿里不唯一，不动它
+        t = tgts.pop()
+        it.pick = spur_picker(pairs, t, tol)
+        it.pick_note = f"杂散清单 {where} 里 {fmt_num(t)}±{fmt_num(tol)} MHz 内最大的一条"
+        # 实测偏移落在哪儿 —— 报表备注要写它（"你这 26M 是在哪测的"）。
+        # 在这里算是因为两个读取层都调这个函数，算一次两边都有。
+        offs = [num(r[c - 1]) for r in rows for c in (it.pick(r),)
+                if c is not None and c - 1 < len(r)]
+        it.pick_stats = {"target": t, "tol": tol, "off": median(offs), "n": len(offs)}
+        # 文本型数字要重判：现在读的是清单那几列，不是原来那一格
+        it.text_src = any(
+            isinstance(r[c], str) and num(r[c]) is not None
+            for r in rows for c in (it.pick(r),) if c is not None and c < len(r))
+    return ""
 
 
 def build_items(cols, rows):
@@ -219,11 +338,20 @@ def build_items(cols, rows):
 # ---------------------------------------------------------------- ③ 行与段
 
 class Row:
-    __slots__ = ("xl", "temp", "leg", "kind", "vals", "raw")
+    __slots__ = ("xl", "temp", "leg", "kind", "vals", "raw", "src")
 
     def __init__(self, xl, temp, kind, raw):
         self.xl, self.temp, self.kind, self.raw = xl, temp, kind, raw
         self.leg, self.vals = None, {}
+        self.src = {}          # {指标键: 这一行实际读的那一列}，只有 pick 类指标有
+
+    def col_of(self, item):
+        """这一行里，这个指标的值出自哪一列——引用要指到这里，不是 item.col。
+
+        对固定列的指标就是 item.col；对杂散清单这种"每行挑一格"的指标，
+        挑中的列逐行不同（不同行的最大杂散落在清单里不同的位置）。
+        """
+        return self.src.get(item.col, item.col)
 
 
 class Leg:
@@ -355,7 +483,8 @@ class Sweep:
 
 def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                lock_pattern=r"_lock$", temp_col=None,
-               keep_test_item=None, keep_mode=None, keep_original=True):
+               keep_test_item=None, keep_mode=None, keep_original=True,
+               spur_tol=2.0):
     """把一份扫描簿读成 Sweep（行已过滤、段已切好、指标已识别）。
 
     keep_original=True 时额外用 data_only=False 再读一遍工作簿并挂在 .wb 上，
@@ -428,9 +557,40 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     items, dropped = build_items(cols, [r.raw for r in rows])
     if not items:
         raise SweepError("没识别出任何有数据的结果列")
+    # ★ 杂散：模板固定频点那一格量到的常常是噪底，真值在表尾的杂散清单里。
+    #   认不出清单就退回原来的行为，并把卡在哪一条说出来。
+    spur_why = attach_spur_list(cols, [r.raw for r in rows], items, tol=spur_tol)
     for r in rows:
         for it in items:
-            r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+            if it.pick is not None:
+                c = it.pick(r.raw)
+                if c is not None:
+                    r.src[it.col] = c
+                r.vals[it.col] = num(r.raw[c]) if (c is not None and c < len(r.raw)) \
+                    else None
+            else:
+                r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+    # 换了取值口径就得报出来差多少：这一改动的全部意义就在那个差值上，
+    # 不打出来没人知道它真的生效了、也没法判断窗口开得合不合适。
+    spur_notes = []
+    for it in items:
+        if it.pick is None:
+            continue
+        new = [r.vals[it.col] for r in rows if r.vals.get(it.col) is not None]
+        old = [num(r.raw[it.col]) for r in rows
+               if it.col < len(r.raw) and num(r.raw[it.col]) is not None]
+        it.pick_stats.update(new=median(new), old=median(old) if old else None)
+        offs = it.pick_stats.get("off")
+        d = (median(new) - median(old)) if (new and old) else None
+        spur_notes.append(
+            f"{it.label}: 取清单里 {fmt_num(offs)} MHz 那条，中位 "
+            f"{fmt_num(median(new), 2)} dBc（{it.src} 那一格中位 "
+            f"{fmt_num(median(old), 2) if old else '空'}"
+            + (f"，差 {d:+.2f} dB）" if d is not None else "）")
+            + f"；{len(new)}/{len(rows)} 行命中")
+    if spur_why:
+        spur_notes.append(f"没认出表尾的杂散清单（{spur_why}），"
+                          f"Spur 仍按模板固定频点那一格取")
 
     # ★ 被过滤掉的行到底有没有带测量结果，必须说出来。
     #   "排除了 6 行"这句话本身不足以判断有没有丢数据——原厂模板常在数据后面
@@ -471,7 +631,8 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                  lock_pattern=lock_pattern, lock_re=lock_re,
                  ti_name=ti_name, ti_col=ti_col, keep_ti=keep_ti, keep_mode=keep_mode,
                  rows=rows, items=items, dropped=dropped, legs=legs, orphan=orphan,
-                 excluded=excluded, warnings=warnings, room_t=room_temp(legs),
+                 excluded=excluded, warnings=warnings, spur_notes=spur_notes,
+                 room_t=room_temp(legs),
                  n_rows=ws_val.max_row, n_cols=ws_val.max_column)
 
 
