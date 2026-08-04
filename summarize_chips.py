@@ -1795,13 +1795,16 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
     return out
 
 
-def current_rows(cur, groups, chip_note=""):
-    """一份电流簿 → 页上的行（跟 VCO 页同形：cat/item/unit/dir/kind/vals/note）。
+def current_rows(cur, parts, total_name="", chip_note=""):
+    """一份电流簿 → 一张表的行（跟 VCO 页同形：cat/item/unit/dir/kind/vals/note）。
 
-    groups = [(组名, [键1, 键2, ...], 组备注)]；给空就把所有关断步骤按文件顺序排成一组。
-    每组末尾自动补一行**合计**＝本组各行相加（一组只有一行时不补，省得同一个数
-    写两遍）。合计是这页真正要看的东西——单个模块的 ΔI 逼近重复性下限，
-    几个模块加起来才稳。
+    parts = [(部件名, [步骤键…], 部件备注), …]。一个部件一条分组带，带里逐步一行、
+    末尾一行 `<部件名> 合计`；部件多于一个时最后再来一条 `总计` 带，
+    放一行 total_name ＝ 各部件合计相加。
+
+    ★ 分组是**加在原来那张全量表之外**的，不是替换（用户 2026-08-04：
+      "我不是让你把原来的删了……原来的我也要，只是在原来的基础上添加"）。
+      全量表由调用方另起一张，逻辑就是"一个部件、键给 None"。
     """
     # 每个键在各温度下的 ΔI
     dmap, order, modes = {}, [], {}
@@ -1811,9 +1814,6 @@ def current_rows(cur, groups, chip_note=""):
             modes.setdefault(k, m)
             if k not in order:
                 order.append(k)
-    if not groups:
-        groups = [("全部关断步骤", order, "")]
-    groups = [(g[0], g[1], g[2] if len(g) > 2 else "") for g in groups]
 
     # 这趟测试自己的重复性 = |恢复后复测 − 全开基线|，取各温度里最大的那个
     rep = 0.0
@@ -1838,11 +1838,13 @@ def current_rows(cur, groups, chip_note=""):
     out.append({"cat": "Condition", "item": "关断步数", "unit": "",
                 "dir": "", "kind": "cond",
                 "vals": {t: len(cur.runs[t]["steps"]) for t in cur.temps},
-                "note": "这一趟一共关了多少步；本表只列清单里的", "nd": 0})
+                "note": "这一趟一共关了多少步（不只本表列出来的这些）", "nd": 0})
 
-    for gname, keys, gnote in groups:
+    sums = []                       # [(部件名, {温度: 合计})]
+    for pname, keys, pnote in parts:
+        ks = order if keys is None else keys
         n_in = 0
-        for k in keys:
+        for k in ks:
             vals = dmap.get(k, {})
             note = "关它之前 − 关它之后的总电流"
             if modes.get(k):
@@ -1852,29 +1854,47 @@ def current_rows(cur, groups, chip_note=""):
             if rep and got and max(abs(v) for v in got) < rep:
                 note = (f"⚠ 比本趟重复性（复测−基线 {fmt_num(rep, 4)} mA）还小，"
                         f"只能当上限看；" + note)
-            out.append({"cat": gname, "item": k, "unit": "mA", "dir": "≤",
+            out.append({"cat": pname, "item": k, "unit": "mA", "dir": "≤",
                         "kind": "result", "vals": vals, "note": note, "nd": 4})
             if k in dmap:
                 n_in += 1
-        # ---- 组合计 ----
-        # ★ 一组只有一行就不补：合计跟那一行一模一样，同一个数写两遍，
-        #   正是「表里放值、一行只有一种统计量」那条规矩要挡的东西。
-        if n_in < 2:
+        if not n_in:
             continue
-        sums = {}
+        psum = {}
         for t in cur.temps:
-            got = [dmap[k][t] for k in keys
+            got = [dmap[k][t] for k in ks
                    if k in dmap and isinstance(dmap[k].get(t), (int, float))]
             if got:
-                sums[t] = sum(got)
-        if not sums:
+                psum[t] = sum(got)
+        if not psum:
             continue
+        # ★ 一个部件只有一行就不补合计：合计跟那一行一模一样，同一个数写两遍，
+        #   正是「一行只有一种统计量」那条规矩要挡的。总计那行的备注就直接
+        #   引它自己那一行的名字。
+        if n_in < 2:
+            sums.append((pname, psum, next(k for k in ks if k in dmap)))
+            continue
+        sums.append((pname, psum, f"{pname} 合计"))
         note = "本组各行相加"
-        if gnote:
-            note = f"{note}；{gnote}"
-        out.append({"cat": gname, "item": "合计", "unit": "mA", "dir": "≤",
-                    "kind": "result", "vals": sums, "note": note, "nd": 4,
+        if pnote:
+            note = f"{note}；{pnote}"
+        out.append({"cat": pname, "item": f"{pname} 合计", "unit": "mA", "dir": "≤",
+                    "kind": "result", "vals": psum, "note": note, "nd": 4,
                     "strong": True})
+
+    # ---- 总计 ----
+    # 备注里每一项都**正好是表上某一行的名字**，评审能用眼睛把它加出来。
+    if total_name and len(sums) >= 2:
+        tot = {}
+        for t in cur.temps:
+            got = [d[t] for _p, d, _l in sums if t in d]
+            if got:
+                tot[t] = sum(got)
+        if tot:
+            terms = " + ".join(l for _p, _d, l in sums)
+            out.append({"cat": "总计", "item": total_name, "unit": "mA", "dir": "≤",
+                        "kind": "result", "vals": tot, "note": terms, "nd": 4,
+                        "strong": True})
     return out
 
 
@@ -1914,13 +1934,34 @@ def scale_from_cfg(m):
     return out
 
 
+def _part_list(m):
+    out = []
+    for pn, ps in (m or {}).items():
+        if isinstance(ps, dict):
+            out.append((pn, list(ps.get("keys") or []), txt(ps.get("note") or "")))
+        else:
+            out.append((pn, list(ps), ""))
+    return out
+
+
 def groups_from_cfg(m):
+    """清单 -> [(报告名, [(部件名, 键表, 部件备注)…], 总计行的名字)]。
+
+    三种写法都认：
+      "组名":   [键…]                                 一张表一个组
+      "组名":   {"keys": [键…], "note": "…"}           同上，带一句组备注
+      "报告名": {"parts": {"部件名": [键…] | {…}}}      一张表分几块，末尾一行总计
+    第三种是「<某模块> 总功耗 ＝ A + B + C」那种报告（用户 2026-08-04 要的）。
+    """
     out = []
     for g, spec in (m or {}).items():
-        if isinstance(spec, dict):
-            out.append((g, list(spec.get("keys") or []), txt(spec.get("note") or "")))
+        if isinstance(spec, dict) and spec.get("parts"):
+            out.append((g, _part_list(spec["parts"]), g))
+        elif isinstance(spec, dict):
+            out.append((g, [(g, list(spec.get("keys") or []),
+                             txt(spec.get("note") or ""))], ""))
         else:
-            out.append((g, list(spec), ""))
+            out.append((g, [(g, list(spec), "")], ""))
     return out
 
 
@@ -2386,19 +2427,15 @@ def main():
         elif cfg.get("groups"):
             gj = {"groups": cfg["groups"]}
         if gj is not None:
-            # 一组可以直接给键的列表，也可以给 {"keys": [...], "note": "…"}——
-            # 后者用来带一句这组特有的话（比如"两个模块共用，相加别算两遍"）。
-            # 这类话**只能从数据侧进来**：工具里一个真实模块名都不许写死。
-            wanted = []
-            for g, spec in (gj.get("groups") or gj).items():
-                if isinstance(spec, dict):
-                    wanted.append((g, list(spec.get("keys") or []),
-                                   txt(spec.get("note") or "")))
-                else:
-                    wanted.append((g, list(spec), ""))
+            # 写法见 groups_from_cfg。带一句组备注、或者分成几块出一行总计，
+            # 都从清单进来——工具里一个真实模块名都不许写死。
+            wanted = groups_from_cfg(gj.get("groups") or gj)
             print()
             print(f"分组清单: {args.groups or cfg_path} —— "
-                  + "，".join(f"{g} {len(ks)} 行" for g, ks, _n in wanted))
+                  + "；".join(
+                      f"{g}[" + "+".join(f"{pn} {len(ks)}行"
+                                         for pn, ks, _x in parts) + "]"
+                      for g, parts, _t in wanted))
         cdata = {}
         print()
         print("=== 逐级关断电流 ===")
@@ -2461,17 +2498,23 @@ def main():
             # 电流簿一份就同时装着两个 PLL 的步骤，所以这里的"组"来自清单、
             # 不是来自文件名的模块
             miss = {}
-            for gname, keys, gnote in (wanted or [("全部关断步骤", None, "")]):
+            # ★ 报告表在前、**原来那张全量表照旧留在最后**。分组是加出来的，
+            #   不是替换（用户 2026-08-04："我不是让你把原来的删了……
+            #   原来的我也要，只是在原来的基础上添加"）。
+            #   全量表 ＝ 一个部件、键给 None ＝ 文件里全部关断步骤按原顺序。
+            plan = list(wanted) + [("全部关断步骤",
+                                    [("逐级关断", None, "")], "")]
+            for gname, parts, total in plan:
                 rowsg = {}
                 for chip, cur in cdata.items():
-                    rows_ = current_rows(cur, [(gname, keys, gnote)] if keys else [])
+                    rows_ = current_rows(cur, parts, total_name=total)
                     rowsg[chip] = rows_
-                    if keys:
-                        have = {r["item"] for r in rows_ if r["kind"] == "result"
-                                and any(isinstance(v, (int, float))
-                                        for v in r["vals"].values())}
-                        for k in keys:
-                            if k not in have:
+                    have = {r["item"] for r in rows_ if r["kind"] == "result"
+                            and any(isinstance(v, (int, float))
+                                    for v in r["vals"].values())}
+                    for _pn, ks, _x in parts:
+                        for k in (ks or ()):
+                            if k not in have and k not in miss.get(chip, ()):
                                 miss.setdefault(chip, []).append(k)
                 ctables.append((gname, rowsg))
             for chip, ks in miss.items():
