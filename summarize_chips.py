@@ -1781,16 +1781,31 @@ def main():
         print("\n--dry-run：没有写文件。")
         return
 
+    # ★★ 每一页只列**这一页真有数据**的芯片，不拿全局芯片表去铺列。
+    #   性能和电流常常不是同一个人测的、测的也不是同一颗 die（一个目录只有温扫、
+    #   另一个只有电流）。用全局表铺列的话，只测了电流的那颗会在 PLL / VCO 四张页上
+    #   各占一整列"未测"——一列全是"未测"不是信息，是噪声，还会让人以为那颗片子
+    #   测坏了。反过来电流页也一样。
+    #   ★ 这不是把差异藏起来：哪颗片子有哪类数据，隐藏的 _审计 页逐份列着，
+    #     控制台每次也打。正表上只摆有数的列。
+    def _with_data(tbls):
+        return [c for c in chips
+                if any(d.get(c) is not None for _m, d in tbls)]
+
+    chips_pll = _with_data(tables)
+    chips_vco = _with_data(vtables)
+
     # ---- 写出 ----
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     st = styles()
     if tables:
-        write_summary(wb, tables, chips, st, slim=args.slim)
-        write_journey(wb, tables, chips, st, no_charts=args.no_charts)
+        write_summary(wb, tables, chips_pll, st, slim=args.slim)
+        write_journey(wb, tables, chips_pll, st, no_charts=args.no_charts)
     if vtables:
-        write_vco_summary(wb, vtables, chips, st, vtemps, slim=args.slim)
-        write_vco_charts(wb, vcharts, chips, st, vtemps, no_charts=args.no_charts)
+        write_vco_summary(wb, vtables, chips_vco, st, vtemps, slim=args.slim)
+        write_vco_charts(wb, vcharts, chips_vco, st, vtemps,
+                         no_charts=args.no_charts)
     if not args.no_audit:
         write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all)
     wb.calculation.fullCalcOnLoad = True
@@ -1803,6 +1818,11 @@ def main():
     print(f"\n已写出: {os.path.abspath(out)}")
     print("  可见页: " + " / ".join(s.title for s in wb.worksheets
                                     if s.sheet_state == "visible"))
+    for nm, cs in (("PLL_Summary / 温巡", chips_pll), ("VCO 两页", chips_vco)):
+        if cs and set(cs) != set(chips):
+            gone = [c for c in chips if c not in cs]
+            print(f"  {nm} 只列了 {', '.join(cs)}；{', '.join(gone)} 没有这类数据，"
+                  f"不给它留空列（谁有哪类数据见隐藏的 _审计 页）。")
     print("  各汇总页的 Spec / 仿真 / Limit 列留空，填进 Spec Min/Max "
           "判定列自动出 PASS/FAIL 并上色。")
     if args.slim:
