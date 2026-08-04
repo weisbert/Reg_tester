@@ -41,6 +41,12 @@ HINT = OrderedDict([
 ])
 
 
+def fmt(v):
+    if v is None:
+        return "?"
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
 def _cl(i):
     from openpyxl.utils import get_column_letter
     return get_column_letter(i)
@@ -163,36 +169,103 @@ def profile(grid, hdr, r0, r1, c):
     }
 
 
-def guess_roles(cols, n_rows):
+FLAGS = {"yes", "no", "y", "n", "true", "false", "on", "off", "-", "--"}
+
+
+def _is_flag(p):
+    """YES/NO 这种开关列，不管有多少行都不是标签列。"""
+    return bool(p["all_text"]) and \
+        {t.lower() for t in p["all_text"]} <= FLAGS
+
+
+def guess_roles(cols, n_rows, force_label=None, force_value=None):
     """猜每列的角色。只给建议，最终以人看到的为准。"""
-    label, value, cond = None, [], []
+    value, cond, cand = [], [], []
     for p in cols:
         if not p["n_filled"]:
             continue
         numeric = p["n_num"] >= max(3, p["n_filled"] * 0.8)
         if numeric:
-            # 值列：数字为主、且不是序号那种 1..N
-            if p["kind_hint"] in ("电流", ""):
-                value.append(p)
-            else:
-                cond.append(p)
+            value.append(p) if p["kind_hint"] in ("电流", "") else cond.append(p)
         else:
-            # 标签列：文字为主、去重个数接近行数（一行一个模块）
-            if label is None and p["n_uniq"] >= max(3, n_rows * 0.5):
-                label = p
-            else:
-                cond.append(p)
+            cond.append(p)
+            # ★★ 标签列判据不能要求"不同值 ≈ 行数"：同一批标签会**在每个温度下
+            #   重复一遍**（真文件：56 个步骤 × 3 个温度 = 167 行），按行数一半去卡
+            #   就一个都认不出来（2026-08-04 真文件上就是这么漏的）。
+            #   改成：文字列里**不同值最多**的那一列，开关列（YES/NO）排除。
+            if p["n_uniq"] >= 4 and not _is_flag(p):
+                cand.append(p)
+    label = None
+    if force_label:
+        label = next((p for p in cols if force_label.upper() in
+                      (p["letter"], p["name"].upper())), None)
+    if label is None and cand:
+        label = max(cand, key=lambda p: (p["n_uniq"], -p["col"]))
+    if force_value:
+        v = next((p for p in cols if force_value.upper() in
+                  (p["letter"], p["name"].upper())), None)
+        if v is not None:
+            value = [v] + [x for x in value if x is not v]
     return label, value, cond
 
 
-def probe_sheet(title, grid, ncol, capped):
+def _pick(cols, want_hint, numeric=None, max_uniq=None):
+    best = None
+    for p in cols:
+        if p["kind_hint"] != want_hint or not p["n_filled"]:
+            continue
+        if numeric is True and p["n_num"] < p["n_filled"] * 0.8:
+            continue
+        if numeric is False and p["n_num"] > p["n_filled"] * 0.2:
+            continue
+        if max_uniq is not None and p["n_uniq"] > max_uniq:
+            continue
+        if best is None or p["n_uniq"] > best["n_uniq"]:
+            best = p
+    return best
+
+
+def build_ladder(grid, r0, r1, label, cur, temp, mode, cap):
+    """按文件顺序列出「标签 → 电流」的阶梯，并给出相邻做差。
+
+    ★ 这类逐级关断簿里，值列装的是**每关掉一个模块之后的总电流**，
+      不是那个模块自己的电流。模块电流＝相邻两个测量点相减。把两列并排打出来，
+      口径对不对一眼就能看出来（差出负数、差出 0，都是当场就该发现的事）。
+    """
+    if not (label and cur):
+        return [], None
+    t0 = None
+    if temp:
+        for r in range(r0, r1 + 1):
+            v = _num(at(grid, r, temp["col"]))
+            if v is not None:
+                t0 = v
+                break
+    out, prev = [], None
+    for r in range(r0, r1 + 1):
+        if temp and t0 is not None and _num(at(grid, r, temp["col"])) != t0:
+            continue
+        lab = _s(at(grid, r, label["col"]))
+        md = _s(at(grid, r, mode["col"])) if mode else ""
+        iv = _num(at(grid, r, cur["col"]))
+        d = None if (iv is None or prev is None) else round(prev - iv, 4)
+        out.append((r, lab, md, iv, d))
+        if iv is not None:
+            prev = iv
+        if len(out) >= cap:
+            break
+    return out, t0
+
+
+def probe_sheet(title, grid, ncol, capped, force_label=None, force_value=None,
+                ladder=40):
     hdr, _ = find_header(grid, ncol)
     r0 = hdr + 1
     r1 = last_data_row(grid, ncol, hdr)
     cols = [profile(grid, hdr, r0, r1, c) for c in range(1, ncol + 1)]
     used = [p for p in cols if p["n_filled"] or p["name"]]
     dup = [n for n, k in Counter(p["name"] for p in used if p["name"]).items() if k > 1]
-    label, value, cond = guess_roles(used, r1 - r0 + 1)
+    label, value, cond = guess_roles(used, r1 - r0 + 1, force_label, force_value)
     # 尾部页脚行：只有零星几个格子有字、没有任何数
     foot = []
     for r in range(r1, max(r0, r1 - 8), -1):
@@ -202,15 +275,35 @@ def probe_sheet(title, grid, ncol, capped):
             foot.append((r, [_s(at(grid, r, c)) for c in filled][:3]))
         else:
             break
+    # 温度列：像温度、是数、档数不多；电流值列：像电流、不同值最多的那一个
+    temp = _pick(used, "温度", numeric=True, max_uniq=12)
+    cur = _pick(used, "电流", numeric=True)
+    if cur is None and value:
+        cur = max(value, key=lambda p: p["n_uniq"])
+    # 第二文字列当"这一步在干嘛"的说明
+    mode = None
+    for p in used:
+        if p is not label and p["n_filled"] and p["n_num"] < p["n_filled"] * 0.5 \
+                and p["n_uniq"] >= 4 and not _is_flag(p):
+            if mode is None or p["n_uniq"] > mode["n_uniq"]:
+                mode = p
+    lad, t0 = build_ladder(grid, r0, r1, label, cur, temp, mode, ladder)
+    # 标签重复几遍＝多半是几个温度各跑了一趟
+    rep = None
+    if label and label["n_uniq"]:
+        rep = round((r1 - r0 + 1) / label["n_uniq"], 2)
     return {
         "sheet": title, "max_row": len(grid), "max_col": ncol, "capped": capped,
         "header_row": hdr, "data_rows": [r0, r1], "n_data_rows": r1 - r0 + 1,
         "cols": used, "dup_names": dup, "footer_rows": foot,
         "label_col": label, "value_cols": value, "cond_cols": cond,
+        "temp_col": temp, "cur_col": cur, "mode_col": mode,
+        "ladder": lad, "ladder_temp": t0, "repeat": rep,
     }
 
 
-def probe_book(path, only_sheet=None, max_rows=20000):
+def probe_book(path, only_sheet=None, max_rows=20000,
+               force_label=None, force_value=None, ladder=40):
     size = os.path.getsize(path) / 1e6
     print(f"  读 {os.path.basename(path)}（{size:.1f} MB）…", end="", flush=True)
     t0 = time.time()
@@ -227,7 +320,9 @@ def probe_book(path, only_sheet=None, max_rows=20000):
                 out["sheets"].append({"sheet": ws.title, "empty": True,
                                       "max_row": len(grid), "max_col": ncol})
                 continue
-            out["sheets"].append(probe_sheet(ws.title, grid, ncol, capped))
+            out["sheets"].append(probe_sheet(ws.title, grid, ncol, capped,
+                                             force_label, force_value,
+                                             ladder))
     finally:
         wb.close()
     print(f"  {time.time() - t0:.1f}s")
@@ -286,8 +381,32 @@ def show(rep, max_list):
                 print(f"           样例: {', '.join(str(x)[:18] for x in p['sample'])}")
 
         if lab:
-            print(f"     ---- 标签列 {lab['letter']}「{lab['name']}」"
-                  f"的全部取值（{len(lab['all_text'])} 个）----")
+            key = [f"标签列 {lab['letter']}「{lab['name']}」"]
+            for tag, p in (("温度列", sh.get("temp_col")),
+                           ("电流值列", sh.get("cur_col")),
+                           ("说明列", sh.get("mode_col"))):
+                if p is not None:
+                    key.append(f"{tag} {p['letter']}「{p['name']}」")
+            print("     ---- 认出来的关键列 ----")
+            print("       " + "； ".join(key))
+            if sh.get("repeat"):
+                print(f"       标签 {lab['n_uniq']} 个 / 数据 {sh['n_data_rows']} 行"
+                      f" ≈ 重复 {sh['repeat']} 遍"
+                      + (f"（温度列有 {sh['temp_col']['n_uniq']} 档——"
+                         f"多半是每个温度各跑一趟）" if sh.get("temp_col") else ""))
+            lad = sh.get("ladder") or []
+            if lad:
+                print(f"     ---- 逐级阶梯（{fmt(sh.get('ladder_temp'))}℃ 那一趟，"
+                      f"前 {len(lad)} 行）----")
+                print(f"       {'行':>4}  {'标签':<22} {'电流':>10} {'与上一点之差':>12}"
+                      f"  说明")
+                for r, l_, md, iv, d in lad:
+                    print(f"       {r:>4}  {l_[:22]:<22} "
+                          f"{('' if iv is None else f'{iv:.4f}'):>10} "
+                          f"{('' if d is None else f'{d:+.4f}'):>12}  {md[:34]}")
+                print("       （值列装的是每一步之后的**总电流**；模块电流＝相邻做差，"
+                      "上面右边那一列就是）")
+            print(f"     ---- 标签列的全部取值（{len(lab['all_text'])} 个）----")
             for i, t in enumerate(lab["all_text"][:max_list]):
                 print(f"       {i + 1:>3}. {t}")
             if len(lab["all_text"]) > max_list:
@@ -295,7 +414,7 @@ def show(rep, max_list):
                       f"（--max-list 调）")
         else:
             print("     ⚠ 没认出标签列（哪一列是「一行一个模块」的名字）——"
-                  "用 --sheet 换页，或者把这段输出发我")
+                  "用 --label-col A 手指一列，或者把这段输出发我")
 
 
 def main():
@@ -305,6 +424,11 @@ def main():
     ap.add_argument("--max-list", type=int, default=80, help="标签最多列几个")
     ap.add_argument("--max-rows", type=int, default=20000,
                     help="每页最多读多少行（防超大簿子）")
+    ap.add_argument("--label-col", default=None,
+                    help="手指标签列（列字母或表头文字），认错时用")
+    ap.add_argument("--value-col", default=None, help="手指电流值列")
+    ap.add_argument("--ladder", type=int, default=40,
+                    help="逐级阶梯打前几行（0=不打）")
     ap.add_argument("--json", default=None, help="结构写一份 JSON（不含数据值）")
     ap.add_argument("--emit-groups", default=None,
                     help="把标签列写成分组清单模板（★含真实名字，只能放 private/）")
@@ -335,7 +459,8 @@ def main():
     reps = []
     for chip, mod, p in files:
         try:
-            rep = probe_book(p, args.sheet, args.max_rows)
+            rep = probe_book(p, args.sheet, args.max_rows,
+                             args.label_col, args.value_col, args.ladder)
         except Exception as e:                        # noqa: B902
             print(f"\n✗ 读失败 {os.path.basename(p)}: {type(e).__name__}: {e}")
             continue
