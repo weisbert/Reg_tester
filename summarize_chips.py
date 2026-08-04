@@ -375,10 +375,12 @@ def _header(ws, r0, chips, st, title, n_chips, tlabels):
         put(ws, ar, col, None, st, st["f_head"])
         ws.merge_cells(start_row=hr, start_column=col, end_row=ar, end_column=col)
     chip_ax = _chip_axes(tlabels)
-    groups = [(C_SPEC, "Spec（留空，填完自动判定）", AXES),
-              (C_SIM, "仿真（留空）", AXES),
-              (C_SUM, f"汇总 · {n_chips} 片",
-               ["Min\n(各片最小)", "Typ\n(各片中位)", "Max\n(各片最大)"])]
+    # ★ 表头只写这一列**是什么**，不写"该怎么用"。"（留空，填完自动判定）"
+    #   "(各片最小)" 这类是写给填表的人的，评审看见只会觉得奇怪——
+    #   designer 本来就知道 Spec 列填什么，Min 是什么也不用括号解释。
+    groups = [(C_SPEC, "Spec", AXES),
+              (C_SIM, "仿真", AXES),
+              (C_SUM, f"汇总 · {n_chips} 片", AXES)]
     for n, chip in enumerate(chips):
         groups.append((chip_col(n), chip, chip_ax))
     for col, name, axes in groups:
@@ -402,20 +404,11 @@ def _header(ws, r0, chips, st, title, n_chips, tlabels):
     return ar + 1
 
 
-def _caption(ws, r, st, n_chips, slim=False):
-    """口径说明：这几个数是怎么取的。评审第一句必问，写在表头下面最省事。"""
-    txt_ = ("每片三列＝该温度的实测值。汇总列 Min / Max 就是这些格子里的最小 / 最大，"
-            "Typ 取各片常温值。填 Spec 的 Min / Max，判定列自动出 PASS / FAIL。")
-    # 折起来的列不说一句，看的人会以为只测了常温——那比多一句话糟得多。
-    # 这不是使用说明，是"你现在看到的是全部数据的哪一部分"，属于口径。
-    if slim:
-        txt_ += "　每片的低温 / 高温列已折起（点表头上方的 ＋ 展开），汇总列取的仍是那三列。"
-    c = put(ws, r, C_ITEM, txt_, st, st["f_group"], align="left", size=9)
-    ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r,
-                   end_column=note_col(n_chips))
-    c.alignment = _align("left", wrap=True)
-    ws.row_dimensions[r].height = 26
-    return r + 1
+# ★ 这里原来有一行 `_caption()`：「每片三列＝该温度的实测值。汇总列 Min / Max 就是
+#   这些格子里的最小 / 最大…填 Spec 的 Min / Max，判定列自动出 PASS / FAIL。」
+#   2026-08-04 整行删掉——**从头到尾都是在教人怎么读表和怎么填表**，评审要的是数。
+#   列名已经写着 25℃ / Min / Spec，再解释一遍只会招来"这行字是干嘛的"。
+#   口径要留档就进隐藏的 _审计 页和控制台，正表里不写。
 
 
 def _band(ws, r, name, st, n_chips):
@@ -637,7 +630,6 @@ def write_summary(wb, tables, chips, st, slim=False):
         tpick, tlabels = pick_temps(sweeps)
         t0 = r                                   # 这张表的第一行（大标题）
         r = _header(ws, r, chips, st, f"{mod} PLL 性能汇总", n, tlabels)
-        r = _caption(ws, r, st, n, slim=slim)
         r = _cond_rows(ws, r, chips, data, st, n)
         j0 = r
         for band, rows in items:
@@ -766,10 +758,10 @@ def write_journey(wb, tables, chips, st, no_charts=False):
             ws.column_dimensions[_cl(c0 + j)].width = 9 if j else 5
         ws.column_dimensions[_cl(c0 + STRIP_W - 1)].width = 2
 
-    c = put(ws, 1, 1, "温度巡回过程 —— 一颗芯片一竖条；每张图只画一颗芯片的一个模块。"
-                      "横轴按实际测试先后排，刻度标的是当时的温度；红三角 = 重锁点。"
-                      "同一模块各片共用一个纵轴范围，可以直接横向比。",
-            st, st["f_sep"], bold=True, align="left")
+    # ★ 只写这一页是什么，不写"该怎么看"。原来这里有一整句版式说明
+    #   （一片一竖条／横轴按测试先后／共用纵轴范围）——芯片名就写在每条竖条上面，
+    #   横轴刻度和图例自己会说话，那句话是写给我自己的。
+    c = put(ws, 1, 1, "温度巡回过程", st, st["f_sep"], bold=True, align="left")
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n * STRIP_W)
     c.alignment = _align("left", wrap=True)
     ws.row_dimensions[1].height = 30
@@ -887,20 +879,20 @@ VCO_DROP = {
 # 太小则环路带宽不够/锁不住，太大则杂散与噪声恶化。
 VCO_LIMIT_FIX = {"Kvco average": "range"}
 # 备注补一句"这是什么"。★ 只补定义，不补解读——评审要的是"这个数怎么来的"。
-VCO_NOTE_ADD = {
-    "CT Band Coverage": "＝整个电容阵列能覆盖多宽（不含调谐电压那一维）",
-    "Tuning Range": "＝调谐电压与电容码合起来的总覆盖宽度",
-}
+VCO_NOTE_ADD = {}      # 解释性的尾巴全去掉了，备注只留算式
 # ★ 备注整句改写：让算式里的每一项都**正好是表上某一行的名字**，
 #   这样导出来的数用眼睛就能核（用户原话："缺少了计算他们的中间值，我有些没安全感"）。
+# ★ 备注里**只留算式**。原来每条后面还跟着一句解释（"＝整个电容阵列能覆盖多宽"
+#   "两项都在上面的实测端点行里，可以直接核"）——评审知道 Tuning Range 是什么，
+#   也不用我告诉他去哪儿核；那些话跟表头里的"（各片最小）"是同一类。
 VCO_NOTE_SET = {
-    "Kvco average": "［F(Vtune=最高) − F(Vtune=最低)］÷ Vtune 扫的跨度"
-                    "（两项都在上面的实测端点行里，可以直接核）",
+    "Kvco average": "［F(Vtune=最高) − F(Vtune=最低)］÷ Vtune 扫的跨度",
     "Fmin": "CT 扫最低频 −［F(Vtune=0.4V) − F(Vtune=最低)］",
     "Fmax": "CT 扫最高频 +［F(Vtune=最高) − F(Vtune=0.4V)］",
-    "Tuning Range": "Fmax − Fmin ＝调谐电压与电容码合起来的总覆盖宽度",
-    "CT Band Coverage": "CT 扫最高频 − CT 扫最低频 ＝整个电容阵列能覆盖多宽"
-                        "（不含调谐电压那一维）",
+    "Tuning Range": "Fmax − Fmin",
+    "CT Band Coverage": "CT 扫最高频 − CT 扫最低频",
+    # 纯出处（"原表 Temperature 列"）不进正表：那是给我自己对数用的
+    "Temperature": "",
 }
 # ★ 空的：`Kvco @工作点` 请回来了。我当初提议删它的理由是"它落在 Kvco min/max
 #   之间、判定上冗余"——那个理由依赖 min/max 存在。min/max 一走，它就是环路带宽
@@ -1163,10 +1155,9 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
             put(ws, hr, col, name, st, st["f_head"], bold=True)
             put(ws, ar, col, None, st, st["f_head"])
             ws.merge_cells(start_row=hr, start_column=col, end_row=ar, end_column=col)
-        groups = [(C_SPEC, "Spec（留空，填完自动判定）", AXES, 3),
-                  (C_SIM, "仿真（留空）", AXES, 3),
-                  (C_SUM, f"汇总 · {n} 片",
-                   ["Min\n(全部片全温)", "Typ\n(各片常温中位)", "Max\n(全部片全温)"], 3)]
+        groups = [(C_SPEC, "Spec", AXES, 3),
+                  (C_SIM, "仿真", AXES, 3),
+                  (C_SUM, f"汇总 · {n} 片", AXES, 3)]
         for k, chip in enumerate(chips):
             groups.append((vchip(k), chip,
                            [f"{fmt_num(t)}℃" for t in vtemps], nax))
@@ -1189,18 +1180,10 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
         ws.row_dimensions[ar].height = 30
         r = ar + 1
 
-        cap = ("每颗芯片三列＝三个温度各自算出来的值（不是极值，VCO 的量按温度报）。　"
-               "汇总列：Min / Max 取全部芯片全部温度的包络，Typ 取各片常温值的中位数。　"
-               "判定只看 Spec 的 Min / Max 两头。　"
-               "CT 全码扫只在常温做（条件行「CT Code Range (points)」括号里就是测点数），"
-               "所以按相邻码算的步长只有常温有。")
-        if slim:
-            cap += "　每片只展开了常温列，其余温度列已折起（点表头上方的 ＋ 看）。"
-        c = put(ws, r, C_ITEM, cap, st, st["f_group"], align="left", size=9)
-        ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
-        c.alignment = _align("left", wrap=True)
-        ws.row_dimensions[r].height = 30
-        r += 1
+        # ★ 这里原来有一行口径说明（每片三列是什么、汇总怎么取、判定看哪头、
+        #   CT 全码扫只在常温）。2026-08-04 整行删掉：全是读表说明。
+        #   "CT 全码扫只在常温" 这条**是测试条件、不是说明**，它已经在下面的
+        #   条件行 `CT Code Range (points)` 里，不必在正表上再说一遍。
 
         # ---- 行序：按 (cat, item) 对齐各片；cat 变了插一条分组带 ----
         order, seen = [], set()
@@ -1367,11 +1350,7 @@ def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
             ws.column_dimensions[_cl(c0 + j)].width = 10
         ws.column_dimensions[_cl(c0 + VSTRIP_W - 1)].width = 2
 
-    c = put(ws, 1, 1, "VCO 开环压控 —— 一颗芯片一竖条，一张图只画一颗芯片的一个模块。"
-                      "同一模块各片共用纵轴范围，可以直接横向比。"
-                      "★CT 全码扫只在常温：高低温只测了几个粗码，那两条只打记号不连线"
-                      "（5 个点跨 64 个码直连出来是一条不存在的曲线）。",
-            st, st["f_sep"], bold=True, align="left")
+    c = put(ws, 1, 1, "VCO 开环压控", st, st["f_sep"], bold=True, align="left")
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n * VSTRIP_W)
     c.alignment = _align("left", wrap=True)
     ws.row_dimensions[1].height = 32
