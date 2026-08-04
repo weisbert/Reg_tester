@@ -180,11 +180,14 @@ def print_excluded(excluded, indent="     ", cap=14):
 # 只有这些进汇总表。★ 压控/片上温度/电流一律不进：
 #   压控的结论是「距轨还剩多少」，一个 Min/Max 说不清，去「温巡」页看图；
 #   电流另有专门的测试表格，格式定了再单独加页。
-WANT_EXACT = ["Freq_MHz", "Power_dBm", "IPN_SSB", "IPN_Omit_SSB"]
-WANT_PREFIX = ["SpotPN@", "Spur@"]
-# 表里的分组带（顺序＝出现在页面上的顺序）
+WANT_EXACT = ["Freq_MHz", "Power_dBm"]
+# `IPN*` 按前缀收：换算成 DSB 之后行名会从 IPN_SSB 变成 IPN_DSB，
+# 写死名字的话那两行会当场从表里消失（而且不报错）。
+WANT_PREFIX = ["IPN", "SpotPN@", "Spur@"]
+# 表里的分组带（顺序＝出现在页面上的顺序）。
+# `xxx@` = 按 offset 排序收；`xxx*` = 按前缀收、保持识别顺序
 BANDS = [("Frequency / Output", ["Freq_MHz", "Power_dBm"]),
-         ("Phase Noise", ["IPN_SSB", "IPN_Omit_SSB", "SpotPN@"]),
+         ("Phase Noise", ["IPN*", "SpotPN@"]),
          ("Spur", ["Spur@"])]
 # 单位 -> 小数位
 ND = {"MHz": 3}
@@ -219,6 +222,8 @@ def canon_items(sweeps):
             if k.endswith("@"):
                 picked += sorted((v for lb, v in seen.items() if lb.startswith(k)),
                                  key=lambda v: _off_key(v[0]))
+            elif k.endswith("*"):
+                picked += [v for lb, v in seen.items() if lb.startswith(k[:-1])]
             elif k in seen:
                 picked.append(seen[k])
         if picked:
@@ -341,15 +346,57 @@ def note_scale(sinfo, kind, mod, chip, info):
           + f"，相噪/杂散 {info['n_db']} 项 {info['db']:+.2f} dB")
 
 
-def scale_title(info):
+# 单边带 → 双边带：10·log10(2)
+DSB_DB = 3.010299956639812
+
+
+def to_dsb(sw):
+    """把**积分**相噪从单边带换算到双边带（+3.01 dB），并把行名改掉。
+
+    ★ 为什么只动 IPN：
+      · 逐点相噪 L(f) 的定义本身就是单边带——载波一侧、偏移 f 处、1 Hz 带宽内
+        相对载波的功率。它是"某一点的密度"，没有"两边加起来"这回事
+        （真要说双边带那是相位谱密度 S_φ = 2L，单位 rad²/Hz，不是 dBc/Hz）。
+      · 积分相噪回答的是"总共抖了多少"。相位调制的 +f 与 −f 两个边带是同一个
+        相位起伏的两半，算总相位误差必须两边都算：σ_φ² = ∫S_φ df = 2·∫L df，
+        落到 dB 上就是 +10·log10(2)。
+      · 杂散跟逐点相噪同理：dBc 的惯例就是报单边带那一根。
+      佐证：原表的列名本来就叫 `IPN_SSB` / `IPN_Omit_SSB`（仪器自己标了单边带），
+      而 `SpotPNResult` / `OtherSpurResult` 没有这个后缀。
+    ★ **改了值就必须改名**：留着 `IPN_SSB` 这个名字写 DSB 的数，
+      跟"两个都叫频点却差 4 倍"是同一类错。
+    """
+    n = 0
+    for it in sw.items:
+        if not it.label.startswith("IPN"):
+            continue
+        for r in sw.rows:
+            v = r.vals.get(it.col)
+            if v is not None:
+                r.vals[it.col] = v + DSB_DB
+        it.label = (it.label.replace("_SSB", "_DSB") if "_SSB" in it.label
+                    else it.label + "_DSB")
+        n += 1
+    return n
+
+
+def note_dsb(n, chip):
+    if n:
+        print(f"     · 积分相噪 SSB→DSB：{n} 项 {DSB_DB:+.2f} dB，行名改成 IPN_DSB")
+
+
+def scale_title(info, dsb=False):
     """折算这件事必须**印在表上**——它是取数条件，不是给填表人看的说明。
 
     放大标题那一行：一张表一句，不在每一行的备注里重复 40 遍。
     """
-    if not info:
-        return ""
-    n = fmt_num(info["n"], 4)
-    return f"（折算 ×{n}：频率 ×{n}，相噪/杂散 {info['db']:+.1f} dB）"
+    parts = []
+    if info:
+        n = fmt_num(info["n"], 4)
+        parts.append(f"折算 ×{n}：频率 ×{n}，相噪/杂散 {info['db']:+.1f} dB")
+    if dsb:
+        parts.append(f"积分相噪 SSB→DSB {DSB_DB:+.2f} dB")
+    return f"（{'；'.join(parts)}）" if parts else ""
 
 
 def spur_note(data_or_sw, label):
@@ -774,7 +821,7 @@ def _limit_dropdown(ws, r0, r1):
     dv.add(f"{_cl(C_LIMIT)}{r0}:{_cl(C_LIMIT)}{r1}")
 
 
-def write_summary(wb, tables, chips, st, slim=False, sinfo=None):
+def write_summary(wb, tables, chips, st, slim=False, sinfo=None, dsb=False):
     """tables = [(模块名, {芯片: Sweep}), ...]，一个模块一张表，从上到下排。"""
     ws = wb.create_sheet("PLL_Summary")
     n = len(chips)
@@ -802,7 +849,7 @@ def write_summary(wb, tables, chips, st, slim=False, sinfo=None):
         tpick, tlabels = pick_temps(sweeps)
         t0 = r                                   # 这张表的第一行（大标题）
         r = _header(ws, r, chips, st,
-                    f"{mod} PLL 性能汇总{scale_title((sinfo or {}).get(mod))}",
+                    f"{mod} PLL 性能汇总{scale_title((sinfo or {}).get(mod), dsb)}",
                     n, tlabels)
         r = _cond_rows(ws, r, chips, data, st, n)
         j0 = r
@@ -1180,7 +1227,8 @@ def op_vtune_of(sw):
     return None
 
 
-def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False, sinfo=None):
+def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False,
+                      sinfo=None, dsb=False):
     """VCO 汇总表：每颗芯片的组内轴＝三个温度（不是 Min/Typ/Max）。
 
     ★ 为什么这里用温度当轴、PLL 那页用极值当轴：VCO 这些量本来就是"一个温度
@@ -1189,11 +1237,12 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False, sinfo=None):
       压缩有真收益。
     """
     return write_grouped_page(wb, "VCO_Summary", "{mod} VCO 开环特性汇总",
-                              vtables, chips, st, vtemps, slim=slim, sinfo=sinfo)
+                              vtables, chips, st, vtemps, slim=slim,
+                              sinfo=sinfo, dsb=dsb)
 
 
 def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
-                       slim=False, item_w=26, note_w=46, sinfo=None):
+                       slim=False, item_w=26, note_w=46, sinfo=None, dsb=False):
     """「一行一个量 × 每片若干温度」这种页的通用写法。
 
     ★ VCO 汇总页和电流页是同一个形状：行是结论量、组内轴是温度、汇总列对
@@ -1236,7 +1285,7 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
         t0 = r
         # ---- 三行表头 ----
         c = put(ws, r, C_ITEM,
-                title_fmt.format(mod=mod) + scale_title((sinfo or {}).get(mod)),
+                title_fmt.format(mod=mod) + scale_title((sinfo or {}).get(mod), dsb),
                 st, st["f_sep"], bold=True, align="left", size=12)
         ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
         c.alignment = _align("left", wrap=False)
@@ -2010,6 +2059,12 @@ def main():
                          "把那一组写成 {\"keys\": [步骤键…], \"note\": \"…\"}。"
                          "★含真实模块名，放黄区本地/private，别提交。"
                          "不给＝所有关断步骤按文件顺序排成一组")
+    ap.add_argument("--dsb", dest="dsb", action="store_true", default=None,
+                    help="把**积分**相噪从单边带换算成双边带（+3.01 dB），"
+                         "行名 IPN_SSB→IPN_DSB。逐点相噪与杂散不动"
+                         "（L(f) 与 dBc 的定义本来就是单边带）")
+    ap.add_argument("--no-dsb", dest="dsb", action="store_false",
+                    help="强制按单边带报（盖掉配置文件里的 dsb）")
     ap.add_argument("--config", default=None,
                     help=f"配置文件（默认自动找 <根目录>/{CONFIG_NAME}）。"
                          "里面可以放 scale / groups / modules / chips / "
@@ -2060,6 +2115,7 @@ def main():
     ref_temp = float(pick_opt(args.ref_temp, "ref_temp", 25.0))
     spur_tol = float(pick_opt(args.spur_tol, "spur_tol", 2.0))
     op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
+    dsb = bool(pick_opt(args.dsb, "dsb", False))
 
     want_mod = ([m.strip() for m in args.modules.split(",") if m.strip()]
                 or [str(m).strip() for m in (cfg.get("modules") or [])])
@@ -2141,6 +2197,8 @@ def main():
             n_scale = scale_of(scale_rules, mod, KIND_PLL)
             note_scale(sinfo, KIND_PLL, mod, chip, scale_book(sw, n_scale))
             check_scale(imp, n_scale, chip, KIND_LABEL[KIND_PLL])
+            if dsb:
+                note_dsb(to_dsb(sw), chip)
             n_meas = sum(1 for lg in sw.legs for x in lg.rows if x.kind != "lock")
             notes[id(b)] = f"{sw.n_rows}行×{sw.n_cols}列"
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
@@ -2196,6 +2254,8 @@ def main():
             n_scale = scale_of(scale_rules, mod, KIND_VCO)
             note_scale(sinfo, KIND_VCO, mod, chip, scale_book(sw, n_scale))
             check_scale(imp, n_scale, chip, KIND_LABEL[KIND_VCO])
+            if dsb:
+                note_dsb(to_dsb(sw), chip)          # 要在 vco_rows 之前
             # 工作点用第一颗芯片的（CT 扫钉住的那个 Vtune）统一喂给全部芯片：
             # 否则各片的组名会变成「@ Vtune 0.4V」「@ Vtune 0.45V」，行对不齐
             if op is None:
@@ -2368,11 +2428,11 @@ def main():
     st = styles()
     if tables:
         write_summary(wb, tables, chips_pll, st, slim=args.slim,
-                      sinfo=sinfo.get(KIND_PLL))
+                      sinfo=sinfo.get(KIND_PLL), dsb=dsb)
         write_journey(wb, tables, chips_pll, st, no_charts=args.no_charts)
     if vtables:
         write_vco_summary(wb, vtables, chips_vco, st, vtemps, slim=args.slim,
-                          sinfo=sinfo.get(KIND_VCO))
+                          sinfo=sinfo.get(KIND_VCO), dsb=dsb)
         write_vco_charts(wb, vcharts, chips_vco, st, vtemps,
                          no_charts=args.no_charts)
     # 电流页放最后：前四页是成对的（汇总+过程），别插进它们中间
