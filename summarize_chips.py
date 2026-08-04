@@ -1659,7 +1659,8 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
 
 # ---------------------------------------------------------------- 审计页
 
-def write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all=()):
+def write_audit(wb, picked, dropped, unknown, failed, notes, st,
+                excl_all=(), quality_all=()):
     """每个数出自哪份文件 + 哪些文件没用上。**隐藏页**——正表不写这些。"""
     ws = wb.create_sheet("_审计")
     ws.sheet_state = "hidden"
@@ -1691,7 +1692,10 @@ def write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all=()):
                         for b, why in failed]),
             ("排除的行（逐行原因；这些行不进统计）",
              [(chip, mod, kind, f"行{xl}", why)
-              for chip, mod, kind, ex in excl_all for xl, why in ex])):
+              for chip, mod, kind, ex in excl_all for xl, why in ex]),
+            ("逐级关断这一趟的可信度（恢复后复测 vs 全开基线）",
+             [(chip, mod, kind, what, why)
+              for chip, mod, kind, ex in quality_all for what, why in ex])):
         if not rowsrc:
             continue
         put(ws, r, 1, title, st, st["f_sep"], bold=True, align="left")
@@ -1795,6 +1799,43 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
     return out
 
 
+def run_quality(cur, chip):
+    """这一趟数据的可信度：恢复后复测有没有回到全开基线。
+
+    ★ 逐级关断测出来的是**差值**，差值的误差下限就是"同一个状态测两次差多少"。
+      唯一能观测到它的地方就是恢复后复测 vs 全开基线——两者本该相等。
+    ★★ 这句话是**整趟一句**，不是每个模块各说一遍。真数据上复测比基线差
+      9.58 mA（基线的 17%），比 27 个模块每一个的 ΔI 都大——那不是
+      "27 个模块都不可信"，那是"这一趟没恢复回去"。挂在每一行上只会让人
+      问"这个 ⚠ 是什么"，而且正表里根本不该出现告警。
+    返回控制台/审计页用的字符串列表；一条都没有就是这趟干净。
+    """
+    out = []
+    for t in cur.temps:
+        run = cur.runs[t]
+        base, rc = run["baseline"], run.get("recheck")
+        if not rc:
+            out.append(f"{chip} {fmt_num(t)}℃: 这一趟**没有恢复后复测点**，"
+                       f"没法判断差值的误差下限")
+            continue
+        d = rc[3] - base
+        if not base:
+            continue
+        small = [k for k, _m, _i, dd in run["steps"] if abs(dd) < abs(d)]
+        pct = abs(d) / abs(base) * 100.0
+        if abs(d) < abs(base) * 0.01 and not small:
+            continue                       # 回到基线的 1% 以内，且没有更小的台阶
+        msg = (f"{chip} {fmt_num(t)}℃: 恢复后复测 {fmt_num(rc[3], 4)} mA，"
+               f"全开基线 {fmt_num(base, 4)} mA，差 {d:+.4f}（{pct:.1f}%）"
+               f"——差值的误差下限就是这个数")
+        if small:
+            msg += (f"；{len(small)}/{len(run['steps'])} 个台阶比它还小"
+                    + (f"（{', '.join(small[:6])}"
+                       + (" …" if len(small) > 6 else "") + "）" if small else ""))
+        out.append(msg)
+    return out
+
+
 def current_rows(cur, parts, total_name="", chip_note=""):
     """一份电流簿 → 一张表的行（跟 VCO 页同形：cat/item/unit/dir/kind/vals/note）。
 
@@ -1814,13 +1855,6 @@ def current_rows(cur, parts, total_name="", chip_note=""):
             modes.setdefault(k, m)
             if k not in order:
                 order.append(k)
-
-    # 这趟测试自己的重复性 = |恢复后复测 − 全开基线|，取各温度里最大的那个
-    rep = 0.0
-    for t in cur.temps:
-        rc = cur.runs[t].get("recheck")
-        if rc:
-            rep = max(rep, abs(rc[3] - cur.runs[t]["baseline"]))
 
     out = []
     cond = [("全开基线电流", {t: cur.runs[t]["baseline"] for t in cur.temps},
@@ -1849,11 +1883,11 @@ def current_rows(cur, parts, total_name="", chip_note=""):
             note = "关它之前 − 关它之后的总电流"
             if modes.get(k):
                 note = f"{modes[k]}｜{note}"
-            # ★ 哨兵：比这趟自己的重复性还小的数，不能当成"这个模块耗这么多"
-            got = [v for v in vals.values() if isinstance(v, (int, float))]
-            if rep and got and max(abs(v) for v in got) < rep:
-                note = (f"⚠ 比本趟重复性（复测−基线 {fmt_num(rep, 4)} mA）还小，"
-                        f"只能当上限看；" + note)
+            # ★★ 这里**不写告警**。原来每行前面挂一句"⚠ 比本趟重复性还小，只能当
+            #   上限看"——真数据上复测比基线差了 9.58 mA，于是 27 行全挂上同一句话，
+            #   成了满屏噪声，而且正表里出现 ⚠ 一定会被追问（用户 2026-08-04）。
+            #   更要紧的是**它本来就该是整趟一句话**："这一趟恢复后没回到基线"，
+            #   不是"每个模块各自不可信"。判据挪到 run_quality()，走控制台 + 审计页。
             out.append({"cat": pname, "item": k, "unit": "mA", "dir": "≤",
                         "kind": "result", "vals": vals, "note": note, "nd": 4})
             if k in dmap:
@@ -2275,6 +2309,7 @@ def main():
     # ---- 读 PLL 温扫 ----
     tables, failed, notes, warn_seen, vcharts = [], [], {}, {}, []
     excl_all = []
+    quality_all = []          # 电流那趟的可信度：控制台 + 审计页，不进正表
     scale_rules = parse_scale(args.scale) or scale_from_cfg(cfg.get("scale"))
     sinfo = {}
     if scale_rules:
@@ -2486,6 +2521,13 @@ def main():
                           + (f" / 恢复后复测 {fmt_num(rc[3], 4)} mA"
                              f"（与基线差 {fmt_num(rc[3] - run['baseline'], 4)}）"
                              if rc else " / **没有恢复后复测点**"))
+                # ★ 可信度那句话走这里，不进正表（正表出现 ⚠ 一定被追问）
+                q = run_quality(cur, chip)
+                for line in q:
+                    print(f"     ⚠ {line}")
+                if q:
+                    quality_all.append((chip, mod, KIND_LABEL[KIND_CUR],
+                                        [("这一趟的可信度", line) for line in q]))
                 if cur.excluded:
                     print(f"     排除 {len(cur.excluded)} 行:")
                     print_excluded([(n, why) for n, why, _k in cur.excluded])
@@ -2557,7 +2599,8 @@ def main():
                            ctables, chips_cur, st, ctemps, slim=args.slim,
                            item_w=24, note_w=52)
     if not args.no_audit:
-        write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all)
+        write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all,
+                    quality_all)
     wb.calculation.fullCalcOnLoad = True
 
     out = args.out or os.path.join(os.path.dirname(root),
