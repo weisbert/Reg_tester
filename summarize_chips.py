@@ -1799,6 +1799,20 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
     return out
 
 
+def _mode_note(key, mode):
+    """Mode 列只在它**不是步骤名的换皮**时才写进备注。
+
+    `gtcxo_core` 配 `OFF gtcxo_core_en` 说的是同一件事，写出来只是把行名
+    换个写法再念一遍。判据：把两边都压成小写字母数字，步骤名整个落在
+    Mode 里就当没信息。
+    """
+    m = txt(mode)
+    if not m:
+        return ""
+    k = re.sub(r"[^0-9a-z]", "", txt(key).lower())
+    return "" if (k and k in re.sub(r"[^0-9a-z]", "", m.lower())) else m
+
+
 def run_quality(cur, chip):
     """这一趟数据的可信度：恢复后复测有没有回到全开基线。
 
@@ -1856,23 +1870,25 @@ def current_rows(cur, parts, total_name="", chip_note=""):
             if k not in order:
                 order.append(k)
 
+    # ★★ 备注只写**名字说不出来**的事。行名已经讲明白的，写在备注里就是噪声
+    #   （用户 2026-08-04：「这些都是常识性质的东西没必要反复强调」）。
+    #   于是「全开基线电流＝所有模块都开着时的总电流」「复测 − 基线＝恢复后复测
+    #   − 全开基线」这类同义反复整片删掉，只留"关断步数"那句范围提示——
+    #   它是唯一一句名字里看不出来的（步数是整趟的，不是本表列出来的行数）。
     out = []
-    cond = [("全开基线电流", {t: cur.runs[t]["baseline"] for t in cur.temps},
-             "关断开始之前、所有模块都开着时的总电流"),
+    cond = [("全开基线电流", {t: cur.runs[t]["baseline"] for t in cur.temps}),
             ("恢复后复测", {t: (cur.runs[t]["recheck"][3] if cur.runs[t].get("recheck")
-                            else None) for t in cur.temps},
-             "全部写回初始值并重锁之后再测一次的总电流"),
+                            else None) for t in cur.temps}),
             ("复测 − 基线", {t: ((cur.runs[t]["recheck"][3] - cur.runs[t]["baseline"])
                               if cur.runs[t].get("recheck") else None)
-                          for t in cur.temps},
-             "恢复后复测 − 全开基线")]
-    for item, vals, note in cond:
+                          for t in cur.temps})]
+    for item, vals in cond:
         out.append({"cat": "Condition", "item": item, "unit": "mA", "dir": "",
-                    "kind": "cond", "vals": vals, "note": note, "nd": 4})
+                    "kind": "cond", "vals": vals, "note": "", "nd": 4})
     out.append({"cat": "Condition", "item": "关断步数", "unit": "",
                 "dir": "", "kind": "cond",
                 "vals": {t: len(cur.runs[t]["steps"]) for t in cur.temps},
-                "note": "这一趟一共关了多少步（不只本表列出来的这些）", "nd": 0})
+                "note": "整趟的步数，不只本表列出来的这些", "nd": 0})
 
     sums = []                       # [(部件名, {温度: 合计})]
     for pname, keys, pnote in parts:
@@ -1880,9 +1896,9 @@ def current_rows(cur, parts, total_name="", chip_note=""):
         n_in = 0
         for k in ks:
             vals = dmap.get(k, {})
-            note = "关它之前 − 关它之后的总电流"
-            if modes.get(k):
-                note = f"{modes[k]}｜{note}"
+            # "关它之前 − 关它之后的总电流" 每行写一遍＝把一张表的口径说 27 遍，
+            # 而且逐级关断本来就是这么算的；Mode 只在它不是步骤名换皮时才有信息量。
+            note = _mode_note(k, modes.get(k))
             # ★★ 这里**不写告警**。原来每行前面挂一句"⚠ 比本趟重复性还小，只能当
             #   上限看"——真数据上复测比基线差了 9.58 mA，于是 27 行全挂上同一句话，
             #   成了满屏噪声，而且正表里出现 ⚠ 一定会被追问（用户 2026-08-04）。
@@ -1909,11 +1925,10 @@ def current_rows(cur, parts, total_name="", chip_note=""):
             sums.append((pname, psum, next(k for k in ks if k in dmap)))
             continue
         sums.append((pname, psum, f"{pname} 合计"))
-        note = "本组各行相加"
-        if pnote:
-            note = f"{note}；{pnote}"
+        # 「本组各行相加」也是同义反复：行叫「X 合计」、就在 X 这一带的末尾。
+        # 只有清单给了这一组特有的话（比如共用器件）才写。
         out.append({"cat": pname, "item": f"{pname} 合计", "unit": "mA", "dir": "≤",
-                    "kind": "result", "vals": psum, "note": note, "nd": 4,
+                    "kind": "result", "vals": psum, "note": pnote, "nd": 4,
                     "strong": True})
 
     # ---- 总计 ----
