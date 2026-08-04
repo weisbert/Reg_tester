@@ -2154,6 +2154,92 @@ def _spread_cells(ws, fcell, rr, present, cc, n_t, getval,
           rnd(pct, 4) if pct is not None else None, fill=fill, fmt=FMT_PCT)
 
 
+def db_chip_roster(conn):
+    """库里现有哪些芯片、各几个 run、数据从哪个文件来。"""
+    return conn.execute(
+        "SELECT chip, COUNT(*), COUNT(DISTINCT src_file), MIN(run_ts), MAX(run_ts)"
+        " FROM runs GROUP BY chip ORDER BY chip").fetchall()
+
+
+def db_chip_conflicts(conn):
+    """同一个 (芯片,模式,温度) 被多个源文件占着 -> 出簿时只留 run_ts 最新的那次，
+    另一次静默消失。**两颗芯片被贴成同一个名字**就长这样（真实事故），
+    而老版式一模式一文件、同芯片多源是正常的，不能只看源文件数。"""
+    return dict(conn.execute(
+        "SELECT chip, COUNT(*) FROM (SELECT chip, mode, temp_c FROM runs"
+        "   GROUP BY chip, mode, temp_c HAVING COUNT(DISTINCT src_file) > 1)"
+        " GROUP BY chip").fetchall())
+
+
+def print_chip_roster(conn, title="库里现有"):
+    rows = db_chip_roster(conn)
+    if not rows:
+        print(f"[{title}] 一个 run 都没有")
+        return rows
+    conflicts = db_chip_conflicts(conn)
+    print(f"[{title}] 芯片 {len(rows)} 颗：")
+    for chip, n_run, n_src, ts0, ts1 in rows:
+        span = ts0 if ts0 == ts1 else f"{ts0} ~ {ts1}"
+        n_bad = conflicts.get(chip, 0)
+        warn = (f"   ⚠ {n_bad} 个(模式,温度)被多个文件占着，出簿只留最新的一次"
+                "——两颗芯片贴成同一个名字就长这样" if n_bad else "")
+        print(f"    {chip:<12} {n_run:>3} 个 run   {n_src} 个源文件   {span}{warn}")
+    return rows
+
+
+def cmd_add_chip(args):
+    """往已有库里加一颗芯片的实测，不动仿真、不动别的芯片。
+
+    build 是全量重建（库=目录的纯函数，没有"库里有、目录里没有"的幽灵数据），
+    代价是每次都要重读那本几千行的仿真簿。新到一颗芯片只想把它并进来时用这个。
+    同一个文件重复 add 是幂等的——按 (源文件, 芯片) 先删后插。"""
+    if not os.path.exists(args.db):
+        raise SystemExit(f"[错误] 库不存在: {args.db}（第一次请用 build 建库，仿真表要先进去）")
+    root = os.path.dirname(os.path.abspath(args.db))
+    config, cfg_path, cfg_created = load_config(root, args.config)
+    conn = open_db(args.db)
+    sim_modes = {r[0] for r in conn.execute("SELECT DISTINCT mode FROM sim_current")}
+    if not sim_modes:
+        print("[警告] 库里没有仿真数据（仿真列会全空）——先跑一次 build，或用 ingest-sim 补")
+
+    xlsx = os.path.abspath(args.xlsx)
+    if not os.path.isfile(xlsx):
+        raise SystemExit(f"[错误] 文件不存在: {xlsx}")
+    # 芯片号：--chip 优先，否则取文件所在目录名（与 build 同一条规则：
+    # 目录名对得上某个仿真 Mode 就说明这是老的"按模式分目录"版式，此时必须显式给 --chip）
+    chip, folder_mode = chip_of_path(xlsx, os.path.dirname(os.path.dirname(xlsx)),
+                                     sim_modes, config.get("mode_map"), None)
+    if args.chip:
+        chip, folder_mode = args.chip, folder_mode
+    if not chip:
+        raise SystemExit("[错误] 认不出芯片号：文件所在目录名对上了一个仿真 Mode"
+                         f"（{folder_mode}），这是按模式分目录的老版式 -> 请显式给 --chip")
+
+    before = {c for c, *_ in db_chip_roster(conn)}
+    results = ingest_result_file(conn, xlsx, chip, config, sim_modes, folder_mode=folder_mode)
+    print(f"[实测] {os.path.basename(xlsx)}  芯片 {chip} -> {len(results)} 个 (模式,温度) 段")
+    bad_map = set()
+    for run_id, mode, mode_raw, how, temp, n_steps in results:
+        print(f"        {mode:<22} run#{run_id}  {n_steps} 个模块组  "
+              f"{temp if temp is not None else '?'}°C  {how}")
+        if how in ("none", "ambig"):
+            bad_map.add((mode_raw, how))
+    if bad_map:
+        # 用的是 db 同目录的 config（除非 --config）。db 和 config 不在一起时 mode_map
+        # 读不到，同一个文件在 build 和 add-chip 下会落到不同的模式名上——不喊出来看不见
+        print(f"[警告] {len(bad_map)} 个段没匹配上仿真 Mode: "
+              + "、".join(f"{m}({h})" for m, h in sorted(bad_map)))
+        print(f"       配置用的是 {cfg_path}"
+              + ("（本次现建的默认配置，mode_map 是空的——db 和 config 不在同一个目录？）"
+                 if cfg_created else " -> 确认 mode_map 是否覆盖了这些段"))
+    print_chip_roster(conn)
+    if chip in before:
+        print(f"[提示] {chip} 原本就在库里：同源文件的旧 run 已被本次替换（幂等）")
+    conn.close()
+    print("[下一步] 出簿："
+          f"python current_db.py summary-chips --db {args.db} --out <输出.xlsx>")
+
+
 def cmd_chips(args):
     root = os.path.dirname(os.path.abspath(args.db))
     config, _, _ = load_config(root, args.config)
@@ -2334,6 +2420,8 @@ def cmd_build(args):
         print("[警告] 没有扫到任何 Result 文件")
     if dir_chips:
         print(f"[芯片] 按子目录名认出 {len(dir_chips)} 颗: {', '.join(dir_chips)}")
+    if n_runs:
+        print_chip_roster(conn, "入库后")   # 库里到底有什么，以这行为准
 
     if mapping:
         print("[模式映射] 实测段标签 -> 仿真 Mode（config.mode_map 可强制指定）:")
@@ -2725,6 +2813,14 @@ def main():
     r.add_argument("--sheet", help="tab 名（默认自动扫描）")
     r.add_argument("--config", help="配置文件路径（默认取 db 同目录 current_config.json）")
     r.set_defaults(func=cmd_ingest_run)
+
+    a = sub.add_parser("add-chip", help="往已有库里加一颗芯片的全模式实测文件（增量，不动仿真"
+                                        "和别的芯片；同一文件重复加是幂等的）")
+    a.add_argument("--db", required=True)
+    a.add_argument("--xlsx", required=True, help="该芯片的全模式实测文件")
+    a.add_argument("--chip", help="芯片编号；默认取文件所在目录名")
+    a.add_argument("--config", help="配置文件路径（默认取 db 同目录 current_config.json）")
+    a.set_defaults(func=cmd_add_chip)
 
     p = sub.add_parser("ingest-probe", help="导入 probe_allmode_result.py --json 的产物")
     p.add_argument("--db", required=True)
