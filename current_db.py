@@ -1599,6 +1599,9 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False):
             ch = LineChart()
             ch.title = _chart_title(title)
             ch.style = 12
+            # 只有一行指标时这张图就是单系列，Excel 会"按点着色"并给每个点发一条
+            # 图例（varyColors 省略时默认为真）。同一处兜底在 sweep_lib.blank_policy
+            ch.varyColors = False
             ch.y_axis.title = _chart_title(unit, sz=1000, bold=False)
             ch.x_axis.title = _chart_title("温度", sz=1000, bold=False)
             ch.height, ch.width = max(7.5, 1.2 + 0.42 * len(row_names)), 16

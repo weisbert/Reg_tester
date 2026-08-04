@@ -1423,6 +1423,10 @@ def _scatter(title, xtitle, ytitle, logx=False, xlim=None, ylim=None):
     #   属性，序列化时压根不看——图照样生成，设置却一个都没生效。
     ch.display_blanks = "gap"          # 断点留空，不连成直线
     ch.visible_cells_only = False      # 数据页是隐藏的，不关掉这个图会整片空白
+    # ★ varyColors 省略时 OOXML 默认为真，Excel 的"按点着色"只对**单系列**图生效：
+    #   ΔF vs CT 码只画常温，于是每个数据点发一条图例，几十条把绘图区挤没了。
+    #   不写这个元素 ≠ 关掉它。（同一处兜底在 sweep_lib.blank_policy）
+    ch.varyColors = False
     if ch.legend is not None:
         ch.legend.position = "b"       # 默认在右边，会吃掉四分之一绘图区
         ch.legend.overlay = False

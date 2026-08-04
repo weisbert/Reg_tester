@@ -594,14 +594,21 @@ def legend_bottom(chart):
 
 
 def blank_policy(chart, data_sheet_hidden=False):
-    """断点留空 + 数据页隐藏了也照画。
+    """断点留空 + 数据页隐藏了也照画 + 关掉"按点着色"。
 
     ★ 属性名必须是 openpyxl 的 display_blanks / visible_cells_only。
       写成 OOXML 里的 dispBlanksAs / plotVisOnly **不报错**，只是给对象挂了个
       没人读的属性：dispBlanksAs 缺省是 "zero"，于是没测的格子被当 0 画进图，
       曲线在测点之间扎到零成一串尖刺。
+    ★★ varyColors 省略时 OOXML 默认是**真**，而 Excel 的"按点着色"**只对
+      单系列图生效**——于是同一份代码画出来的图，三条温度曲线那些正常，
+      只画一条曲线的（ΔF vs CT 码只画常温）会**给每个数据点发一条图例**：
+      几十条「—■— 0.5 / —■— 1.5 …」把绘图区挤成顶上一条，纵轴刻度叠成一坨。
+      2026-08-04 用户报的就是这张图。openpyxl 不写这个元素 ≠ 关掉它，
+      必须显式 False。
     """
     chart.display_blanks = "gap"
+    chart.varyColors = False
     if data_sheet_hidden:
         chart.visible_cells_only = False
 
