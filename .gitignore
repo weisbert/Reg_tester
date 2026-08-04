@@ -46,3 +46,7 @@ dist/
 *.swp
 .DS_Store
 Thumbs.db
+
+# ---- summarize_chips 的配置（含真实模块名/步骤名，跟数据放一起，不进仓）----
+chips.json
+!chips.example.json

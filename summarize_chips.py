@@ -1797,6 +1797,110 @@ def current_rows(cur, groups, chip_note=""):
     return out
 
 
+# ---------------------------------------------------------------- 配置文件
+
+CONFIG_NAME = "chips.json"
+
+
+def load_config(root, path=None):
+    """跟着**数据**走的配置：默认找 `<根目录>/chips.json`。
+
+    ★ 为什么要它：折算倍数、电流分组、模块顺序这些是**这个项目的固定事实**，
+      不是每次跑都要重想的参数。写在命令行上就意味着"谁记得住谁才跑得对"——
+      换个人、隔一阵子、开一段新对话，命令就少一截，而少一截**不会报错**，
+      只会安安静静出一份数全错的报表。
+    ★ 放数据目录旁边而不是仓库里：里面有真实模块名（zero-IP），
+      而且它本来就属于"这批数据"，跟着数据一起搬。
+    """
+    p = path or os.path.join(root, CONFIG_NAME)
+    if not os.path.isfile(p):
+        return {}, (p if path else None)
+    with open(p, encoding="utf-8") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        sys.exit(f"配置文件最外层要是一个对象: {p}")
+    return cfg, p
+
+
+def scale_from_cfg(m):
+    """配置里的 {"模块:类型": 倍数} -> parse_scale 那套三元组。"""
+    out = []
+    for k, v in (m or {}).items():
+        mod, sep, kind = str(k).partition(":")
+        if not sep:
+            mod, kind = k, "*"
+        out.append((mod.strip() or "*", kind.strip().lower() or "*", float(v)))
+    return out
+
+
+def groups_from_cfg(m):
+    out = []
+    for g, spec in (m or {}).items():
+        if isinstance(spec, dict):
+            out.append((g, list(spec.get("keys") or []), txt(spec.get("note") or "")))
+        else:
+            out.append((g, list(spec), ""))
+    return out
+
+
+def implied_scale(sw, kind):
+    """簿子**自己声明**的目标频点 ÷ 实测频点 ＝ 这份数据该乘几。
+
+    PLL 簿看 `fLO_MHz`，VCO 簿看 `fVCO_MHz`（load_vco 已经读成 sw.fvco）。
+
+    ★ 只拿它**核对**，不拿它当默认值。折算猜错一个倍数，整本报表每个数都错，
+      而且每个数看着都正常——这种错必须由人拍板，不能由工具猜。
+      但反过来，工具有义务在"配的倍数跟簿子自己说的对不上"、或者"压根没配
+      而簿子看着需要折算"的时候**当场喊出来**。
+    """
+    fi = getattr(sw, "freq_item", None)
+    if fi is None and hasattr(sw, "item"):
+        fi = sw.item("Freq_MHz")
+    if fi is None:
+        return None
+    meas = median([r.vals.get(fi.col) for r in sw.rows
+                   if r.vals.get(fi.col) is not None])
+    if not meas:
+        return None
+    tgt = None
+    if kind == KIND_VCO:
+        tgt = getattr(sw, "fvco", None)
+    else:
+        ci = sw.cols.idx("fLO_MHz")
+        if ci is not None:
+            tgt = median([num(r.raw[ci]) for r in sw.rows
+                          if ci < len(r.raw) and num(r.raw[ci]) is not None])
+    if not tgt:
+        return None
+    return {"target": tgt, "meas": meas, "ratio": tgt / meas}
+
+
+def check_scale(imp, n, chip, kind_label, tol=0.10):
+    """配的倍数 vs 簿子自己声明的比值。对不上就喊，没配也喊。
+
+    ★ 只在比值**贴近一个整数**时才开口。VCO 簿的实测频率本来就扫了一整个调谐
+      范围，中位数当分母只能算个毛估——比值落在 1.6 这种地方，说明这份簿子
+      压根没有"整数倍频"这层关系，那就没有判据，闭嘴比瞎喊强。
+      警告一旦有假阳性，下次真的那条也会被当噪声划过去。
+    """
+    if not imp:
+        return
+    r = imp["ratio"]
+    n0 = round(r)
+    if n0 < 1 or abs(r - n0) > tol * n0:
+        return
+    if n and n != 1.0:
+        if abs(n0 - n) > 1e-9:
+            print(f"     ⚠⚠ {chip}: 折算配的是 ×{fmt_num(n, 4)}，但这份簿子自己说的是 "
+                  f"{fmt_num(imp['target'])} ÷ 实测 {fmt_num(imp['meas'])} ≈ "
+                  f"×{n0} —— 两个只有一个是对的，别就这么发出去")
+    elif n0 > 1:
+        print(f"     ⚠⚠ {chip}: **没配折算**，但这份 {kind_label} 簿子自己写着目标频点 "
+              f"{fmt_num(imp['target'])} MHz、实测才 {fmt_num(imp['meas'])} MHz "
+              f"（≈ ×{n0}）。相噪/杂散没折算到真实载波上就跟 spec 对不上——"
+              f"要么在 {CONFIG_NAME} 里配 scale，要么确认这份就该按实测报")
+
+
 # ---------------------------------------------------------------- 出稿自查
 
 def selfcheck(path):
@@ -1894,7 +1998,12 @@ def main():
                          "把那一组写成 {\"keys\": [步骤键…], \"note\": \"…\"}。"
                          "★含真实模块名，放黄区本地/private，别提交。"
                          "不给＝所有关断步骤按文件顺序排成一组")
-    ap.add_argument("--spur-tol", type=float, default=2.0,
+    ap.add_argument("--config", default=None,
+                    help=f"配置文件（默认自动找 <根目录>/{CONFIG_NAME}）。"
+                         "里面可以放 scale / groups / modules / chips / "
+                         "op_vtune / ref_temp / spur_tol，命令行给了就以命令行为准。"
+                         "★含真实模块名，跟数据放一起，别提交")
+    ap.add_argument("--spur-tol", type=float, default=None,
                     help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
                          "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
                          "认不出清单就退回读模板那一格，并在控制台说原因")
@@ -1909,7 +2018,7 @@ def main():
     ap.add_argument("--no-current", action="store_true", help="不做电流页")
     ap.add_argument("--no-vco", action="store_true",
                     help="不做 VCO 两页（只出 PLL 温扫那两页）")
-    ap.add_argument("--ref-temp", type=float, default=25.0,
+    ap.add_argument("--ref-temp", type=float, default=None,
                     help="VCO 温漂的参考温度（默认 25）")
     ap.add_argument("--op-vtune", type=float, default=None,
                     help="VCO 工作点调谐电压 V（默认取 CT 扫钉住的那个值）")
@@ -1925,8 +2034,25 @@ def main():
     except ImportError:
         sys.exit("缺少 openpyxl，请先: pip install openpyxl")
 
-    want_mod = [m.strip() for m in args.modules.split(",") if m.strip()]
-    only = {c.strip() for c in args.chips.split(",") if c.strip()} or None
+    # ---- 配置：跟着数据走，命令行给了就以命令行为准 ----
+    cfg, cfg_path = load_config(root, args.config)
+    if args.config and not cfg:
+        sys.exit(f"找不到配置文件: {args.config}")
+    print(f"配置    : {cfg_path}" if cfg else
+          f"配置    : 没有（找过 {os.path.join(root, CONFIG_NAME)}）")
+    def pick_opt(cli, key, default=None):
+        if cli is not None:
+            return cli
+        return cfg[key] if key in cfg else default
+
+    ref_temp = float(pick_opt(args.ref_temp, "ref_temp", 25.0))
+    spur_tol = float(pick_opt(args.spur_tol, "spur_tol", 2.0))
+    op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
+
+    want_mod = ([m.strip() for m in args.modules.split(",") if m.strip()]
+                or [str(m).strip() for m in (cfg.get("modules") or [])])
+    only = ({c.strip() for c in args.chips.split(",") if c.strip()}
+            or {str(c).strip() for c in (cfg.get("chips") or [])} or None)
     picked, dropped, unknown, loose = discover(root, only, set(want_mod) or None)
     if not picked:
         sys.exit(f"{root} 下没找到能认出来的 .xlsx —— 文件名要长成 "
@@ -1965,12 +2091,16 @@ def main():
     # ---- 读 PLL 温扫 ----
     tables, failed, notes, warn_seen, vcharts = [], [], {}, {}, []
     excl_all = []
-    scale_rules = parse_scale(args.scale)
+    scale_rules = parse_scale(args.scale) or scale_from_cfg(cfg.get("scale"))
     sinfo = {}
     if scale_rules:
         print()
         print("折算规则: " + "，".join(
-"%s:%s ×%s" % (m, k, fmt_num(v, 4)) for m, k, v in scale_rules))
+"%s:%s ×%s" % (m, k, fmt_num(v, 4)) for m, k, v in scale_rules)
+              + ("" if args.scale else f"   ←{os.path.basename(cfg_path or CONFIG_NAME)}"))
+    else:
+        print()
+        print("折算规则: 没有（相噪/杂散/频率按实测频点报）")
     for mod in modules:
         books = grid.get(KIND_PLL, {}).get(mod, {})
         if not books:
@@ -1986,14 +2116,16 @@ def main():
                 sw = load_sweep(b.path, leg_col=args.leg_col,
                                 lock_pattern=args.lock_pattern,
                                 temp_col=args.temp_col, keep_original=False,
-                                spur_tol=args.spur_tol)
+                                spur_tol=spur_tol)
             except Exception as e:                    # noqa: B902
                 failed.append((b, f"{type(e).__name__}: {e}"))
                 print(f"  {chip}: 读失败 —— {e}")
                 continue
             data[chip] = sw
-            note_scale(sinfo, KIND_PLL, mod, chip,
-                       scale_book(sw, scale_of(scale_rules, mod, KIND_PLL)))
+            imp = implied_scale(sw, KIND_PLL)          # 必须在折算之前算
+            n_scale = scale_of(scale_rules, mod, KIND_PLL)
+            note_scale(sinfo, KIND_PLL, mod, chip, scale_book(sw, n_scale))
+            check_scale(imp, n_scale, chip, KIND_LABEL[KIND_PLL])
             n_meas = sum(1 for lg in sw.legs for x in lg.rows if x.kind != "lock")
             notes[id(b)] = f"{sw.n_rows}行×{sw.n_cols}列"
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
@@ -2038,20 +2170,22 @@ def main():
                 continue
             try:
                 sw = load_vco(b.path, temp_col=args.temp_col, keep_original=False,
-                              spur_tol=args.spur_tol)
+                              spur_tol=spur_tol)
             except Exception as e:                    # noqa: B902
                 failed.append((b, f"{type(e).__name__}: {e}"))
                 print(f"  {chip}: 读失败 —— {e}")
                 continue
             # ★ 折算必须在 vco_rows 之前：Fmin/Fmax/Kvco/温漂全是拿 F 现算的，
             #   先折算，它们自己就跟着 ×N 了。
-            note_scale(sinfo, KIND_VCO, mod, chip,
-                       scale_book(sw, scale_of(scale_rules, mod, KIND_VCO)))
+            imp = implied_scale(sw, KIND_VCO)          # 必须在折算之前算
+            n_scale = scale_of(scale_rules, mod, KIND_VCO)
+            note_scale(sinfo, KIND_VCO, mod, chip, scale_book(sw, n_scale))
+            check_scale(imp, n_scale, chip, KIND_LABEL[KIND_VCO])
             # 工作点用第一颗芯片的（CT 扫钉住的那个 Vtune）统一喂给全部芯片：
             # 否则各片的组名会变成「@ Vtune 0.4V」「@ Vtune 0.45V」，行对不齐
             if op is None:
-                op = args.op_vtune if args.op_vtune else op_vtune_of(sw)
-            rows, temps = vco_rows(sw, args.ref_temp, op)
+                op = op_vtune_cfg if op_vtune_cfg else op_vtune_of(sw)
+            rows, temps = vco_rows(sw, ref_temp, op)
             fv, kv, fc, fd = _vco_series(sw, temps)
             vrows[chip] = rows
             vdata[chip] = {"v": fv, "k": kv, "c": fc, "d": fd}
@@ -2098,9 +2232,13 @@ def main():
     ctables, ctemps = [], []
     if not args.no_current and grid.get(KIND_CUR):
         wanted = []
+        gj = None
         if args.groups:
             with open(args.groups, encoding="utf-8") as f:
                 gj = json.load(f)
+        elif cfg.get("groups"):
+            gj = {"groups": cfg["groups"]}
+        if gj is not None:
             # 一组可以直接给键的列表，也可以给 {"keys": [...], "note": "…"}——
             # 后者用来带一句这组特有的话（比如"两个模块共用，相加别算两遍"）。
             # 这类话**只能从数据侧进来**：工具里一个真实模块名都不许写死。
@@ -2112,7 +2250,7 @@ def main():
                 else:
                     wanted.append((g, list(spec), ""))
             print()
-            print(f"分组清单: {args.groups} —— "
+            print(f"分组清单: {args.groups or cfg_path} —— "
                   + "，".join(f"{g} {len(ks)} 行" for g, ks, _n in wanted))
         cdata = {}
         print()
