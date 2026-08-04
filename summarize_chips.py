@@ -876,6 +876,11 @@ VCO_DROP = {
     "Kvco min",
     "Kvco max",
 }
+# ★★ 2026-08-04 评审意见：Fmin/Fmax 改回**通行定义**＝Vtune 钉在 CT 扫那个电压上、
+#   把电容阵列扫一遍的两端（口径改在 build_conclusion 里，单簿脚本跟着一起变）。
+#   随之：`Frequency Range` 整组没了（它的三行都挪进 CT Band）、
+#   `CT Band Coverage` 删了（新口径下跟 Tuning Range 是同一个数）、
+#   Kvco 组前面多两行实测端点 `F(Vtune=最低/最高)`（Kvco average 的原料，可核）。
 # 判定方向的补丁：build_conclusion 里 Kvco 那几行 dir 是空的（单簿页只作对照），
 # 跨芯片表要判定就得写明方向。Kvco 的 spec 通常给一个范围：
 # 太小则环路带宽不够/锁不住，太大则杂散与噪声恶化。
@@ -888,11 +893,6 @@ VCO_NOTE_ADD = {}      # 解释性的尾巴全去掉了，备注只留算式
 #   "两项都在上面的实测端点行里，可以直接核"）——评审知道 Tuning Range 是什么，
 #   也不用我告诉他去哪儿核；那些话跟表头里的"（各片最小）"是同一类。
 VCO_NOTE_SET = {
-    "Kvco average": "［F(Vtune=最高) − F(Vtune=最低)］÷ Vtune 扫的跨度",
-    "Fmin": "CT 扫最低频 −［F(Vtune=0.4V) − F(Vtune=最低)］",
-    "Fmax": "CT 扫最高频 +［F(Vtune=最高) − F(Vtune=0.4V)］",
-    "Tuning Range": "Fmax − Fmin",
-    "CT Band Coverage": "CT 扫最高频 − CT 扫最低频",
     # 纯出处（"原表 Temperature 列"）不进正表：那是给我自己对数用的
     "Temperature": "",
 }
@@ -919,57 +919,8 @@ def vco_rows(sw, ref_temp, op_vtune):
         out.append({"cat": d["cat"], "item": d["item"], "unit": d["unit"],
                     "dir": VCO_LIMIT_FIX.get(d["item"], d["dir"]),
                     "kind": d["kind"], "vals": vals, "note": note})
-    # 原料行**各自插进自己那个组**的最前面（先摆实测端点、再摆拿它们算出来的数）。
-    # 整块插在一处会让 Frequency Range / CT Band 两个组头各出现两次。
-    eps = endpoint_rows(sw)
-    for ep in reversed(eps):
-        i = next((k for k, x in enumerate(out) if x["cat"] == ep["cat"]), len(out))
-        out.insert(i, ep)
-    out = _kvco_average(out, eps, sw)
     out = _drift_at_op(out, ref_temp)
     return out, temps
-
-
-def _kvco_average(out, eps, sw):
-    """给 Kvco 组补一行 `Kvco average`＝端点算的全程平均斜率。
-
-    ★ 它是 Kvco 那一组里**唯一能用表上的格子核出来**的数：
-      ［F(Vtune=最高) − F(Vtune=最低)］÷ Vtune 扫的跨度，两项都在实测端点行里。
-      旁边的 `Kvco @工作点` 是工作点那一段的局部斜率——环路带宽用的是它，
-      但它推不出来，靠 VCO压控 页那张 Kvco-vs-Vtune 图作证。
-      两个都放：一个可核、一个有工程含义，缺哪个都不完整。
-    ★ 曲线弯的时候这两个数会差很多（真数据里逐区间斜率有 7 倍散布），
-      那不是矛盾——正是"一个数说不清 Kvco"的证据，图才是主证据。
-    """
-    lo = next((e for e in eps if e["item"] == "F(Vtune=最低)"), None)
-    hi = next((e for e in eps if e["item"] == "F(Vtune=最高)"), None)
-    if lo is None or hi is None:
-        return out
-    span = _vtune_span(sw)
-    if not span:
-        return out
-    vals = {t: (hi["vals"][t] - lo["vals"][t]) / span
-            for t in hi["vals"] if t in lo["vals"]}
-    if not vals:
-        return out
-    row = {"cat": "Kvco", "item": "Kvco average", "unit": "MHz/V",
-           "dir": VCO_LIMIT_FIX.get("Kvco average", ""), "kind": "result",
-           "vals": {t: abs(v) for t, v in vals.items()},
-           "note": VCO_NOTE_SET["Kvco average"]}
-    i = next((k for k, x in enumerate(out) if x["cat"] == "Kvco"), len(out))
-    out.insert(i, row)
-    return out
-
-
-def _vtune_span(sw):
-    from summarize_vco_sweep import group_series
-    xs = set()
-    for kind, groups in sw.by_kind:
-        if kind != "vtune":
-            continue
-        for g in groups:
-            xs |= set(group_series(g, sw.freq_item))
-    return (max(xs) - min(xs)) if len(xs) >= 2 else None
 
 
 def _drift_at_op(out, ref_temp):
@@ -1026,56 +977,6 @@ def flat_vtune_temps(sw, ratio=0.1):
     if not med:
         return []
     return [(t, sp, med) for t, sp in sorted(spans.items()) if sp < ratio * med]
-
-
-def endpoint_rows(sw):
-    """两条扫描的四个端点频率。
-
-    ★ Fmin / Fmax / Tuning Range / CT Band Coverage 全是拿这四个数算出来的。
-      只给算出来的结果、不给原料，看的人没法核对，只能选择信或者不信——
-      用户原话「缺少了计算他们的中间值，我有些没安全感」。摆出来之后
-      备注里的算式每一项都能在表上找到对应的行。
-      这四行是**原料**不是被考核项，所以走条件行（米色），不带汇总和判定。
-    """
-    from summarize_vco_sweep import group_series
-    out = []
-    for kind, cat, lo_hi, note_fmt in (
-            ("vtune", "Frequency Range",
-             ("F(Vtune=最低)", "F(Vtune=最高)"),
-             "Vtune 扫的{}设定点（%s V，CT 码固定不动）"),
-            ("ct", "CT Band",
-             ("CT 扫最低频", "CT 扫最高频"),
-             "CT 扫{}的那一端（码 %s，Vtune 钉在 CT 扫用的那个值）")):
-        per_t = {}
-        for k, groups in sw.by_kind:
-            if k != kind:
-                continue
-            for g in groups:
-                if g.temp is None:
-                    continue
-                ser = group_series(g, sw.freq_item)
-                if ser:
-                    per_t[g.temp] = ser
-        if not per_t:
-            continue
-        xs = sorted({x for ser in per_t.values() for x in ser})
-        if len(xs) < 2:
-            continue
-        # CT 那条按"频率最低/最高"排（码号跟频率的方向不一定一致），Vtune 按设定值排
-        if kind == "ct":
-            f_of = {x: median([ser[x] for ser in per_t.values() if x in ser])
-                    for x in (xs[0], xs[-1])}
-            ends = sorted((xs[0], xs[-1]), key=lambda x: f_of[x])
-        else:
-            ends = [xs[0], xs[-1]]
-        for j, x in enumerate(ends):
-            out.append({
-                "cat": cat, "item": lo_hi[j], "unit": "MHz", "dir": "",
-                "kind": "cond",
-                "vals": {t: ser[x] for t, ser in per_t.items() if x in ser},
-                "note": note_fmt.format("最低" if j == 0 else "最高") % fmt_num(x, 4),
-            })
-    return out
 
 
 def coarse_temps(sw):
@@ -1949,7 +1850,7 @@ def main():
                       f"全程只变了 {fmt_num(sp, 4)} MHz，其他温度是 {fmt_num(med, 1)} MHz。"
                       f"这个温度多半没真正切到开环（环路还锁着／DAC 没驱动／testmux "
                       f"没切），它的 Kvco 会算出接近 0 的值——那不是低温增益低。"
-                      f"对照表上 F(Vtune=最低) 与 F(Vtune=最高) 这两行就能确认")
+                      f"对照 Kvco 组里 F(Vtune=…) 那两行就能确认")
             print(f"     排除 {len(sw.excluded)} 行:")
             print_excluded(sw.excluded)
             excl_all.append((chip, mod, KIND_LABEL[KIND_VCO], sw.excluded))

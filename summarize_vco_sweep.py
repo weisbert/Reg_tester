@@ -886,7 +886,7 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
             fml=lambda t, R: vref(fvco_ref) if fvco_ref else None,
             kind="cond", rid="fvco", note="原表 fVCO_MHz 列")
 
-    # ---- 频率范围 / 调谐范围 / 目标余量 ----
+    # ---- CT Band：Fmin / Fmax / 调谐范围 / 目标余量 ----
     # 备注里写清每个数的算法：报告上出现「估计」这种字眼，评审第一句就是
     # 「这怎么算出来的」。把算式写在旁边，就没有这一问。
     _t0 = next((t for t in temps if t in vg), None)
@@ -896,63 +896,56 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
     _V = lambda x: ("%sV" % fmt_num(x)) if x is not None else "?"
 
     def fr(t, side):
-        """Fmin / Fmax：CT 扫的端点，再用 Vtune 相对 CT 扫那个电压还能拉的量补上。
+        """Fmin / Fmax ＝ Vtune 钉住不动、把电容阵列扫一遍的两端。
 
-        CT 扫是在固定 Vtune 上做的，Vtune 扫是在固定 CT 码上做的，
-        所以两个角点没有直接测；这里就是把两段量拼起来，算式写在备注里。
+        ★★ 2026-08-04 改口径（评审意见）。原来是「CT 扫端点 ± Vtune 扫在那个
+          电压之外还能拉的那一截」，拼出来的是**四个角点**里的两个。约定俗成的
+          Fmin/Fmax 就是**固定 Vtune 扫 CT** 得到的两端——补出来的角点是另一个量，
+          按自己的定义报出去，跟别人（仿真、spec、别的芯片）的数根本对不上。
+          新口径下这两个数是直接测出来的，不用拼，也就不再需要"原料行"来兜底。
         """
-        sv, sc = ser("v", t), ser("c", t)
-        if len(sv) < 2 or len(sc) < 2:
+        sc = ser("c", t)
+        if len(sc) < 2:
             return None
-        xn = near_x("v", t, v_ct(t))
-        if xn is None:
-            return None
-        f0 = sv[xn]
-        return (min(sc.values()) - (f0 - min(sv.values()))) if side == "low" \
-            else (max(sc.values()) + (max(sv.values()) - f0))
+        return min(sc.values()) if side == "low" else max(sc.values())
 
     def fr_f(t, side):
-        rv, rc = rng("v", t, freq_item), rng("c", t, freq_item)
-        c0 = cell("v", t, freq_item, near_x("v", t, v_ct(t)))
-        if not (rv and rc and c0):
+        rc = rng("c", t, freq_item)
+        if not rc:
             return None
-        return ("=MIN(%s)-(%s-MIN(%s))" % (rc, c0, rv)) if side == "low" \
-            else ("=MAX(%s)+(MAX(%s)-%s)" % (rc, rv, c0))
+        return ("=MIN(%s)" % rc) if side == "low" else ("=MAX(%s)" % rc)
 
-    add("Frequency Range", "Fmin", "MHz", "≤", lambda t: fr(t, "low"),
+    add("CT Band", "Fmin", "MHz", "≤", lambda t: fr(t, "low"),
         fml=lambda t, R: fr_f(t, "low"), rid="fmin",
-        note="CT 扫最低频 − [F(%s) − F(%s)]" % (_V(_vc), _V(_vmin)))
-    add("Frequency Range", "Fmax", "MHz", "≥", lambda t: fr(t, "high"),
+        note="Vtune 钉在 %s 扫 CT，频率最低的那个码" % _V(_vc))
+    add("CT Band", "Fmax", "MHz", "≥", lambda t: fr(t, "high"),
         fml=lambda t, R: fr_f(t, "high"), rid="fmax",
-        note="CT 扫最高频 + [F(%s) − F(%s)]" % (_V(_vmax), _V(_vc)))
-    add("Frequency Range", "Tuning Range", "MHz", "≥",
+        note="Vtune 钉在 %s 扫 CT，频率最高的那个码" % _V(_vc))
+    add("CT Band", "Tuning Range", "MHz", "≥",
         lambda t: (fr(t, "high") - fr(t, "low"))
         if (fr(t, "low") is not None and fr(t, "high") is not None) else None,
         fml=lambda t, R: f_guard("%s-%s" % (R("fmax", t), R("fmin", t)),
                                  R("fmin", t), R("fmax", t)),
         note="Fmax − Fmin")
     if fvco is not None:
-        add("Frequency Range", "Margin to fVCO (low)", "MHz", "≥",
+        add("CT Band", "Margin to fVCO (low)", "MHz", "≥",
             lambda t: (fvco - fr(t, "low")) if fr(t, "low") is not None else None,
             fml=lambda t, R: f_guard("%s-%s" % (R("fvco", t), R("fmin", t)),
                                      R("fmin", t), R("fvco", t)),
             note="目标 fVCO − Fmin")
-        add("Frequency Range", "Margin to fVCO (high)", "MHz", "≥",
+        add("CT Band", "Margin to fVCO (high)", "MHz", "≥",
             lambda t: (fr(t, "high") - fvco) if fr(t, "high") is not None else None,
             fml=lambda t, R: f_guard("%s-%s" % (R("fmax", t), R("fvco", t)),
                                      R("fmax", t), R("fvco", t)),
             note="Fmax − 目标 fVCO")
 
     # ---- 频段搭接：有没有锁不上的盲区 ----
+    # ★ 原来这里还有一行 `CT Band Coverage`＝CT 扫最高频 − 最低频。新口径下
+    #   它跟上面的 `Tuning Range` 是**同一个数**，删掉，别让同一件事出现两遍。
     add("CT Band", "Sub-band Tuning Range", "MHz", "≥", dfv,
         fml=lambda t, R: f_span([rng("v", t, freq_item)]) if rng("v", t, freq_item) else None,
         rid="dfv",
         note="F(%s) − F(%s)，CT 码固定不动" % (_V(_vmax), _V(_vmin)))
-    add("CT Band", "CT Band Coverage", "MHz", "≥",
-        lambda t: (max(ser("c", t).values()) - min(ser("c", t).values()))
-        if len(ser("c", t)) >= 2 else None,
-        fml=lambda t, R: f_span([rng("c", t, freq_item)]) if rng("c", t, freq_item) else None,
-        note="CT 扫最高频 − 最低频，Vtune 钉在 %s" % _V(_vc))
     add("CT Band", "CT Band Step (avg)", "MHz/code", "",
         lambda t: (sum(steps("c", t)) / len(steps("c", t))) if steps("c", t) else None,
         fml=lambda t, R: ('=IF(COUNT(%s)=0,"",ABS(AVERAGE(%s)))'
@@ -991,6 +984,55 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
             note="|Freq Drift| ÷ CT Band Step 平均（%s℃）" % rt)
 
     # ---- 压控增益 ----
+    # ★ 先摆两个**实测端点**：CT 码钉住不动，Vtune 扫到最低 / 最高时的频率。
+    #   Kvco average 就是拿这两格算的（差 ÷ Vtune 跨度），摆出来评审能自己核。
+    #   它们是原料不是被考核项 → 走条件行（米色），不带汇总和判定。
+    def f_end(t, which):
+        s = ser("v", t)
+        if len(s) < 2:
+            return None
+        xs = sorted(s)
+        return s[xs[0] if which == "lo" else xs[-1]]
+
+    def f_end_f(t, which):
+        s = ser("v", t)
+        if len(s) < 2:
+            return None
+        xs = sorted(s)
+        c = cell("v", t, freq_item, xs[0] if which == "lo" else xs[-1])
+        return ("=" + c) if c else None
+
+    for _w, _x in (("lo", _vmin), ("hi", _vmax)):
+        add("Kvco", "F(Vtune=%s)" % _V(_x), "MHz", "",
+            (lambda t, w=_w: f_end(t, w)),
+            fml=(lambda t, R, w=_w: f_end_f(t, w)), kind="cond",
+            rid="fv_%s" % _w,
+            note="CT 码固定不动，Vtune 扫到%s那一点的频率" % (
+                "最低" if _w == "lo" else "最高"))
+
+    # Kvco average：Kvco 这一组里**唯一能用表上的格子核出来**的数。
+    # 旁边的 `Kvco @工作点` 是工作点那一段的局部斜率——环路带宽用的是它，
+    # 但它推不出来，靠 Kvco-vs-Vtune 那张图作证。两个都放。
+    def kv_avg(t):
+        lo, hi = f_end(t, "lo"), f_end(t, "hi")
+        s = sorted(ser("v", t))
+        if lo is None or hi is None or len(s) < 2 or s[-1] == s[0]:
+            return None
+        return abs((hi - lo) / (s[-1] - s[0]))
+
+    def kv_avg_f(t, R):
+        s = sorted(ser("v", t))
+        if len(s) < 2:
+            return None
+        xa, xb = xcell("v", t, freq_item, s[0]), xcell("v", t, freq_item, s[-1])
+        fa, fb = f_end_f(t, "lo"), f_end_f(t, "hi")
+        if not (xa and xb and fa and fb):
+            return None
+        return "=ABS((%s-%s)/(%s-%s))" % (fb[1:], fa[1:], xb, xa)
+
+    add("Kvco", "Kvco average", "MHz/V", "range", kv_avg, fml=kv_avg_f,
+        note="［F(Vtune=%s) − F(Vtune=%s)］÷ Vtune 扫的跨度" % (_V(_vmax), _V(_vmin)))
+
     def kv_work(t):
         g = vg.get(t)
         ss = slopes(g, freq_item) if (g and freq_item) else []
@@ -2284,8 +2326,9 @@ def main():
     print("\n怎么用（不写进簿子，只在这里说）：")
     print("  · 结论页 Spec 的 Min / Max 两列自己填；Limit 列提示该填哪边"
           "（≥ 填 Min、≤ 填 Max，另一边留空）。填完判定列自动出 PASS/FAIL 并标红。")
-    print("  · Fmin/Fmax 是把 CT 扫和 Vtune 扫两段拼出来的（算式写在结论页备注列里）；"
-          "两个角点没有直接测过，前提是 Kvco 与 CT 码基本无关。要精确值得做二维扫描。")
+    print("  · Fmin/Fmax ＝ Vtune 钉在 CT 扫那个电压上、把电容阵列扫一遍的两端"
+          "（通行定义，直接测出来的，不是拼的）。Vtune 再往两头拉还能到哪儿，"
+          "看 Kvco 组的 F(Vtune=…) 两行。")
     print("  · 同一组同一横轴值测了两次的取后者（例如 CT 先粗扫再回头细扫）。")
     if not args.notes:
         print("  · 排除的行与探查告警见上面的控制台输出；要在簿子里留档加 --notes。")
