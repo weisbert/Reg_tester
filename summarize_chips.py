@@ -1111,11 +1111,11 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
                 if key not in seen:
                     seen.add(key)
                     order.append((d["cat"], d["item"], d["unit"], d["dir"],
-                              d["kind"], d.get("nd")))
+                              d["kind"], d.get("nd"), d.get("strong", False)))
         j0 = None
         cur_cat = None
         band0 = None
-        for cat, item, unit, dr, kind, nd_ in order:
+        for cat, item, unit, dr, kind, nd_, strong in order:
             if cat != cur_cat:
                 if band0 is not None and r - band0 > 4:
                     for rr in range(band0 + 3, r - 1, 4):
@@ -1130,7 +1130,7 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
                 j0 = r
             nd = nd_ or (3 if unit == "MHz" else 2)
             body = st["f_res"] if is_res else st["f_group"]
-            put(ws, r, C_ITEM, item, st, body, align="left")
+            put(ws, r, C_ITEM, item, st, body, align="left", bold=strong)
             put(ws, r, C_UNIT, unit, st, body, size=9)
             put(ws, r, C_LIMIT, dr if is_res else None, st,
                 st["f_in"] if is_res else body, size=9)
@@ -1147,7 +1147,7 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
                 for j, t in enumerate(vtemps):
                     v = vals.get(t)
                     disp = fmt_num(v, nd) if isinstance(v, (int, float)) else v
-                    cell = put(ws, r, vchip(k) + j, disp, st, body,
+                    cell = put(ws, r, vchip(k) + j, disp, st, body, bold=strong,
                                size=10 if isinstance(disp, (int, float)) else 9)
                     if isinstance(disp, (int, float)):
                         cell.number_format = "0." + "0" * nd
@@ -1554,7 +1554,10 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
 def current_rows(cur, groups, chip_note=""):
     """一份电流簿 → 页上的行（跟 VCO 页同形：cat/item/unit/dir/kind/vals/note）。
 
-    groups = [(组名, [键1, 键2, ...])]；给空就把所有关断步骤按文件顺序排成一组。
+    groups = [(组名, [键1, 键2, ...], 组备注)]；给空就把所有关断步骤按文件顺序排成一组。
+    每组末尾自动补一行**合计**＝本组各行相加（一组只有一行时不补，省得同一个数
+    写两遍）。合计是这页真正要看的东西——单个模块的 ΔI 逼近重复性下限，
+    几个模块加起来才稳。
     """
     # 每个键在各温度下的 ΔI
     dmap, order, modes = {}, [], {}
@@ -1565,7 +1568,8 @@ def current_rows(cur, groups, chip_note=""):
             if k not in order:
                 order.append(k)
     if not groups:
-        groups = [("全部关断步骤", order)]
+        groups = [("全部关断步骤", order, "")]
+    groups = [(g[0], g[1], g[2] if len(g) > 2 else "") for g in groups]
 
     # 这趟测试自己的重复性 = |恢复后复测 − 全开基线|，取各温度里最大的那个
     rep = 0.0
@@ -1592,7 +1596,8 @@ def current_rows(cur, groups, chip_note=""):
                 "vals": {t: len(cur.runs[t]["steps"]) for t in cur.temps},
                 "note": "这一趟一共关了多少步；本表只列清单里的", "nd": 0})
 
-    for gname, keys in groups:
+    for gname, keys, gnote in groups:
+        n_in = 0
         for k in keys:
             vals = dmap.get(k, {})
             note = "关它之前 − 关它之后的总电流"
@@ -1605,6 +1610,27 @@ def current_rows(cur, groups, chip_note=""):
                         f"只能当上限看；" + note)
             out.append({"cat": gname, "item": k, "unit": "mA", "dir": "≤",
                         "kind": "result", "vals": vals, "note": note, "nd": 4})
+            if k in dmap:
+                n_in += 1
+        # ---- 组合计 ----
+        # ★ 一组只有一行就不补：合计跟那一行一模一样，同一个数写两遍，
+        #   正是「表里放值、一行只有一种统计量」那条规矩要挡的东西。
+        if n_in < 2:
+            continue
+        sums = {}
+        for t in cur.temps:
+            got = [dmap[k][t] for k in keys
+                   if k in dmap and isinstance(dmap[k].get(t), (int, float))]
+            if got:
+                sums[t] = sum(got)
+        if not sums:
+            continue
+        note = "本组各行相加"
+        if gnote:
+            note = f"{note}；{gnote}"
+        out.append({"cat": gname, "item": "合计", "unit": "mA", "dir": "≤",
+                    "kind": "result", "vals": sums, "note": note, "nd": 4,
+                    "strong": True})
     return out
 
 
@@ -1700,6 +1726,9 @@ def main():
                          "（点 ＋ 展开，数一个没少）；芯片多了用")
     ap.add_argument("--groups", default=None,
                     help="电流页的分组清单 JSON（{\"groups\": {\"组名\": [步骤键…]}}）。"
+                         "每组末尾自动出一行合计。要给某组加一句备注（"
+                         "比如两个模块共用同一个器件、相加时别算两遍），"
+                         "把那一组写成 {\"keys\": [步骤键…], \"note\": \"…\"}。"
                          "★含真实模块名，放黄区本地/private，别提交。"
                          "不给＝所有关断步骤按文件顺序排成一组")
     ap.add_argument("--cur-col", default=None, help="电流值列（默认自动找）")
@@ -1881,10 +1910,19 @@ def main():
         if args.groups:
             with open(args.groups, encoding="utf-8") as f:
                 gj = json.load(f)
-            wanted = [(g, list(ks)) for g, ks in (gj.get("groups") or gj).items()]
+            # 一组可以直接给键的列表，也可以给 {"keys": [...], "note": "…"}——
+            # 后者用来带一句这组特有的话（比如"两个模块共用，相加别算两遍"）。
+            # 这类话**只能从数据侧进来**：工具里一个真实模块名都不许写死。
+            wanted = []
+            for g, spec in (gj.get("groups") or gj).items():
+                if isinstance(spec, dict):
+                    wanted.append((g, list(spec.get("keys") or []),
+                                   txt(spec.get("note") or "")))
+                else:
+                    wanted.append((g, list(spec), ""))
             print()
             print(f"分组清单: {args.groups} —— "
-                  + "，".join(f"{g} {len(ks)} 行" for g, ks in wanted))
+                  + "，".join(f"{g} {len(ks)} 行" for g, ks, _n in wanted))
         cdata = {}
         print()
         print("=== 逐级关断电流 ===")
@@ -1947,10 +1985,10 @@ def main():
             # 电流簿一份就同时装着两个 PLL 的步骤，所以这里的"组"来自清单、
             # 不是来自文件名的模块
             miss = {}
-            for gname, keys in (wanted or [("全部关断步骤", None)]):
+            for gname, keys, gnote in (wanted or [("全部关断步骤", None, "")]):
                 rowsg = {}
                 for chip, cur in cdata.items():
-                    rows_ = current_rows(cur, [(gname, keys)] if keys else [])
+                    rows_ = current_rows(cur, [(gname, keys, gnote)] if keys else [])
                     rowsg[chip] = rows_
                     if keys:
                         have = {r["item"] for r in rows_ if r["kind"] == "result"
