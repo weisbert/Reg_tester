@@ -113,7 +113,13 @@ class Book:
 
 
 def discover(root, only_chips=None, only_modules=None):
-    """扫目录 -> (选中的, 同类被跳过的, 认不出来的, 根目录下散放没被扫的)。"""
+    """扫目录 -> (选中的, 同类被跳过的, 认不出来的, 散放的, 被 --chips/--modules 滤掉的)。
+
+    ★ 过滤掉的也要报出来。模块名是从文件名前缀认出来的，同一个模块的几份文件
+      前缀不一致很常见（`<模块>PLL_...` 但电流那份写成 `<芯片系列>_<模块>_CURRENT_...`），
+      这时候一给 --modules / modules 配置，那份就**安静地消失**——
+      报表少一页，控制台一个字都没有。
+    """
     dirs = sorted((d for d in os.listdir(root)
                    if os.path.isdir(os.path.join(root, d))), key=natkey)
     loose = []
@@ -126,10 +132,11 @@ def discover(root, only_chips=None, only_modules=None):
         loose = [f for f in sorted(os.listdir(root))
                  if os.path.isfile(os.path.join(root, f))
                  and f.lower().endswith((".xlsx", ".xlsm")) and not SKIP_RE.search(f)]
-    picked, dropped, unknown = {}, [], []
+    picked, dropped, unknown, filtered = {}, [], [], []
     for d in dirs:
         chip = d or os.path.basename(os.path.abspath(root))
         if only_chips and chip not in only_chips:
+            filtered.append((chip, "*", f"芯片 {chip} 不在指定的芯片清单里"))
             continue
         sub = os.path.join(root, d) if d else root
         for f in sorted(os.listdir(sub)):
@@ -140,6 +147,7 @@ def discover(root, only_chips=None, only_modules=None):
                 unknown.append((chip, f, "模块" if kind is not None else "类型"))
                 continue
             if only_modules and mod not in only_modules:
+                filtered.append((chip, f, f"模块认成 {mod!r}，不在指定的模块清单里"))
                 continue
             b = Book(chip, mod, kind, os.path.join(sub, f))
             key = (chip, mod, kind)
@@ -151,7 +159,7 @@ def discover(root, only_chips=None, only_modules=None):
                 dropped.append((old, b))          # 旧的那份让位
             else:
                 dropped.append((b, old))
-    return picked, dropped, unknown, loose
+    return picked, dropped, unknown, loose, filtered
 
 
 def print_excluded(excluded, indent="     ", cap=14):
@@ -2053,7 +2061,8 @@ def main():
                 or [str(m).strip() for m in (cfg.get("modules") or [])])
     only = ({c.strip() for c in args.chips.split(",") if c.strip()}
             or {str(c).strip() for c in (cfg.get("chips") or [])} or None)
-    picked, dropped, unknown, loose = discover(root, only, set(want_mod) or None)
+    picked, dropped, unknown, loose, filtered = discover(root, only,
+                                                        set(want_mod) or None)
     if not picked:
         sys.exit(f"{root} 下没找到能认出来的 .xlsx —— 文件名要长成 "
                  f"`<模块><类型>_...`（类型＝ PLL / VCO / Current）")
@@ -2080,6 +2089,8 @@ def main():
         print(f"  ↷ 跳过 {b.chip}/{b.name}（同类里有更新的 {w.ts or w.name}）")
     for chip, f, why in unknown:
         print(f"  ? 认不出{why}，没读: {chip}/{f}")
+    for chip, f, why in filtered:
+        print(f"  ⚠ 被过滤掉没读: {chip}/{f} —— {why}")
     if loose:
         print(f"  ⚠ 根目录下还散放着 {len(loose)} 个 .xlsx **没有被扫**"
               f"（有芯片目录时只扫子目录）——如果它们也是要算的芯片，"
