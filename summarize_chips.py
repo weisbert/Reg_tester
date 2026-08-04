@@ -333,6 +333,34 @@ def _chip_axes(tlabels):
     return [(t or "—") for t in tlabels]
 
 
+def fold_temp_cols(ws, col_of, n_chips, nax, keep=0):
+    """--slim：每片只留常温那一列，其余温度列收进 Excel 大纲（默认折起）。
+
+    ★ 为什么是"折"不是"删"：汇总列的 Min/Max 就是这些格子里的值。真删掉，
+      汇总那几个数在表上就没了出处（"导出来的数必须能用表上的格子推出来"），
+      脚本自查第①条会当场 exit 1。折起来一个数都没少，点 ＋ 就能核。
+      6 片时实测区 24 列 → 12 列，一屏看得完。
+    ★ keep 不写死 0：PLL 页的第一列就是常温，VCO 页的三列是升序温度
+      （−40 在最左），留错列的话折完剩下的是低温那列。
+    """
+    from openpyxl.worksheet.properties import Outline
+    # summaryRight=False ＝ 汇总列在明细列**左边**，＋/− 按钮就画在留下的那列头上；
+    # 默认的 True 会把按钮画到右边的灰竖栏上（点得到，但看着像点在缝里）
+    ws.sheet_properties.outlinePr = Outline(summaryBelow=True, summaryRight=False)
+    n = 0
+    for k in range(n_chips):
+        c0 = col_of(k)
+        for j in range(nax):
+            if j == keep:
+                continue
+            d = ws.column_dimensions[_cl(c0 + j)]
+            d.outlineLevel = 1
+            d.hidden = True
+            n += 1
+        ws.column_dimensions[_cl(c0 + keep)].collapsed = True
+    return n
+
+
 def _header(ws, r0, chips, st, title, n_chips, tlabels):
     """三行表头：大标题 / 组名 / 轴名。"""
     last = note_col(n_chips)
@@ -374,10 +402,14 @@ def _header(ws, r0, chips, st, title, n_chips, tlabels):
     return ar + 1
 
 
-def _caption(ws, r, st, n_chips):
+def _caption(ws, r, st, n_chips, slim=False):
     """口径说明：这几个数是怎么取的。评审第一句必问，写在表头下面最省事。"""
     txt_ = ("每片三列＝该温度的实测值。汇总列 Min / Max 就是这些格子里的最小 / 最大，"
             "Typ 取各片常温值。填 Spec 的 Min / Max，判定列自动出 PASS / FAIL。")
+    # 折起来的列不说一句，看的人会以为只测了常温——那比多一句话糟得多。
+    # 这不是使用说明，是"你现在看到的是全部数据的哪一部分"，属于口径。
+    if slim:
+        txt_ += "　每片的低温 / 高温列已折起（点表头上方的 ＋ 展开），汇总列取的仍是那三列。"
     c = put(ws, r, C_ITEM, txt_, st, st["f_group"], align="left", size=9)
     ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r,
                    end_column=note_col(n_chips))
@@ -577,7 +609,7 @@ def _limit_dropdown(ws, r0, r1):
     dv.add(f"{_cl(C_LIMIT)}{r0}:{_cl(C_LIMIT)}{r1}")
 
 
-def write_summary(wb, tables, chips, st):
+def write_summary(wb, tables, chips, st, slim=False):
     """tables = [(模块名, {芯片: Sweep}), ...]，一个模块一张表，从上到下排。"""
     ws = wb.create_sheet("PLL_Summary")
     n = len(chips)
@@ -605,7 +637,7 @@ def write_summary(wb, tables, chips, st):
         tpick, tlabels = pick_temps(sweeps)
         t0 = r                                   # 这张表的第一行（大标题）
         r = _header(ws, r, chips, st, f"{mod} PLL 性能汇总", n, tlabels)
-        r = _caption(ws, r, st, n)
+        r = _caption(ws, r, st, n, slim=slim)
         r = _cond_rows(ws, r, chips, data, st, n)
         j0 = r
         for band, rows in items:
@@ -630,6 +662,9 @@ def write_summary(wb, tables, chips, st):
     #   模块的数写着上面那个模块的名字——比丢掉表头更容易看错。表本身只 20 来行，
     #   在一张表里滚动表头不会跑掉。
     ws.freeze_panes = f"{_cl(C_CHIP0)}1"
+    if slim:
+        # tpick = [常温, 最低温, 最高温]，留第 0 列
+        fold_temp_cols(ws, chip_col, n, CHIP_AX, keep=0)
     return ws
 
 
@@ -1076,7 +1111,7 @@ def op_vtune_of(sw):
     return None
 
 
-def write_vco_summary(wb, vtables, chips, st, vtemps):
+def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
     """VCO 汇总表：每颗芯片的组内轴＝三个温度（不是 Min/Typ/Max）。
 
     ★ 为什么这里用温度当轴、PLL 那页用极值当轴：VCO 这些量本来就是"一个温度
@@ -1159,6 +1194,8 @@ def write_vco_summary(wb, vtables, chips, st, vtemps):
                "判定只看 Spec 的 Min / Max 两头。　"
                "CT 全码扫只在常温做（条件行「CT Code Range (points)」括号里就是测点数），"
                "所以按相邻码算的步长只有常温有。")
+        if slim:
+            cap += "　每片只展开了常温列，其余温度列已折起（点表头上方的 ＋ 看）。"
         c = put(ws, r, C_ITEM, cap, st, st["f_group"], align="left", size=9)
         ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
         c.alignment = _align("left", wrap=True)
@@ -1260,6 +1297,10 @@ def write_vco_summary(wb, vtables, chips, st, vtemps):
         _pass_fail_cf(ws, _cl(C_JUDGE), a, b, st)
         _over_spec_cf(ws, a, b, st)
     ws.freeze_panes = f"{_cl(C_CHIP0)}1"
+    if slim and vtemps:
+        # ★ 这里的列是**升序温度**，第 0 列是最低温。留常温＝留 _room_of 那一列，
+        #   照搬 PLL 页的 keep=0 会折得只剩 −40℃。
+        fold_temp_cols(ws, vchip, n, nax, keep=vtemps.index(_room_of(vtemps)))
     return ws
 
 
@@ -1586,6 +1627,9 @@ def main():
                     help="该列匹配这个正则的行 = 一次重锁（默认 _lock$）")
     ap.add_argument("--temp-col", default=None, help="温度列（默认自动找 Temperature）")
     ap.add_argument("--no-charts", action="store_true", help="图都不画，只出数据块")
+    ap.add_argument("--slim", action="store_true",
+                    help="两张汇总表每片只显示常温列，其余温度列折进 Excel 大纲"
+                         "（点 ＋ 展开，数一个没少）；芯片多了用")
     ap.add_argument("--no-vco", action="store_true",
                     help="不做 VCO 两页（只出 PLL 温扫那两页）")
     ap.add_argument("--ref-temp", type=float, default=25.0,
@@ -1763,10 +1807,10 @@ def main():
     wb.remove(wb.active)
     st = styles()
     if tables:
-        write_summary(wb, tables, chips, st)
+        write_summary(wb, tables, chips, st, slim=args.slim)
         write_journey(wb, tables, chips, st, no_charts=args.no_charts)
     if vtables:
-        write_vco_summary(wb, vtables, chips, st, vtemps)
+        write_vco_summary(wb, vtables, chips, st, vtemps, slim=args.slim)
         write_vco_charts(wb, vcharts, chips, st, vtemps, no_charts=args.no_charts)
     if not args.no_audit:
         write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all)
@@ -1782,6 +1826,14 @@ def main():
                                     if s.sheet_state == "visible"))
     print("  各汇总页的 Spec / 仿真 / Limit 列留空，填进 Spec Min/Max "
           "判定列自动出 PASS/FAIL 并上色。")
+    if args.slim:
+        print("  --slim: 两张汇总表每片只显示常温列，其余温度列已折起——"
+              "点表头上方的 ＋（或左上角的「2」）展开，数一个都没少。"
+              "温巡页 / VCO压控页的竖条不受影响。")
+    elif len(chips) >= 5:
+        print(f"  提示: {len(chips)} 颗芯片＝实测区 {len(chips) * CHIP_W} 列，"
+              f"横着容易数不清第几片。加 --slim 每片只显示常温列"
+              f"（其余折起来，点 ＋ 就能展开核对）。")
     fails, n_agg, n_f = selfcheck(out)
     print(f"  自查: {n_agg} 个汇总格子都能在同一行的格子里找到；"
           f"{n_f} 个判定公式没有留下缓存值"
