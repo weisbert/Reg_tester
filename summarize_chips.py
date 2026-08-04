@@ -1485,18 +1485,26 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
                 pts_ = [(y, x) for x, y in ser.get(t_lab, []) if x in pos]
                 if not pts_:
                     continue                    # 常温那条没点就顺延
-                for y, x in {min(pts_), max(pts_)}:
-                    want.setdefault(t_lab, []).append((pos[x], y))
+                lo_, hi_ = min(pts_), max(pts_)
+                want[t_lab] = [(pos[lo_[1]], False), (pos[hi_[1]], True)]
                 break
             for t, items in want.items():
                 sr_, color = built[t]
                 # 带系列名 + 染成本条线的颜色：三条线只有两个标签时，
                 # 不这么做就看不出这两个数是哪条线上的
-                _label_points(sr_, [i for i, _y in items], numfmt="0.##",
-                              pos={i: label_pos(y, bounds, xs[i], xs)
-                                   for i, y in items},
+                _label_points(sr_, [i for i, _m in items], numfmt="0.##",
+                              pos={i: label_pos(m) for i, m in items},
                               color=color, sername=True)
     apply_y(ch, bounds)
+    # ★ 横轴自己留边距：标注放在极值点的正上/正下，而极值点几乎总在横轴两端，
+    #   Excel 自动定的范围常常刚好卡在数据末端，标注就被右边框切掉半截。
+    if xs and len(xs) > 1 and max(xs) > min(xs):
+        xb = axis_bounds(list(xs), pad=0.12)
+        lo_x = 0.0 if (min(xs) >= 0 and xb[0] < 0) else xb[0]
+        # 数据非负就别把轴画到负数去：Vtune / CT 码没有负的，轴上冒出 "-0.2 V"
+        # 一眼就假。左边那个标注是往**下**放的，不吃左边距，夹掉不影响它。
+        ch.x_axis.scaling.min, ch.x_axis.scaling.max = lo_x, xb[1]
+        ch.x_axis.majorUnit = xb[2]
     nf = axis_numfmt(bounds)
     if nf:
         ch.y_axis.numFmt = nf

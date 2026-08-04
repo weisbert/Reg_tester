@@ -1460,31 +1460,19 @@ def _style_series(s, color, dashed=False, marker="circle", size=5):
     s.marker = mk
 
 
-def label_pos(y, bounds, x=None, xs=None, edge=0.12, top=0.22):
-    """这个点的标签往哪边放——按它在图里的位置定，躲开会撞的东西。
+def label_pos(is_max):
+    """标注往哪边放。
 
-    ★ 四种撞法都真出现过（用户 2026-08-04 报的 + 我导图看到的）：
-      · 贴顶的点标签放上面 → **顶到图标题**
-      · 贴底的放下面 → 压到横轴刻度
-      · 贴右边的 → 被右边框切掉半截
-      · 贴左边的 → 压在纵轴刻度上（"2000.000" 那一列）
-      横向先判：极值点几乎总落在横轴两端，撞边比撞标题更常发生。
-      openpyxl 只有上/下/左/右四档，给不了像素偏移，所以只能这么挑。
+    ★★ 标的是**这条线自己的最低点和最高点**——那就意味着最高点的**正上方**、
+      最低点的**正下方**在这条线上必然是空的。所以最大值往上、最小值往下，
+      标注不会压在自己的曲线上。
+      （2026-08-04 走了两版弯路：先按"贴顶/贴底"挑 → 贴右边的被边框切掉半截；
+        改成贴边就往里放 → 标注直接压在曲线上，用户："标注和曲线重合的问题
+        你没考虑"。往左右放一定会撞线，因为曲线就是往左右延伸的。）
+      配套：横轴要留出边距（见 _vco_chart 的 x_axis 设定），否则往上放的那个
+      标注在最右端会被右边框切掉。
     """
-    if x is not None and xs:
-        x0, x1 = min(xs), max(xs)
-        if x1 > x0:
-            fx = (x - x0) / (x1 - x0)
-            if fx >= 1 - edge:
-                return "l"
-            if fx <= edge:
-                return "r"
-    if not bounds or y is None:
-        return "t"
-    lo, hi = bounds[0], bounds[1]
-    if hi <= lo:
-        return "t"
-    return "b" if (y - lo) / (hi - lo) >= 1 - top else "t"
+    return "t" if is_max else "b"
 
 
 def axis_numfmt(bounds):
@@ -1558,7 +1546,7 @@ def _label_text(color, size=900):
 
 
 def _add_series(ch, ws, n_series, head, first, last, counts=None, labels=None,
-                target_idx=None):
+                target_idx=None, ismax=None):
     """挂数据系列。
 
     几处必须显式设，否则图会骗人：
@@ -1583,7 +1571,11 @@ def _add_series(ch, ws, n_series, head, first, last, counts=None, labels=None,
                           marker="circle" if n_pts <= 60 else "none",
                           size=5 if n_pts <= 30 else 3)
             if labels:
-                _label_points(s, labels.get(i) or [])
+                idxs = labels.get(i) or []
+                _label_points(s, idxs, color=SERIES_COLORS[i % len(SERIES_COLORS)],
+                              sername=True,
+                              pos={j: label_pos((ismax or {}).get(j, True))
+                                   for j in idxs})
         ch.series.append(s)
 
 
@@ -1639,8 +1631,8 @@ def _extreme_labels(sers, xrow, first, pick=None):
         if not pts:
             continue
         lo, hi = min(pts), max(pts)
-        return {i: sorted({lo[1], hi[1]})}
-    return {}
+        return {i: sorted({lo[1], hi[1]})}, {lo[1]: False, hi[1]: True}
+    return {}, {}
 
 
 def write_charts(wb, panels, st, all_charts=False):
@@ -1659,11 +1651,12 @@ def write_charts(wb, panels, st, all_charts=False):
                           ylim=_nice(min(ys), max(ys)) if ys else None)
             # 关键点 = 每条线自己的首末点，标上数值，不用对着坐标轴猜
             xrow = lay["xrow"].get(it.col, {})
-            labels = _extreme_labels(sers, xrow, first,
-                                     pick=room_series(groups))
+            labels, ismax = _extreme_labels(sers, xrow, first,
+                                            pick=room_series(groups))
             _add_series(ch, ws_src, n_col, head, first, last,
                         [len(d) for d in sers], labels,
-                        target_idx=len(groups) if tgt is not None else None)
+                        target_idx=len(groups) if tgt is not None else None,
+                        ismax=ismax)
             grid.add(ch)
     return ws, grid
 
@@ -1678,9 +1671,10 @@ def write_slope_chart(grid, ws_slope, groups, anchor, title, xlabel, unit,
     ch = _scatter(title, xlabel, unit,
                   xlim=_nice(min(xs), max(xs)) if xs else None,
                   ylim=_nice(min(ys), max(ys)) if ys else None)
-    _add_series(ch, ws_slope, len(groups), head, first, last, counts,
-                _extreme_labels(sers or [], xrow or {}, first,
-                                pick=room_series(groups)))
+    _lbl, _mx = _extreme_labels(sers or [], xrow or {}, first,
+                                pick=room_series(groups))
+    _add_series(ch, ws_slope, len(groups), head, first, last, counts, _lbl,
+                ismax=_mx)
     grid.add(ch)
 
 
@@ -1733,8 +1727,8 @@ def write_pn_chart(wb, grid, groups, pn_items, st, src_title, op_x=None):
     for _g, _xm, row in picks:
         pn_sers.append(dict((i, row.vals[it.col]) for i, it in enumerate(pn_items)
                             if row.vals.get(it.col) is not None))
-    pn_labels = _extreme_labels(pn_sers, pn_row, 3,
-                                pick=room_series(groups))
+    pn_labels, pn_ismax = _extreme_labels(pn_sers, pn_row, 3,
+                                          pick=room_series(groups))
 
     ch = _scatter("相噪 vs offset", "offset (MHz)", "dBc/Hz", logx=True)
     xref = Reference(ws, min_col=1, min_row=3, max_row=2 + len(pn_items))
@@ -1743,7 +1737,9 @@ def write_pn_chart(wb, grid, groups, pn_items, st, src_title, op_x=None):
         s = Series(yref, xref, title_from_data=True)
         s.smooth = False
         _style_series(s, SERIES_COLORS[j % len(SERIES_COLORS)])
-        _label_points(s, pn_labels.get(j) or [])
+        _pi = pn_labels.get(j) or []
+        _label_points(s, _pi, pos={k: label_pos(pn_ismax.get(k, True))
+                                   for k in _pi})
         ch.series.append(s)
     grid.add(ch)
 
@@ -2241,7 +2237,7 @@ def main():
             dsers.append({x: sg[x] - sref[x] for x in sg if x in sref})
         _add_series(ch, wb[d["sheet"]], len(d["col_of"]), 2, d["first"], d["last"],
                     [len(group_series(g, freq_item)) for g in others],
-                    _extreme_labels(dsers, drow, dr))
+                    _extreme_labels(dsers, drow, dr)[0])
         grid.add(ch)
     pn_items = [it for it in items if it.label.startswith("SpotPN@")]
     vt_groups = next((gs for k, gs in by_kind if k == "vtune"), [])
