@@ -694,6 +694,50 @@ def as_text(v):
     return v
 
 
+# ---- 版面几何 ------------------------------------------------------------
+# Excel 的列宽单位＝默认字体里 '0' 的宽度，换算成像素是 round(w*7)+5（Calibri 11）；
+# 行高单位是磅，96 dpi 下 1 磅 = 4/3 px。图的 width/height 单位是厘米。
+# ★ 这三套单位不换算到一起，就只能靠眼睛猜"这张图放不放得下"——
+#   2026-08-04 就是这么撞的：图宽写死 14.5cm、竖条列宽写死出来 14.15cm，
+#   每张图往右边邻居里压 13px，三颗芯片的图连成一片。
+
+PX_PER_CM = 96 / 2.54
+DEFAULT_ROW_PT = 15.0
+
+
+def col_px(w):
+    return round(w * 7) + 5
+
+
+def cols_cm(widths):
+    return sum(col_px(w) for w in widths) / PX_PER_CM
+
+
+def rows_cm(n, row_pt=DEFAULT_ROW_PT):
+    return n * row_pt * (4.0 / 3.0) / PX_PER_CM
+
+
+def fit_strip(base, chart_cm, margin_cm=0.15):
+    """按目标图宽把数据列**等比撑开**，保证竖条一定放得下图。
+
+    撑数据列而不是撑间隔列：间隔拉宽只是留白，把数据列一起撑开，
+    图和它下面那张表就是同一个宽度，看着是一整条。
+    返回 (撑开后的列宽表, 实际能用的图宽cm)。
+    """
+    need = (chart_cm + margin_cm) * PX_PER_CM
+    have = sum(col_px(w) for w in base)
+    k = max(1.0, need / have)
+    out = [round(w * k, 2) for w in base]
+    return out, cols_cm(out) - margin_cm
+
+
+def chart_rows(h_cm, margin_px=16, row_pt=DEFAULT_ROW_PT):
+    """一张图该占几行——**按图高算**，不写死。写死的话图一变大就上下压在一起。"""
+    import math
+    return max(2, int(math.ceil((h_cm * PX_PER_CM + margin_px) /
+                                (row_pt * 4.0 / 3.0))))
+
+
 # ---- 图表原语 ------------------------------------------------------------
 
 # 每段/每条线一个颜色 + 一个记号形状：几条线叠在一张图上，光靠颜色分不开

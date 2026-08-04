@@ -46,8 +46,9 @@ from summarize_vco_sweep import load_vco
 from sweep_lib import (
     COLOR_FLAG, COLOR_MUTED, COLOR_PASS, FILL_FAIL, FILL_PASS,
     LEG_STYLE, Columns, SweepError, apply_y, as_text, axis_bounds, blank_policy,
-    fmt_num, is_blank, leg_series, legend_bottom, load_sweep, median, nice_step,
-    num, put, stats_all, styles, style_series, txt,
+    DEFAULT_ROW_PT, chart_rows, col_px, cols_cm, fit_strip, fmt_num, is_blank,
+    leg_series, legend_bottom,
+    load_sweep, median, nice_step, num, put, stats_all, styles, style_series, txt,
 )
 from xlsx_formula_cache import FormulaCache
 
@@ -58,6 +59,9 @@ except Exception:
     pass
 
 VCACHE = FormulaCache()
+
+EMU_PX = 9525.0            # 1 px = 9525 EMU
+DEFAULT_COL_W = 8.43       # Excel 没设过的列就是这个宽度
 
 # ---------------------------------------------------------------- 发现层
 
@@ -883,10 +887,17 @@ def write_summary(wb, tables, chips, st, slim=False, sinfo=None, dsb=False):
 
 # ---------------------------------------------------------------- 温巡页
 
-# 一个芯片竖条的宽度：8 列数据 + 1 列间隔（≈ 一张图的宽度）
-STRIP_W = 9
+# ★★ 竖条宽度与图宽必须由**同一个数**推出来。原来图宽写死 14.5cm、列宽写死
+#   5/9×7（＝14.15cm），两边各改各的——每张图往右边邻居里压 13px，
+#   三颗芯片的图连成一片（2026-08-04 用户报的"两个温巡的图片重叠了"）。
+#   现在：给一个目标图宽 → fit_strip 等比撑开数据列 → 图宽再由实际列宽反算，
+#   谁都跑不掉。图占几行也按图高算，不写死。
 JCOLS = ["序", "温度℃", "事件", "Vtune_V", "重锁点", "Freq_MHz", "Δf (kHz)", "重锁点"]
-CHART_H = 20            # 一张图占多少行
+JW_BASE = [5] + [9] * 7        # 撑开之前的列宽（比例）
+GAP_W = 2                      # 竖条之间的间隔列
+STRIP_W = len(JCOLS) + 1
+CHART_W_CM = 15.5              # 默认图宽（--chart-w 可改）
+CHART_AR = 8.2 / 14.5          # 高宽比，沿用原来那张图的比例
 
 
 def _journey_rows(sw):
@@ -919,7 +930,7 @@ def _journey_rows(sw):
 
 
 def _jchart(ws, kind, chip, mod, col0, r_data, n_rows, bounds, st, title_extra="",
-            rows=None):
+            rows=None, size=(14.5, 8.2)):
     """一张温巡图：横轴=测试顺序（刻度标当时的温度），重锁点单独一条红三角。
 
     为什么不按"vs 温度"画：温巡是有先后的，同一个温度会经过好几次；
@@ -935,7 +946,7 @@ def _jchart(ws, kind, chip, mod, col0, r_data, n_rows, bounds, st, title_extra="
                 ("压控电压 温巡过程" if kind == "vt" else "输出频率漂移 温巡过程")
                 + title_extra)
     ch.style = 13
-    ch.height, ch.width = 8.2, 14.5
+    ch.width, ch.height = size
     blank_policy(ch)
     ch.y_axis.title = "Vtune (V)" if kind == "vt" else "Δf (kHz)"
     ch.x_axis.title = "温度 (℃)　—　从左到右＝实际测试先后"
@@ -966,18 +977,21 @@ def _jchart(ws, kind, chip, mod, col0, r_data, n_rows, bounds, st, title_extra="
     return ch
 
 
-def write_journey(wb, tables, chips, st, no_charts=False):
+def write_journey(wb, tables, chips, st, no_charts=False, chart_w=CHART_W_CM):
     """一页里：每颗芯片一个竖条；条内每模块两张图 + 两块数据。
 
     横着一条 band = 同一个模块同一个指标的各芯片对照；竖着一条 = 同一颗芯片。
     """
     ws = wb.create_sheet("温巡")
     n = len(chips)
+    jw, cw = fit_strip(JW_BASE, chart_w)      # 列宽撑到放得下图，图宽再由列宽反算
+    chart_h = cw * CHART_AR
+    CHART_H = chart_rows(chart_h)
     for k in range(n):
         c0 = 1 + k * STRIP_W
         for j in range(len(JCOLS)):
-            ws.column_dimensions[_cl(c0 + j)].width = 9 if j else 5
-        ws.column_dimensions[_cl(c0 + STRIP_W - 1)].width = 2
+            ws.column_dimensions[_cl(c0 + j)].width = jw[j]
+        ws.column_dimensions[_cl(c0 + STRIP_W - 1)].width = GAP_W
 
     # ★ 只写这一页是什么，不写"该怎么看"。原来这里有一整句版式说明
     #   （一片一竖条／横轴按测试先后／共用纵轴范围）——芯片名就写在每条竖条上面，
@@ -1056,7 +1070,7 @@ def write_journey(wb, tables, chips, st, no_charts=False):
                 extra = (f"（相对首点 {fmt_num(f0, 6)} MHz）"
                          if kind == "df" and f0 is not None else "")
                 ch = _jchart(ws, kind, chip, mod, 1 + k * STRIP_W, first, cnt,
-                             bounds, st, extra, rows=_rows)
+                             bounds, st, extra, rows=_rows, size=(cw, chart_h))
                 ws.add_chart(ch, f"{_cl(1 + k * STRIP_W)}{row + band * CHART_H}")
         row += 2 * CHART_H
     return ws
@@ -1435,7 +1449,7 @@ def _room_of(vtemps, target=25.0):
 # ---- VCO 图 --------------------------------------------------------------
 
 VSTRIP_W = 9            # 一颗芯片一竖条：8 列数据 + 1 列间隔
-VCHART_H = 20
+VW_BASE = [10] * (VSTRIP_W - 1)
 # 四张图：Vtune 轴给"值 + 斜率"，CT 轴也给"值 + 斜率"，对称
 VCO_TAGS = ("v", "k", "c", "d")
 VCO_TITLE = {"v": "频率 vs Vtune", "k": "Kvco vs Vtune", "c": "频率 vs CT 码",
@@ -1478,18 +1492,22 @@ def _vco_series(sw, temps):
     return fv, kv, fc, fd
 
 
-def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
+def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False,
+                     chart_w=CHART_W_CM):
     """一页里：每颗芯片一竖条，条内三张图（F-Vtune / Kvco-Vtune / F-CT码）+ 数据源。
 
     横着一条 band = 同一张图的各片对照；同一模块各片共用纵轴范围，才能直接比。
     """
     ws = wb.create_sheet("VCO压控")
     n = len(chips)
+    vw, cw = fit_strip(VW_BASE, chart_w)      # 跟温巡页同一套：列宽撑到放得下图
+    chart_h = cw * CHART_AR
+    VCHART_H = chart_rows(chart_h)
     for k in range(n):
         c0 = 1 + k * VSTRIP_W
         for j in range(VSTRIP_W - 1):
-            ws.column_dimensions[_cl(c0 + j)].width = 10
-        ws.column_dimensions[_cl(c0 + VSTRIP_W - 1)].width = 2
+            ws.column_dimensions[_cl(c0 + j)].width = vw[j]
+        ws.column_dimensions[_cl(c0 + VSTRIP_W - 1)].width = GAP_W
 
     c = put(ws, 1, 1, "VCO 开环压控", st, st["f_sep"], bold=True, align="left")
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n * VSTRIP_W)
@@ -1555,13 +1573,15 @@ def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False):
                     continue
                 first, cnt, ser, xs = got[chip]
                 ws.add_chart(_vco_chart(ws, tag, chip, mod, 1 + k * VSTRIP_W,
-                                        first, cnt, vtemps, bounds, ser, xs),
+                                        first, cnt, vtemps, bounds, ser, xs,
+                                        size=(cw, chart_h)),
                              f"{_cl(1 + k * VSTRIP_W)}{row}")
             row += VCHART_H
     return ws
 
 
-def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs):
+def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs,
+               size=(14.5, 8.2)):
     from openpyxl.chart import Reference, ScatterChart, Series
     # ★ 借单簿脚本那份数值标注（只标全图最低/最高两点——三条温度曲线在同一个
     #   横轴端点上值挨得很近，各标各的会叠成一坨）。放在那边是因为它先写出来的，
@@ -1571,7 +1591,7 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
     ch = ScatterChart()
     ch.title = f"{chip} · {mod} " + VCO_TITLE[tag]
     ch.style = 13
-    ch.height, ch.width = 8.2, 14.5
+    ch.width, ch.height = size
     blank_policy(ch)
     ch.x_axis.title = VCO_XLABEL[tag]
     ch.y_axis.title = VCO_YAXIS[tag]
@@ -2028,7 +2048,54 @@ def selfcheck(path):
                         x is not None and abs(float(x) - float(y)) > 1e-9):
                     fails.append(f"{name}「{item}」第{j+1}个汇总格: "
                                  f"表上的格子给出 {x}，写的是 {y}")
+    fails += chart_overlaps(wb)
     return fails, n_agg, n_f
+
+
+def chart_overlaps(wb):
+    """③ 图和图不许压在一起——**算出来**，不靠眼睛看。
+
+    ★ 2026-08-04 事故：图宽写死 14.5cm，竖条宽度是列宽算出来的 14.15cm，
+      每张图往右边邻居里压 13px。这种事读 chart XML 一点看不出来
+      （每张图自己都完全正常），肉眼在 Excel 里也只是"边框好像贴着"。
+      三套单位（列宽格 / 行高磅 / 图厘米）换算到像素，重叠就是个几何题。
+    """
+    from openpyxl.utils import get_column_letter as gl
+    out = []
+    for ws in wb.worksheets:
+        boxes = []
+        for ch in getattr(ws, "_charts", []):
+            a_ = getattr(ch, "anchor", None)
+            frm = getattr(a_, "_from", None)
+            ext = getattr(a_, "ext", None)
+            if frm is None or ext is None:
+                continue                      # 双格锚点：位置由格子定，不会压
+            x = sum(col_px(ws.column_dimensions[gl(c)].width
+                           or DEFAULT_COL_W) if gl(c) in ws.column_dimensions
+                    else col_px(DEFAULT_COL_W) for c in range(1, frm.col + 1))
+            y = sum((ws.row_dimensions[r].height
+                     if r in ws.row_dimensions and ws.row_dimensions[r].height
+                     else DEFAULT_ROW_PT) * 4.0 / 3.0 for r in range(1, frm.row + 1))
+            boxes.append((_chart_name(ch), x + frm.colOff / EMU_PX,
+                          y + frm.rowOff / EMU_PX,
+                          ext.cx / EMU_PX, ext.cy / EMU_PX))
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                t1, x1, y1, w1, h1 = boxes[i]
+                t2, x2, y2, w2, h2 = boxes[j]
+                ox = min(x1 + w1, x2 + w2) - max(x1, x2)
+                oy = min(y1 + h1, y2 + h2) - max(y1, y2)
+                if ox > 1 and oy > 1:
+                    out.append(f"{ws.title}: 两张图压在一起（横 {ox:.0f}px / "
+                               f"纵 {oy:.0f}px）—— {t1} ×× {t2}")
+    return out
+
+
+def _chart_name(ch):
+    try:
+        return "".join(r.t or "" for p in ch.title.tx.rich.p for r in (p.r or ()))[:40]
+    except Exception:                          # noqa: B902
+        return "(无标题)"
 
 
 # ---------------------------------------------------------------- main
@@ -2059,6 +2126,10 @@ def main():
                          "把那一组写成 {\"keys\": [步骤键…], \"note\": \"…\"}。"
                          "★含真实模块名，放黄区本地/private，别提交。"
                          "不给＝所有关断步骤按文件顺序排成一组")
+    ap.add_argument("--chart-w", type=float, default=None,
+                    help=f"每张图的宽度 cm（默认 {CHART_W_CM}）。芯片竖条的列宽会跟着"
+                         "等比撑开，保证放得下——图宽和列宽是同一个数推出来的，"
+                         "不会再出现相邻两颗芯片的图压在一起")
     ap.add_argument("--dsb", dest="dsb", action="store_true", default=None,
                     help="把**积分**相噪从单边带换算成双边带（+3.01 dB），"
                          "行名 IPN_SSB→IPN_DSB。逐点相噪与杂散不动"
@@ -2116,6 +2187,7 @@ def main():
     spur_tol = float(pick_opt(args.spur_tol, "spur_tol", 2.0))
     op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
     dsb = bool(pick_opt(args.dsb, "dsb", False))
+    chart_w = float(pick_opt(args.chart_w, "chart_w", CHART_W_CM))
 
     want_mod = ([m.strip() for m in args.modules.split(",") if m.strip()]
                 or [str(m).strip() for m in (cfg.get("modules") or [])])
@@ -2429,12 +2501,13 @@ def main():
     if tables:
         write_summary(wb, tables, chips_pll, st, slim=args.slim,
                       sinfo=sinfo.get(KIND_PLL), dsb=dsb)
-        write_journey(wb, tables, chips_pll, st, no_charts=args.no_charts)
+        write_journey(wb, tables, chips_pll, st, no_charts=args.no_charts,
+                      chart_w=chart_w)
     if vtables:
         write_vco_summary(wb, vtables, chips_vco, st, vtemps, slim=args.slim,
                           sinfo=sinfo.get(KIND_VCO), dsb=dsb)
         write_vco_charts(wb, vcharts, chips_vco, st, vtemps,
-                         no_charts=args.no_charts)
+                         no_charts=args.no_charts, chart_w=chart_w)
     # 电流页放最后：前四页是成对的（汇总+过程），别插进它们中间
     if ctables:
         write_grouped_page(wb, "Current_Summary", "{mod}（逐级关断电流）",
