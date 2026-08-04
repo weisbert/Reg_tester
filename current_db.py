@@ -49,6 +49,7 @@ import os
 import re
 import sqlite3
 import sys
+import types
 
 import openpyxl
 from openpyxl.chart import LineChart, Reference
@@ -1173,16 +1174,20 @@ def _chart_title(text, sz=1100, bold=True):
     return Title(tx=Text(rich=RichText(p=[p])))
 
 
-def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
-    """人直接读的汇总簿：说明 / 总览(模块×模式×温度 + 仿真对比) / 温度趋势(图) / 对比明细。"""
-    tier = config.get("sim_tier") or ""
-    stage_main = (config.get("sim_stage") or "post").strip().lower()
-    fb_stage = bool(config.get("sim_stage_fallback", True))
-    zero_ua = float(config.get("sim_zero_ua") or 0)
-    other_stage = "pre" if stage_main == "post" else "post"
-    sim_note = config.get("sim_temp_note") or ""
-    thr = float(config.get("delta_flag_pct") or 20) / 100.0
-    abs_thr = float(config.get("delta_flag_abs_ua") or 0)   # 双阈值绝对下限 µA
+def summary_data(conn, config, chips=None):
+    """从库里备好两种版式共用的那份数据（run/温度轴、行列 universe、实测矩阵、仿真值）。
+
+    单芯片版式（cmd_summary_export）和跨芯片版式（chips_sheet）只在**怎么摆**上不同，
+    读数和口径必须是同一份——否则两本簿子会对同一批数据给出不同的数，这种事没法解释。"""
+    d = types.SimpleNamespace()
+    d.tier = tier = config.get("sim_tier") or ""
+    d.stage_main = stage_main = (config.get("sim_stage") or "post").strip().lower()
+    d.fb_stage = fb_stage = bool(config.get("sim_stage_fallback", True))
+    d.zero_ua = zero_ua = float(config.get("sim_zero_ua") or 0)
+    d.other_stage = other_stage = "pre" if stage_main == "post" else "post"
+    d.sim_note = config.get("sim_temp_note") or ""
+    d.thr = float(config.get("delta_flag_pct") or 20) / 100.0
+    d.abs_thr = float(config.get("delta_flag_abs_ua") or 0)   # 双阈值绝对下限 µA
 
     runs = latest_runs(conn)
     if not runs:
@@ -1193,17 +1198,20 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         if bad:
             raise SystemExit(f"[错误] 库里没有芯片 {', '.join(bad)}；现有: {', '.join(have)}")
         runs = [r for r in runs if r[2] in chips]
-    sim_modes = {r[0] for r in conn.execute("SELECT DISTINCT mode FROM sim_current")}
-    multi_chip = len({r[2] for r in runs}) > 1
+    d.runs = runs
+    d.sim_modes = sim_modes = {r[0] for r in conn.execute("SELECT DISTINCT mode FROM sim_current")}
+    d.multi_chip = multi_chip = len({r[2] for r in runs}) > 1
     temps = sorted({r[3] for r in runs if r[3] is not None})
     if not temps:
         temps = [None]
-    n_t = len(temps)
+    d.temps = temps
+    d.n_t = n_t = len(temps)
     # 仿真温度：偏差把实测线性插值到该温度再对仿真，消除单点仿真 vs 多温实测的系统温差
     sim_temp_c = config.get("sim_temp_c")
     if sim_temp_c is None:
         m = re.search(r"-?\d+(?:\.\d+)?", str(config.get("sim_temp_note") or ""))
         sim_temp_c = float(m.group(0)) if m else (temps[0] if temps[0] is not None else 25)
+    d.sim_temp_c = sim_temp_c
 
     def interp_to(pairs, target):
         """线性插值到 target 温度；范围外取最近端点（不外推）；单点直接返回。"""
@@ -1219,6 +1227,7 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
             if t0 <= target <= t1:
                 return v0 + (v1 - v0) * (target - t0) / (t1 - t0)
         return pts[-1][1]
+    d.interp_to = interp_to
 
     # 列组 = (mode, chip)，按首个 run_id 排（=入库顺序=测试顺序）
     first_id = {}
@@ -1226,10 +1235,16 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         k = (r[1], r[2])
         if k not in first_id or r[0] < first_id[k]:
             first_id[k] = r[0]
-    col_keys = sorted(first_id, key=first_id.get)
+    d.col_keys = col_keys = sorted(first_id, key=first_id.get)
+    # 模式/芯片各自的顺序（跨芯片版式按这两根轴摆）
+    d.modes = sorted({m for m, _c in col_keys}, key=lambda m: min(
+        first_id[k] for k in col_keys if k[0] == m))
+    d.chips = sorted({c for _m, c in col_keys}, key=lambda c: min(
+        first_id[k] for k in col_keys if k[1] == c))
 
     def col_title(mode, chip):
         return f"{mode}({chip})" if multi_chip else mode
+    d.col_title = col_title
 
     # 逐 run 取基线/末态/模块组
     base_ma, init_ma, end_ma, per_groups = {}, {}, {}, {}   # 键 (mode,chip,temp)
@@ -1252,6 +1267,8 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         per_groups[k] = conn.execute(
             "SELECT step_order,group_disp,step_name,sim_ids,sim_mode,current_ua,note"
             " FROM meas_module WHERE run_id=? ORDER BY step_order", (run_id,)).fetchall()
+    d.base_ma, d.init_ma, d.end_ma = base_ma, init_ma, end_ma
+    d.per_groups, d.src_files = per_groups, src_files
 
     # 行 universe：(disp, step_name)，按平均步序排
     matrix, order_sum, order_cnt, notes, siminfo = {}, {}, {}, {}, {}
@@ -1279,6 +1296,8 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
             return (0, min(ids), order_sum[k] / order_cnt[k])
         return (1, 0, order_sum[k] / order_cnt[k])
     row_keys = sorted(matrix, key=_row_sort_key)
+    d.matrix, d.notes, d.siminfo = matrix, notes, siminfo
+    d.caliber_keys, d.row_keys = caliber_keys, row_keys
 
     # 仿真值缓存：行×模式 -> pre/post 合计 µA（tier 过滤）；行名
     sim_val, sim_pre_val, sim_names, sim_fb = {}, {}, {}, {}
@@ -1297,8 +1316,26 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
                     conn, lk_mode, ids, other_stage, tier)
                 if fb:
                     sim_fb[(key, mode)] = fb
+    d.sim_val, d.sim_pre_val, d.sim_names, d.sim_fb = sim_val, sim_pre_val, sim_names, sim_fb
     # 标签行（DCO 等）排在末尾——Σ 分两段：LO 模块（可与仿真对）/ 总合计（含标签行，只有实测）
-    n_label = sum(1 for k in row_keys if parse_ids(str(k[0]).replace("+", ",")) is None)
+    d.n_label = sum(1 for k in row_keys if parse_ids(str(k[0]).replace("+", ",")) is None)
+    return d
+
+
+def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
+    """人直接读的汇总簿：说明 / 总览(模块×模式×温度 + 仿真对比) / 温度趋势(图) / 对比明细。"""
+    d = summary_data(conn, config, chips)
+    tier, stage_main, fb_stage = d.tier, d.stage_main, d.fb_stage
+    zero_ua, other_stage, sim_note = d.zero_ua, d.other_stage, d.sim_note
+    thr, abs_thr = d.thr, d.abs_thr
+    runs, sim_modes, multi_chip = d.runs, d.sim_modes, d.multi_chip
+    temps, n_t, sim_temp_c, interp_to = d.temps, d.n_t, d.sim_temp_c, d.interp_to
+    col_keys, col_title = d.col_keys, d.col_title
+    base_ma, end_ma, per_groups, src_files = d.base_ma, d.end_ma, d.per_groups, d.src_files
+    matrix, notes, caliber_keys, row_keys = d.matrix, d.notes, d.caliber_keys, d.row_keys
+    siminfo = d.siminfo
+    sim_val, sim_pre_val, sim_names, sim_fb, n_label = (
+        d.sim_val, d.sim_pre_val, d.sim_names, d.sim_fb, d.n_label)
 
     wb = openpyxl.Workbook()
     fcache = {}   # {sheet标题: {坐标: 缓存值}}，写公式时记录，保存后注入 <v>
@@ -1690,6 +1727,378 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
     wb.save(out_path)
     _inject_cached_values(out_path, fcache)   # 给公式补缓存值，不重算的查看器也能显示
     return len(runs), len(row_keys), n_charts
+
+
+def cmd_chips_export(conn, out_path, config, chips=None):
+    """跨芯片评审版汇总簿：说明 + 一页总览。
+
+    与单芯片版（cmd_summary_export）的区别只在**摆法**，读数走同一个 summary_data：
+      - 仿真列只出现一次（仿真与芯片无关，单芯片版每个模式×芯片块都重复一遍）
+      - 一颗芯片一竖条（n_t 列），加片进来是加竖条不是加块，宽度线性且慢
+      - 右侧直接给「片间极差」——多片测试要看的是一致性，横着比是人眼干的活
+      - 模式做成行分区（band 行），不再占一根列轴；一行 = 一个模式的一个模块组，
+        所以跨阶段补值的备注能落到行上，不需要再开一页明细
+    """
+    d = summary_data(conn, config, chips)
+    temps, n_t, chip_ids, modes = d.temps, d.n_t, d.chips, d.modes
+    matrix, row_keys, sim_val, sim_names = d.matrix, d.row_keys, d.sim_val, d.sim_names
+    n_chip = len(chip_ids)
+    lo_keys = set(row_keys[:len(row_keys) - d.n_label])   # 标签行(DCO)排在最后 n_label 个
+
+    def has(key, mode, chip):
+        return any((mode, chip, t) in matrix[key] for t in temps)
+
+    rows_of_mode = {m: [k for k in row_keys if any(has(k, m, c) for c in chip_ids)]
+                    for m in modes}
+
+    # ---- 列几何：编号/模块/单位 | 仿真 | 每片 n_t 列 | [片间极差 极差%] | 均值@ 偏差% | 备注
+    FIX, C_SIM = 3, 4
+    C_CHIP = C_SIM + 1
+    after = C_CHIP + n_chip * n_t
+    spread = n_chip > 1                      # 只有一颗芯片时「片间极差」是废列，不出
+    C_SPREAD, C_SPCT = (after, after + 1) if spread else (None, None)
+    C_MEAN = after + (2 if spread else 0)
+    C_DEV, C_NOTE = C_MEAN + 1, C_MEAN + 2
+
+    def cc(chip_i, ti):
+        return C_CHIP + chip_i * n_t + ti
+
+    wb = openpyxl.Workbook()
+    fcache = {}
+
+    def fcell(ws_, r, c, formula, value, **kw):
+        _cell(ws_, r, c, formula, **kw)
+        fcache.setdefault(ws_.title, {})[f"{get_column_letter(c)}{r}"] = value
+        return value
+
+    def ref(r, c):
+        return f"{get_column_letter(c)}{r}"
+
+    # ================= 说明 =================
+    ws = wb.active
+    ws.title = "说明"
+    ws["A1"] = "跨芯片功耗汇总簿 · 读法"
+    ws["A1"].font = Font(name=FONT_NAME, bold=True, size=14)
+    lines = [
+        "",
+        f"导出时间 {now_iso()}；数据源 current.db（current_db.py summary-chips 生成）",
+        f"芯片 {n_chip} 颗：{', '.join(chip_ids)}；模式 {len(modes)} 个；"
+        f"温度点 {', '.join(_t(t) for t in temps if t is not None) or '未知'}；"
+        f"实测 {len(d.runs)} 个 run（模式×芯片×温度，重复测取最新一次）",
+        f"源文件 {', '.join(sorted(d.src_files))}",
+        f"仿真：档位 {d.tier or '未过滤'} / {d.stage_main}-sim / 温度 {d.sim_note or '未标注'}；"
+        "仿真与芯片无关，故只有一列，各片共用。",
+        ((f"  仿真取值：优先 {d.stage_main}-sim；某模块该阶段为 0/缺项（≤{d.zero_ua:g}µA 计作缺项）"
+          f"时取{d.other_stage}-sim（前仿已做 back annotate，两者可比），逐模块判断，"
+          f"两阶段都为 0 则留空。本簿共 {len(d.sim_fb)} 处，逐处在该行备注列写明。")
+         if (d.fb_stage and d.sim_fb) else "  仿真列全部取自同一阶段，无跨阶段补值。"),
+        "",
+        "【总览页】一个模式一段（灰底 band 行），段内：",
+        "  条件行 = 锁定后总电流（做差基线）、全关残留电流（末个 OFF 步=全关后的末态），单位 mA；",
+        "  结果行 = 每个模块组一行，单位 µA；段末 Σ LO 模块合计（口径与仿真一致）与 Σ 总合计。",
+        "  列：仿真 1 列（各片共用）→ 每颗芯片一竖条（各温度实测）"
+        + ("→ 片间极差 → 均值@%g℃ → 偏差%%。" % d.sim_temp_c if spread
+           else "→ 均值@%g℃ → 偏差%%。" % d.sim_temp_c),
+    ]
+    if spread:
+        lines += [
+            f"  片间极差 = 同一温度下各片的 max−min，取三个温度里最大的那个（最坏情况）；"
+            f"极差% = 极差 ÷ 常温({_t(_closest(temps, 25))})各片均值。",
+            "  某颗芯片这一组没测时极差留空——不同覆盖度的片之间不做减法。",
+            "  ★极差不标色：多大算超标要你定（片间一致性没有 spec），定了我再加判据。",
+        ]
+    lines += [
+        f"  偏差% = (各片均值插值到{'%g' % d.sim_temp_c}℃ − 仿真) ÷ 仿真。仿真是"
+        f"{'%g' % d.sim_temp_c}℃单点，实测按三温线性插值到该温度再比，消除系统性温差。",
+        f"  标红=双阈值：|偏差%|>{d.thr * 100:.0f}% 且 |绝对偏差|>{d.abs_thr:.0f}µA 才红"
+        "（避免小电流模块被百分比放大成假红）。",
+        f"  LDO 归并 {config.get('ldo_reparent')}：子模块实测并入父组、仿真侧不计子模块，"
+        "父组口径不可比 -> 偏差仅供参考、不标红（见该行备注）。",
+        "",
+        "极差/均值/偏差/Σ 都是 Excel 公式（改实测或仿真会自动重算），同时写入了当前结果的",
+        "缓存值，不自动重算的查看器打开也能直接看到数字。",
+    ]
+    for i, line in enumerate(lines, 2):
+        ws.cell(row=i, column=1, value=line).font = Font(name=FONT_NAME, size=10)
+    ws.column_dimensions["A"].width = 112
+
+    # ================= 总览 =================
+    ws = wb.create_sheet("总览")
+    ws.sheet_view.showGridLines = False
+    for r in (1, 2):
+        for c in range(1, C_NOTE + 1):
+            _cell(ws, r, c, fill=C_HEADER)
+
+    def head_single(c, title, width):
+        ws.merge_cells(start_row=1, start_column=c, end_row=2, end_column=c)
+        _cell(ws, 1, c, title, bold=True, fill=C_HEADER)
+        ws.column_dimensions[get_column_letter(c)].width = width
+
+    for c, (title, w) in enumerate(zip(["编号", "模块 (OFF 步)", "单位"], [9, 30, 6]), 1):
+        head_single(c, title, w)
+    head_single(C_SIM, f"仿真\n{d.sim_note} {d.tier}", 11)
+    for j, chip in enumerate(chip_ids):
+        ws.merge_cells(start_row=1, start_column=cc(j, 0), end_row=1, end_column=cc(j, n_t - 1))
+        _cell(ws, 1, cc(j, 0), chip, bold=True, fill=C_HEADER)
+        for ti, t in enumerate(temps):
+            _cell(ws, 2, cc(j, ti), _t(t) if t is not None else "?", bold=True, fill=C_HEADER)
+            ws.column_dimensions[get_column_letter(cc(j, ti))].width = 10
+    if spread:
+        head_single(C_SPREAD, "片间极差\nµA", 10)
+        head_single(C_SPCT, "片间极差\n%", 9)
+    head_single(C_MEAN, "各片均值\n@%g℃" % d.sim_temp_c, 11)
+    head_single(C_DEV, "偏差%\nvs 仿真", 10)
+    head_single(C_NOTE, "备注", 46)
+    for r in (1, 2):
+        for c in range(1, C_NOTE + 1):
+            ws.cell(row=r, column=c).alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 30
+    ws.freeze_panes = ref(3, C_SIM)
+
+    red_font = Font(name=FONT_NAME, size=10, bold=True, color=C_FLAG)
+    i25 = temps.index(_closest(temps, 25)) if temps[0] is not None else 0
+
+    def interp_expr(rr, j):
+        """该片这一行插值到 sim_temp_c 的表达式（引用温度列，随实测联动）。"""
+        pts = sorted((t, ti) for ti, t in enumerate(temps) if t is not None)
+        if not pts:
+            return ref(rr, cc(j, 0))
+        if len(pts) == 1 or d.sim_temp_c <= pts[0][0]:
+            return ref(rr, cc(j, pts[0][1]))
+        if d.sim_temp_c >= pts[-1][0]:
+            return ref(rr, cc(j, pts[-1][1]))
+        for i in range(1, len(pts)):
+            (t0, i0), (t1, i1) = pts[i - 1], pts[i]
+            if t0 <= d.sim_temp_c <= t1:
+                w = (d.sim_temp_c - t0) / (t1 - t0)
+                a, b = ref(rr, cc(j, i0)), ref(rr, cc(j, i1))
+                return f"({a}+{w:g}*({b}-{a}))"
+        return ref(rr, cc(j, pts[-1][1]))
+
+    rr = 3
+    for mode in modes:
+        # -- band 行：模式分区（对齐 > 分隔 > 颜色：整行浅底 + 上边框，不做花哨）
+        for c in range(1, C_NOTE + 1):
+            _cell(ws, rr, c, fill=C_SETTING)
+        ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=FIX)
+        _cell(ws, rr, 1, mode, bold=True, fill=C_SETTING, align="left", size=11)
+        ws.merge_cells(start_row=rr, start_column=C_SIM, end_row=rr, end_column=C_NOTE)
+        freq = _mode_freq(mode, config)
+        _cell(ws, rr, C_SIM, f"测试频率 {freq}" if freq else "", fill=C_SETTING, align="left")
+        ws.row_dimensions[rr].height = 18
+        rr += 1
+
+        # -- 条件行：锁定后总电流 / 全关残留（mA，不与仿真对比）
+        for name, src in (("锁定后总电流", d.base_ma), ("全关残留电流", d.end_ma)):
+            for c in range(1, C_NOTE + 1):
+                _cell(ws, rr, c, fill=C_SETTING)
+            _cell(ws, rr, 2, name, fill=C_SETTING, align="left")
+            _cell(ws, rr, 3, "mA", fill=C_SETTING)
+            present = []
+            for j, chip in enumerate(chip_ids):
+                got = False
+                for ti, t in enumerate(temps):
+                    v = src.get((mode, chip, t))
+                    _cell(ws, rr, cc(j, ti), rnd(v, 3) if v is not None else "",
+                          fill=C_SETTING, fmt=FMT_MA)
+                    got = got or v is not None
+                if got:
+                    present.append(j)
+            _spread_cells(ws, fcell, rr, present, cc, n_t,
+                          getval=lambda j, ti, _m=mode, _s=src: _s.get((_m, chip_ids[j], temps[ti])),
+                          C_SPREAD=C_SPREAD, C_SPCT=C_SPCT, i25=i25, spread=spread,
+                          fill=C_SETTING, fmt=FMT_MA, ref=ref)
+            _cell(ws, rr, C_MEAN, "", fill=C_SETTING)
+            _cell(ws, rr, C_DEV, "", fill=C_SETTING)
+            _cell(ws, rr, C_NOTE, "基线=末个 Lock_step，整机电流，不与仿真直接对比"
+                  if name.startswith("锁定") else "末个 OFF 步实测=全部关断后仍在流的电流",
+                  fill=C_SETTING, align="left")
+            rr += 1
+
+        # -- 结果行：每个模块组一行
+        mode_rows = rows_of_mode[mode]
+        first_row = rr
+        lo_rows, all_rows = [], []
+        for key in mode_rows:
+            disp, step_name = key
+            _cell(ws, rr, 1, disp)
+            _cell(ws, rr, 2, sim_names.get(key) or step_name, align="left")
+            _cell(ws, rr, 3, "µA")
+            sv = sim_val.get((key, mode))
+            _cell(ws, rr, C_SIM, rnd(sv, 1) if sv is not None else "", fmt=FMT_UA)
+            present, vals = [], {}
+            for j, chip in enumerate(chip_ids):
+                got = False
+                for ti, t in enumerate(temps):
+                    v = matrix[key].get((mode, chip, t))
+                    vals[(j, ti)] = v
+                    _cell(ws, rr, cc(j, ti), rnd(v, 1) if v is not None else "", fmt=FMT_UA)
+                    got = got or v is not None
+                if got:
+                    present.append(j)
+            _spread_cells(ws, fcell, rr, present, cc, n_t,
+                          getval=lambda j, ti, _v=vals: _v.get((j, ti)),
+                          C_SPREAD=C_SPREAD, C_SPCT=C_SPCT, i25=i25, spread=spread,
+                          fill=None, fmt=FMT_UA, ref=ref)
+            # 均值@sim_temp / 偏差%
+            mv = _mean_at(d, [[vals.get((j, ti)) for ti in range(n_t)] for j in present])
+            if present:
+                expr = "+".join(interp_expr(rr, j) for j in present)
+                guard = ",".join(ref(rr, cc(j, ti)) for j in present for ti in range(n_t))
+                fcell(ws, rr, C_MEAN,
+                      f"=IF(COUNT({guard})<{len(present) * n_t},\"\",({expr})/{len(present)})",
+                      rnd(mv, 1), fmt=FMT_UA)
+            else:
+                _cell(ws, rr, C_MEAN, "", fmt=FMT_UA)
+            dv = (mv - sv) / sv if (mv is not None and sv not in (None, 0)) else None
+            m_ref, s_ref = ref(rr, C_MEAN), ref(rr, C_SIM)
+            fcell(ws, rr, C_DEV,
+                  f'=IF(OR({s_ref}="",{s_ref}=0,{m_ref}=""),"",({m_ref}-{s_ref})/{s_ref})',
+                  rnd(dv, 4) if dv is not None else None, fmt=FMT_PCT)
+            if (dv is not None and key not in d.caliber_keys
+                    and abs(dv) > d.thr and abs(mv - sv) > d.abs_thr):
+                ws.cell(row=rr, column=C_DEV).font = red_font
+            note = sorted(d.notes.get(key, ()))
+            fb = d.sim_fb.get((key, mode))
+            if fb:
+                note.append(f"仿真 {','.join(str(x) for x in fb)} {d.stage_main} 为 0/缺项，"
+                            f"取{d.other_stage}")
+            if sv is None and key not in lo_keys:
+                note.append("标签行，仿真未映射")
+            _cell(ws, rr, C_NOTE, "；".join(note), align="left")
+            all_rows.append(rr)
+            if key in lo_keys:
+                lo_rows.append(rr)
+            rr += 1
+
+        # -- 段末 Σ
+        for title, rws, with_sim in (("Σ LO 模块合计", lo_rows, True),
+                                     ("Σ 总合计（含标签行）", all_rows, False)):
+            if not rws:
+                continue
+            for c in range(1, C_NOTE + 1):
+                _cell(ws, rr, c, fill=C_SEP)
+            _cell(ws, rr, 2, title, bold=True, fill=C_SEP, align="left")
+            _cell(ws, rr, 3, "µA", fill=C_SEP)
+            sum_of = lambda c: (f"=SUM({ref(rws[0], c)}:{ref(rws[-1], c)})"
+                                if rws == list(range(rws[0], rws[-1] + 1))
+                                else "=" + "+".join(ref(x, c) for x in rws))
+            sv_sum = (sum(v for v in (sim_val.get((k, mode)) for k in mode_rows
+                                      if k in lo_keys) if v is not None)
+                      if with_sim else None)
+            if with_sim:
+                fcell(ws, rr, C_SIM, sum_of(C_SIM), rnd(sv_sum, 1), fill=C_SEP, fmt=FMT_UA)
+            else:
+                _cell(ws, rr, C_SIM, "", fill=C_SEP)
+            present, sums = [], {}
+            for j, chip in enumerate(chip_ids):
+                got = False
+                for ti, t in enumerate(temps):
+                    vals = [matrix[k].get((mode, chip, t)) for k in mode_rows
+                            if (k in lo_keys or not with_sim)]
+                    vals = [v for v in vals if v is not None]
+                    sums[(j, ti)] = sum(vals) if vals else None
+                    fcell(ws, rr, cc(j, ti), sum_of(cc(j, ti)),
+                          rnd(sum(vals), 1) if vals else None, fill=C_SEP, fmt=FMT_UA)
+                    got = got or bool(vals)
+                if got:
+                    present.append(j)
+            # Σ 行的片间极差 = 这颗片整段加起来比别人高/低多少，是一致性最直接的一个数
+            _spread_cells(ws, fcell, rr, present, cc, n_t,
+                          getval=lambda j, ti, _s=sums: _s.get((j, ti)),
+                          C_SPREAD=C_SPREAD, C_SPCT=C_SPCT, i25=i25, spread=spread,
+                          fill=C_SEP, fmt=FMT_UA, ref=ref)
+            if with_sim and present:
+                expr = "+".join(interp_expr(rr, j) for j in present)
+                mv = _mean_at(d, [[
+                    sum(v for v in (matrix[k].get((mode, chip_ids[j], temps[ti]))
+                                    for k in mode_rows if k in lo_keys) if v is not None)
+                    for ti in range(n_t)] for j in present])
+                fcell(ws, rr, C_MEAN, f"=({expr})/{len(present)}", rnd(mv, 1),
+                      fill=C_SEP, fmt=FMT_UA)
+                dv = (mv - sv_sum) / sv_sum if (mv is not None and sv_sum) else None
+                m_ref, s_ref = ref(rr, C_MEAN), ref(rr, C_SIM)
+                fcell(ws, rr, C_DEV,
+                      f'=IF(OR({s_ref}="",{s_ref}=0,{m_ref}=""),"",({m_ref}-{s_ref})/{s_ref})',
+                      rnd(dv, 4) if dv is not None else None, fill=C_SEP, fmt=FMT_PCT)
+                if dv is not None and abs(dv) > d.thr and abs(mv - sv_sum) > d.abs_thr:
+                    ws.cell(row=rr, column=C_DEV).font = red_font
+                _cell(ws, rr, C_NOTE, "口径与仿真一致（不含标签行）", fill=C_SEP, align="left")
+            else:
+                _cell(ws, rr, C_MEAN, "", fill=C_SEP)
+                _cell(ws, rr, C_DEV, "", fill=C_SEP)
+                _cell(ws, rr, C_NOTE, "含 DCO 等标签行，仿真未覆盖，无对比",
+                      fill=C_SEP, align="left")
+            rr += 1
+        rr += 1     # 段间空行
+
+    wb.save(out_path)
+    _inject_cached_values(out_path, fcache)
+    return len(d.runs), len(modes), n_chip
+
+
+def _closest(temps, target):
+    """最接近 target 的温度点（常温列用它定位，别写死 25）。"""
+    pts = [t for t in temps if t is not None]
+    return min(pts, key=lambda t: abs(t - target)) if pts else None
+
+
+def _mean_at(d, per_chip_series):
+    """各片先各自插值到 sim_temp_c，再取平均；有片缺值就返回 None。"""
+    vals = []
+    for series in per_chip_series:
+        v = d.interp_to(list(zip(d.temps, series)), d.sim_temp_c)
+        if v is None:
+            return None
+        vals.append(v)
+    return sum(vals) / len(vals) if vals else None
+
+
+def _spread_cells(ws, fcell, rr, present, cc, n_t, getval,
+                  C_SPREAD, C_SPCT, i25, spread, fill, fmt, ref):
+    """片间极差两列：同温度 max−min 取三温最大；极差% = 极差 ÷ 常温各片均值。
+    少于两片有数就留空——覆盖度不同的片之间做减法没有意义。"""
+    if not spread:
+        return
+    if len(present) < 2:
+        _cell(ws, rr, C_SPREAD, "", fill=fill, fmt=fmt)
+        _cell(ws, rr, C_SPCT, "", fill=fill)
+        return
+    per_t_f, per_t_v = [], []
+    for ti in range(n_t):
+        cells = [ref(rr, cc(j, ti)) for j in present]
+        per_t_f.append(f"MAX({','.join(cells)})-MIN({','.join(cells)})")
+        vs = [getval(j, ti) for j in present]
+        per_t_v.append(max(vs) - min(vs) if all(v is not None for v in vs) else None)
+    guard = ",".join(ref(rr, cc(j, ti)) for j in present for ti in range(n_t))
+    got = [v for v in per_t_v if v is not None]
+    fcell(ws, rr, C_SPREAD,
+          f'=IF(COUNT({guard})<{len(present) * n_t},"",MAX({",".join(per_t_f)}))',
+          rnd(max(got), 3 if fmt == FMT_MA else 1) if len(got) == n_t else None,
+          fill=fill, fmt=fmt)
+    base_cells = ",".join(ref(rr, cc(j, i25)) for j in present)
+    base_vals = [getval(j, i25) for j in present]
+    base = (sum(base_vals) / len(base_vals)
+            if all(v is not None for v in base_vals) else None)
+    pct = (max(got) / base) if (len(got) == n_t and base) else None
+    fcell(ws, rr, C_SPCT,
+          f'=IF(OR({ref(rr, C_SPREAD)}="",AVERAGE({base_cells})=0),"",'
+          f'{ref(rr, C_SPREAD)}/AVERAGE({base_cells}))',
+          rnd(pct, 4) if pct is not None else None, fill=fill, fmt=FMT_PCT)
+
+
+def cmd_chips(args):
+    root = os.path.dirname(os.path.abspath(args.db))
+    config, _, _ = load_config(root, args.config)
+    conn = open_db(args.db)
+    chips = None
+    if args.chip:
+        chips = [c.strip() for arg in args.chip for c in str(arg).split(",") if c.strip()]
+    n_runs, n_modes, n_chip = cmd_chips_export(conn, args.out, config, chips=chips)
+    conn.close()
+    print(f"[完成] 跨芯片汇总簿: {args.out}"
+          f"（{n_chip} 颗芯片 × {n_modes} 个模式，{n_runs} 个 run）")
 
 
 def cmd_summary(args):
@@ -2271,6 +2680,15 @@ def main():
     m.add_argument("--config", help="配置文件路径（默认取 db 同目录 current_config.json）")
     m.add_argument("--chip", action="append",
                    help="只出这些芯片（可重复或逗号分隔）；默认库里有几颗出几颗")
+
+    mc = sub.add_parser("summary-chips", help="跨芯片评审版汇总簿：仿真列只一列、一片一竖条、"
+                                              "带片间极差（多颗芯片时用这个）")
+    mc.add_argument("--db", required=True)
+    mc.add_argument("--out", required=True)
+    mc.add_argument("--config", help="配置文件路径（默认取 db 同目录 current_config.json）")
+    mc.add_argument("--chip", action="append",
+                    help="只出这些芯片（可重复或逗号分隔）；默认库里有几颗出几颗")
+    mc.set_defaults(func=cmd_chips)
     m.add_argument("--mark-fallback", action="store_true",
                    help="把跨阶段补值的仿真格标成蓝色斜体（自查版用；默认不标，"
                         "保持给人 review 的总览干净）")
