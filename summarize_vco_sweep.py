@@ -1430,6 +1430,11 @@ def _scatter(title, xtitle, ytitle, logx=False, xlim=None, ylim=None):
     if ch.legend is not None:
         ch.legend.position = "b"       # 默认在右边，会吃掉四分之一绘图区
         ch.legend.overlay = False
+    # ★ 标题的 overlay 缺省＝盖在绘图区上（openpyxl 不写这个元素），
+    #   于是轴标题压在刻度文字上。同一处兜底在 sweep_lib.legend_bottom
+    for _t in (ch.title, ch.x_axis.title, ch.y_axis.title):
+        if _t is not None and hasattr(_t, "overlay"):
+            _t.overlay = False
     if logx:
         ch.x_axis.scaling.logBase = 10
     else:
@@ -1455,12 +1460,63 @@ def _style_series(s, color, dashed=False, marker="circle", size=5):
     s.marker = mk
 
 
-def _label_points(s, idxs, numfmt="0.###"):
+def label_pos(y, bounds, x=None, xs=None, edge=0.12, top=0.22):
+    """这个点的标签往哪边放——按它在图里的位置定，躲开会撞的东西。
+
+    ★ 四种撞法都真出现过（用户 2026-08-04 报的 + 我导图看到的）：
+      · 贴顶的点标签放上面 → **顶到图标题**
+      · 贴底的放下面 → 压到横轴刻度
+      · 贴右边的 → 被右边框切掉半截
+      · 贴左边的 → 压在纵轴刻度上（"2000.000" 那一列）
+      横向先判：极值点几乎总落在横轴两端，撞边比撞标题更常发生。
+      openpyxl 只有上/下/左/右四档，给不了像素偏移，所以只能这么挑。
+    """
+    if x is not None and xs:
+        x0, x1 = min(xs), max(xs)
+        if x1 > x0:
+            fx = (x - x0) / (x1 - x0)
+            if fx >= 1 - edge:
+                return "l"
+            if fx <= edge:
+                return "r"
+    if not bounds or y is None:
+        return "t"
+    lo, hi = bounds[0], bounds[1]
+    if hi <= lo:
+        return "t"
+    return "b" if (y - lo) / (hi - lo) >= 1 - top else "t"
+
+
+def axis_numfmt(bounds):
+    """纵轴刻度的小数位按跨度定。
+
+    ★ Excel 默认跟着源格子的数字格式走：源格是 0.000，两千多兆赫的轴就写成
+      "2250.000"，一列宽字压到轴标题上（导图看出来的）。跨度大就不要小数。
+    """
+    if not bounds:
+        return None
+    span = abs(bounds[1] - bounds[0])
+    if span >= 50:
+        return "0"
+    if span >= 5:
+        return "0.0"
+    if span >= 0.5:
+        return "0.00"
+    return "0.000"
+
+
+def _label_points(s, idxs, numfmt="0.###", pos=None, color=None, sername=False):
     """只给指定的几个点打数值标签。
 
     ★ 标的是**全图的最低点和最高点**，不是每条线各标首末点：三条温度曲线在
       同一个横轴端点上值挨得很近，各标各的会叠成一坨看不清。全图两个极值点
       各一个标签，位置天然分得开，而且那两个点正是要看的。
+    ★★ 但"只标两个点"会带来另一个问题：图上三条线，标签却只有两个，
+      **看不出这两个数属于哪条线**（用户 2026-08-04 原话）。所以：
+      · sername=True 让标签带上系列名（"F@-40℃ 2212"），一眼知道是哪条；
+      · color 把标签文字染成那条线的颜色，再绑一道。
+      拉线标注（leader line）做不了：Excel 只有把标签手动挪开才画那根线，
+      而 openpyxl 的 DataLabel 没有 layout 字段、写不了偏移量。
     """
     from openpyxl.chart.label import DataLabel, DataLabelList
     if not idxs:
@@ -1470,15 +1526,31 @@ def _label_points(s, idxs, numfmt="0.###"):
     s.dLbls.showSerName = False
     s.dLbls.showCatName = False
     s.dLbls.showLegendKey = False
+    if sername:
+        s.dLbls.separator = " "
     for i in sorted(set(idxs)):
         dl = DataLabel(idx=i)
         dl.showVal = True
-        dl.showSerName = False
+        dl.showSerName = sername
         dl.showCatName = False
         dl.showLegendKey = False
         dl.numFmt = numfmt
-        dl.dLblPos = "t"
+        dl.dLblPos = (pos or {}).get(i, "t")
+        if sername:
+            dl.separator = " "
+        if color:
+            dl.txPr = _label_text(color)
         s.dLbls.dLbl.append(dl)
+
+
+def _label_text(color, size=900):
+    """标签文字的样式：染成曲线的颜色。"""
+    from openpyxl.chart.text import RichText
+    from openpyxl.drawing.text import (
+        CharacterProperties, Paragraph, ParagraphProperties, RichTextProperties)
+    pr = CharacterProperties(solidFill=color, sz=size, b=True)
+    return RichText(bodyPr=RichTextProperties(), p=[
+        Paragraph(pPr=ParagraphProperties(defRPr=pr), endParaRPr=pr)])
 
 
 def _add_series(ch, ws, n_series, head, first, last, counts=None, labels=None,

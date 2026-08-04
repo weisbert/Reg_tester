@@ -1314,11 +1314,11 @@ VCHART_H = 20
 # 四张图：Vtune 轴给"值 + 斜率"，CT 轴也给"值 + 斜率"，对称
 VCO_TAGS = ("v", "k", "c", "d")
 VCO_TITLE = {"v": "频率 vs Vtune", "k": "Kvco vs Vtune", "c": "频率 vs CT 码",
-             "d": "相邻码频率差 vs CT 码（仅常温）"}
+             "d": "δf vs CT 码（仅常温）"}
 VCO_XLABEL = {"v": "Vtune (V)", "k": "Vtune (V)", "c": "CT code", "d": "CT code"}
-VCO_YHEAD = {"v": "F", "k": "Kvco", "c": "F", "d": "ΔF"}
+VCO_YHEAD = {"v": "F", "k": "Kvco", "c": "F", "d": "δf"}
 VCO_YAXIS = {"v": "F (MHz)", "k": "Kvco (MHz/V)", "c": "F (MHz)",
-             "d": "|ΔF| (MHz/code)"}
+             "d": "|δf| (MHz/code)"}
 # 四张图都给**全图最低/最高两点**打数值标注。值图（F-vs-Vtune / F-vs-CT）的曲线
 # 是单调的，全图最低/最高点正好落在两个端点上，要的就是它们；
 # 斜率图上则是最平和最陡的那两个区间。
@@ -1441,7 +1441,7 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
     # ★ 借单簿脚本那份数值标注（只标全图最低/最高两点——三条温度曲线在同一个
     #   横轴端点上值挨得很近，各标各的会叠成一坨）。放在那边是因为它先写出来的，
     #   这里不再抄一份，抄了必然漂移。
-    from summarize_vco_sweep import _label_points
+    from summarize_vco_sweep import _label_points, axis_numfmt, label_pos
 
     ch = ScatterChart()
     ch.title = f"{chip} · {mod} " + VCO_TITLE[tag]
@@ -1468,7 +1468,7 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
         style_series(sr, color, sym, line=not sparse,
                      size=8 if sparse else (3 if len(pts) > 60 else 5))
         ch.series.append(sr)
-        built[t] = sr
+        built[t] = (sr, color)
     if tag in VCO_LABELED and built:
         pos = {x: i for i, x in enumerate(xs)}
         allp = [(y, t, x) for t in built for x, y in ser.get(t, [])]
@@ -1479,10 +1479,19 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
             want = {}
             for y, t, x in {min(allp), max(allp)}:
                 if x in pos:
-                    want.setdefault(t, []).append(pos[x])
-            for t, idxs in want.items():
-                _label_points(built[t], idxs, numfmt="0.##")
+                    want.setdefault(t, []).append((pos[x], y))
+            for t, items in want.items():
+                sr_, color = built[t]
+                # 带系列名 + 染成本条线的颜色：三条线只有两个标签时，
+                # 不这么做就看不出这两个数是哪条线上的
+                _label_points(sr_, [i for i, _y in items], numfmt="0.##",
+                              pos={i: label_pos(y, bounds, xs[i], xs)
+                                   for i, y in items},
+                              color=color, sername=True)
     apply_y(ch, bounds)
+    nf = axis_numfmt(bounds)
+    if nf:
+        ch.y_axis.numFmt = nf
     legend_bottom(ch)
     return ch
 

@@ -1173,7 +1173,7 @@ def _chart_title(text, sz=1100, bold=True):
     return Title(tx=Text(rich=RichText(p=[p])))
 
 
-def cmd_summary_export(conn, out_path, config, mark_fb=False):
+def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
     """人直接读的汇总簿：说明 / 总览(模块×模式×温度 + 仿真对比) / 温度趋势(图) / 对比明细。"""
     tier = config.get("sim_tier") or ""
     stage_main = (config.get("sim_stage") or "post").strip().lower()
@@ -1187,6 +1187,12 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False):
     runs = latest_runs(conn)
     if not runs:
         raise SystemExit("[错误] 库里没有任何实测 run")
+    if chips:
+        have = sorted({r[2] for r in runs})
+        bad = [c for c in chips if c not in have]
+        if bad:
+            raise SystemExit(f"[错误] 库里没有芯片 {', '.join(bad)}；现有: {', '.join(have)}")
+        runs = [r for r in runs if r[2] in chips]
     sim_modes = {r[0] for r in conn.execute("SELECT DISTINCT mode FROM sim_current")}
     multi_chip = len({r[2] for r in runs}) > 1
     temps = sorted({r[3] for r in runs if r[3] is not None})
@@ -1690,8 +1696,11 @@ def cmd_summary(args):
     root = os.path.dirname(os.path.abspath(args.db))
     config, _, _ = load_config(root, args.config)
     conn = open_db(args.db)
+    chips = None
+    if args.chip:
+        chips = [c.strip() for arg in args.chip for c in str(arg).split(",") if c.strip()]
     n_runs, n_rows, n_charts = cmd_summary_export(conn, args.out, config,
-                                                  mark_fb=args.mark_fallback)
+                                                  mark_fb=args.mark_fallback, chips=chips)
     conn.close()
     print(f"[完成] 功耗汇总簿: {args.out}（{n_runs} 个 run，矩阵 {n_rows} 行，{n_charts} 张趋势图）")
 
@@ -1708,6 +1717,25 @@ def walk_xlsx(root, skip_dirs, exclude_globs=()):
             if any(fnmatch.fnmatch(f, pat) for pat in exclude_globs):
                 continue
             yield os.path.join(dirpath, f)
+
+
+def chip_of_path(path, root, sim_modes, mode_map, fallback):
+    """实测文件 -> (芯片号, 当模式名用的文件夹名)。
+
+    两种目录版式并存，靠「文件夹名对不对得上一个仿真 Mode」区分，不另加开关：
+      <root>/<模式>/Result*.xlsx    老版式：文件夹名=模式名（单模式文件靠它兜底/纠错）
+      <root>/<芯片号>/*.xlsx        新版式：文件夹名=芯片号（全模式单文件自带模式标签）
+    判错的代价不对称：把芯片号误当模式名，只是让段标签兜底失效（多段文件根本不看它）；
+    把模式名误当芯片号，会让老数据整批改名。所以只在「对不上任何仿真 Mode」时才认作芯片号。
+    root 直放的文件没有文件夹可依，用 fallback（--chip，默认 C1）。"""
+    rel = os.path.relpath(os.path.dirname(path), root)
+    top = "" if rel in ("", ".", os.curdir) else rel.replace("\\", "/").split("/")[0]
+    if not top:
+        return fallback, None
+    _mode, how = resolve_mode(top, sim_modes, mode_map)
+    if how in ("config", "auto"):
+        return fallback, top
+    return top, None
 
 
 def find_sim_candidates(root, config, verbose=False):
@@ -1805,22 +1833,32 @@ def cmd_build(args):
     sim_modes = {r[0] for r in conn.execute("SELECT DISTINCT mode FROM sim_current")}
     n_runs = 0
     mapping = {}  # mode_raw -> (mode, how)
-    for f in walk_xlsx(root, skip, excl):
-        if not fnmatch.fnmatch(os.path.basename(f), result_glob):
-            continue
-        folder = os.path.basename(os.path.dirname(f))
-        results = ingest_result_file(conn, f, args.chip, config, sim_modes, folder_mode=folder)
+    fallback_chip = args.chip or "C1"
+    plan = [(f,) + chip_of_path(f, root, sim_modes, config.get("mode_map"), fallback_chip)
+            for f in walk_xlsx(root, skip, excl)
+            if fnmatch.fnmatch(os.path.basename(f), result_glob)]
+    dir_chips = sorted({c for _f, c, fm in plan if fm is None})
+    # 目录已经按芯片分好时 --chip 是有害的：它会把几颗芯片的 run 全贴成同一个名字，
+    # 而汇总簿按 (模式,芯片,温度) 只取最新一次 -> 后测的那颗静默顶掉先测的，簿子上看不出来
+    if args.chip and (len(dir_chips) > 1 or (dir_chips and dir_chips != [args.chip])):
+        raise SystemExit(
+            f"[错误] 子目录名已经是芯片号（{'/'.join(dir_chips)}），此时不要传 --chip"
+            f"（会把它们全贴成 {args.chip}，同名 run 互相顶掉且无痕）。去掉 --chip 重跑。")
+    for f, chip, folder_mode in plan:
+        results = ingest_result_file(conn, f, chip, config, sim_modes, folder_mode=folder_mode)
         n_runs += len(results)
         rel = os.path.relpath(f, root)
         if len(results) > 1:
-            print(f"[实测] {rel}  全模式单文件 -> {len(results)} 个 (模式,温度) 段:")
+            print(f"[实测] {rel}  芯片 {chip}  全模式单文件 -> {len(results)} 个 (模式,温度) 段:")
         for run_id, mode, mode_raw, how, temp, n_steps in results:
             mapping[(mode_raw, mode)] = how
-            pre = "        " if len(results) > 1 else f"[实测] {rel}  "
+            pre = "        " if len(results) > 1 else f"[实测] {rel}  芯片 {chip}  "
             print(f"{pre}{mode:<22} run#{run_id}  {n_steps} 个模块组  "
                   f"{temp if temp is not None else '?'}°C")
     if n_runs == 0:
         print("[警告] 没有扫到任何 Result 文件")
+    if dir_chips:
+        print(f"[芯片] 按子目录名认出 {len(dir_chips)} 颗: {', '.join(dir_chips)}")
 
     if mapping:
         print("[模式映射] 实测段标签 -> 仿真 Mode（config.mode_map 可强制指定）:")
@@ -2024,12 +2062,16 @@ def cmd_inspect(args):
     how_disp = {"config": "config 指定", "auto": "自动匹配", "folder": "⚠ 按文件夹名",
                 "ambig": "⚠ 多个候选未映射", "none": "⚠ 仿真表无此模式"}
     n_files = 0
+    chips_seen = {}
     for f in walk_xlsx(root, skip, excl):
         if not fnmatch.fnmatch(os.path.basename(f), result_glob):
             continue
         n_files += 1
-        folder = os.path.basename(os.path.dirname(f))
-        print(f"\n  {os.path.relpath(f, root)}")
+        # 与 build 同一条规则：文件夹名对得上仿真 Mode 就当模式名，否则当芯片号
+        chip, folder = chip_of_path(f, root, sim_modes, mode_map, "C1")
+        chips_seen.setdefault(chip, []).append(os.path.relpath(f, root))
+        print(f"\n  {os.path.relpath(f, root)}   芯片={chip}"
+              + (f"  文件夹名当模式用={folder}" if folder else ""))
         wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
         try:
             ws, hdr, cols = find_result_sheet(wb, config.get("result_sheet"))
@@ -2042,7 +2084,7 @@ def cmd_inspect(args):
             wb.close()
         print(f"    页={ws.title} 表头行={hdr} 单位列={cols['unit'] or '(空,按mA)'}  原始行 {len(raw)}")
         factor_to_ma = UNIT_TO_UA.get(cols["unit"], 1000.0) / 1000.0
-        segs = split_allmode(raw) or [{"mode": folder, "raw": raw, "temp": None}]
+        segs = split_allmode(raw) or [{"mode": folder or "?", "raw": raw, "temp": None}]
         # 与 _ingest_raw 保持同一条规则：旧单模式文件（整文件一段）段内标签与文件夹不符时
         # 文件夹名优先（见过模板复制错名）。体检必须复刻它，否则 inspect 与 build 结论会打架。
         single_legacy = (len(segs) == 1 and folder
@@ -2066,7 +2108,7 @@ def cmd_inspect(args):
                 problems.append(f"模式 {s['mode']!r} 匹配不到仿真 Mode（{how}）"
                                 f" -> 在 config.mode_map 里指定")
             elif how == "folder":
-                problems.append(f"{os.path.basename(os.path.dirname(f))} 目录里段内标签写的是"
+                problems.append(f"{folder} 目录里段内标签写的是"
                                 f" {s['mode']!r}（模板复制错名？）-> 已按文件夹名当 {mode}")
             have = sim_ids_by_mode.get(mode)
             if have is None:
@@ -2115,6 +2157,11 @@ def cmd_inspect(args):
     if n_files == 0:
         print(f"\n  ⚠ 没扫到任何匹配 {result_glob} 的文件")
         problems.append(f"没有扫到 {result_glob}")
+    elif len(chips_seen) > 1:
+        print(f"\n  芯片 {len(chips_seen)} 颗（按子目录名）: "
+              + " / ".join(f"{c}×{len(v)} 个文件" for c, v in sorted(chips_seen.items())))
+        print("    build 不要传 --chip（传了会把它们贴成同一个名字，同名 run 互相顶掉）；"
+              "summary 可用 --chip 只出其中一颗。")
 
     # ---------------------------------------------------------- 结论
     print("\n" + "=" * 72)
@@ -2173,7 +2220,8 @@ def main():
 
     b = sub.add_parser("build", help="一键：扫描数据根目录，全量重建库并导出")
     b.add_argument("--root", required=True, help="数据根目录，如 D:\\Excel")
-    b.add_argument("--chip", default="C1", help="芯片编号（默认 C1）")
+    b.add_argument("--chip", help="芯片编号；**子目录名已经是芯片号时不要传**"
+                                  "（默认按子目录名逐文件认；root 直放的文件归 C1）")
     b.add_argument("--sim", help="仿真工作簿路径（默认自动找 Current_all_mode*.xlsx）")
     b.add_argument("--db", help="SQLite 输出路径（默认 root/current.db）")
     b.add_argument("--out", help="Excel 输出路径（默认 root/Current_compare_pivot.xlsx）")
@@ -2221,6 +2269,8 @@ def main():
     m.add_argument("--db", required=True)
     m.add_argument("--out", required=True)
     m.add_argument("--config", help="配置文件路径（默认取 db 同目录 current_config.json）")
+    m.add_argument("--chip", action="append",
+                   help="只出这些芯片（可重复或逗号分隔）；默认库里有几颗出几颗")
     m.add_argument("--mark-fallback", action="store_true",
                    help="把跨阶段补值的仿真格标成蓝色斜体（自查版用；默认不标，"
                         "保持给人 review 的总览干净）")

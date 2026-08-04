@@ -588,9 +588,22 @@ def apply_y(chart, bounds):
 
 
 def legend_bottom(chart):
+    """图例放下面，并且**所有标题都别盖在绘图区上**。
+
+    ★★ OOXML 里 `<c:title>` 的 `<c:overlay>` 缺省＝盖在绘图区上，openpyxl 压根
+      不写这个元素。后果：图标题被画进绘图框**里面**，两根轴标题直接压在刻度
+      文字上（"Kvco (MHz/V)" 盖住 "275"、"Vtune (V)" 盖住 "0.4"）。
+      2026-08-04 用户报"看样子你没有做重叠检测"——真正的原因是这个默认值，
+      不是标注算法。显式置 False，Excel 才会给标题留出自己的位置。
+      放这里是因为每个画图的地方都调它，漏不掉。
+    """
     if chart.legend is not None:
         chart.legend.position = "b"
         chart.legend.overlay = False
+    for t in (chart.title, getattr(chart.x_axis, "title", None),
+              getattr(chart.y_axis, "title", None)):
+        if t is not None and hasattr(t, "overlay"):
+            t.overlay = False
 
 
 def blank_policy(chart, data_sheet_hidden=False):
