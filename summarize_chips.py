@@ -620,11 +620,15 @@ def _cond_rows(ws, r, chips, data, st, n_chips):
 
     per_chip("温度范围 (℃)", temp_range)
     per_chip("温度点数", n_points)
-    per_chip("测试频点 fLO (MHz)", lambda sw: cond_val(sw, "fLO_MHz"))
-    # 折算之后，"实测的是哪个频点"就只剩这一行还看得见了（结果行里的
-    # Freq 已经是折算后的载波）。没折算就不出这一行。
+    # ★ 这两行必须一眼分得出谁是测出来的、谁是设计上的数。原来叫
+    #   「测试频点 fLO」和「实测频点」——两个都长得像测量结果，
+    #   而它们差 4 倍，看的人只会以为哪儿算错了（用户原话："让人很误解"）。
+    #   fLO 是原表声明的**标称** LO，不是量出来的。
+    per_chip("fLO 标称 (MHz)", lambda sw: cond_val(sw, "fLO_MHz"))
+    # 折算之后，"仪器实际测的是哪个频点"就只剩这一行还看得见了
+    # （结果行里的 Freq 已经是折算后的载波）。没折算就不出这一行。
     if any(getattr(s, "scale_info", None) for s in data.values() if s is not None):
-        per_chip("实测频点 (MHz)", lambda sw: (
+        per_chip("仪器实测频点 (MHz)", lambda sw: (
             fmt_num(getattr(sw, "scale_info", {}).get("before"))
             if getattr(sw, "scale_info", None) else ""))
     per_chip("参考 fXO (MHz)", lambda sw: cond_val(sw, "fXO_MHz"))
