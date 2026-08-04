@@ -219,6 +219,131 @@ def canon_items(sweeps):
     return rows
 
 
+# ---------------------------------------------------------------- 频率折算
+
+def unit_scaling(unit):
+    """这个单位的量，载波乘 N 之后自己怎么变。
+
+    · 频率维（MHz / MHz/V / MHz/code）——直接 ×N。
+    · 相噪与杂散是**相对载波**的量：载波乘 N，相位起伏跟着乘 N，
+      落到 dB 域就是 +20·log10(N)。IPN 是积分相噪，同理；
+      Spur 的 dBc 也是同一条（杂散来自同一个相位调制，跟着载波一起被倍频）。
+    · Power_dBm / Vtune_V / Current_mA / 温度 / CT 码都不跟着变——
+      倍频器改的是频率与相位，不是这些量。
+    """
+    u = txt(unit).lower()
+    if u.startswith("mhz"):
+        return "lin"
+    if u.startswith("dbc"):
+        return "db"
+    return None
+
+
+def parse_scale(spec):
+    """`模块:类型=倍数`，逗号分隔；模块与类型都可以写 `*`，只写模块＝该模块全部类型。
+
+    倍数**只能从命令行进来**：它是"这颗芯片的测试点在真实频点的几分之一"，
+    是芯片事实，写进公开仓就等于把架构写进去了（铁律：通用引擎零真实字面量）。
+    """
+    out = []
+    for part in txt(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            sys.exit(f"--scale 这一段少了 '='：{part!r}（写法 模块:类型=倍数）")
+        key, _, val = part.rpartition("=")
+        try:
+            n = float(val)
+        except ValueError:
+            sys.exit(f"--scale 的倍数不是数：{part!r}")
+        if n <= 0:
+            sys.exit(f"--scale 的倍数必须为正：{part!r}")
+        mod, sep, kind = key.partition(":")
+        if not sep:
+            mod, kind = key, "*"
+        out.append((mod.strip() or "*", kind.strip().lower() or "*", n))
+    return out
+
+
+def scale_of(rules, mod, kind):
+    """后写的规则盖前面的——可以先写一条通配、再写某个模块的例外。"""
+    n = 1.0
+    for m, k, v in rules:
+        if m in ("*", mod) and k in ("*", kind):
+            n = v
+    return n
+
+
+def scale_book(sw, n):
+    """把一份读完的簿子里所有跟载波成比例的量折算到 N 倍频点上。
+
+    ★ 为什么在**读完之后**动 r.vals，而不是写表的时候再乘：表和图读的是同一份
+      r.vals。只改写表那一路，同一页上表里写折算后的频点、图上还画着实测频点。
+    ★ Kvco 不用单独处理：它是逐区间 ΔF/ΔVtune 算出来的，F 乘了 N 它自然就 ×N。
+      Fmin/Fmax/Tuning Range/温漂同理，全是拿 F 算的。
+    ★ 只动值不动横轴：Vtune 与 CT 码是自变量，倍频器不改它们。
+    """
+    import math
+    if not n or abs(n - 1.0) < 1e-12:
+        return None
+    db = 20.0 * math.log10(n)
+    fi = getattr(sw, "freq_item", None)
+    if fi is None and hasattr(sw, "item"):
+        fi = sw.item("Freq_MHz")
+    before = median([r.vals.get(fi.col) for r in sw.rows
+                     if r.vals.get(fi.col) is not None]) if fi is not None else None
+    n_lin = n_db = 0
+    for it in sw.items:
+        how = unit_scaling(it.unit)
+        if how is None:
+            continue
+        hit = False
+        for r in sw.rows:
+            v = r.vals.get(it.col)
+            if v is None:
+                continue
+            r.vals[it.col] = (v * n) if how == "lin" else (v + db)
+            hit = True
+        if hit:
+            n_lin, n_db = (n_lin + 1, n_db) if how == "lin" else (n_lin, n_db + 1)
+    info = {"n": n, "db": db, "before": before,
+            "after": (before * n) if before is not None else None,
+            "n_lin": n_lin, "n_db": n_db}
+    # 挂回簿子上：条件行要报"折算之前实测的是哪个频点"——
+    # 他要的是「测的是哪个、报的是哪个」两个都看得见，不是只看见折算后的那个。
+    sw.scale_info = info
+    return info
+
+
+def note_scale(sinfo, kind, mod, chip, info):
+    """记下折算结果，并当场把折算前后的频点打出来。
+
+    ★ 折算是最容易"看着对、其实错一个倍数"的改动：差 2 倍，表和图都还长得
+      像那么回事。所以每份簿子都报一句实测中位频点 → 折算后频点，
+      对不对一眼就知道。
+    """
+    if not info:
+        return
+    sinfo.setdefault(kind, {})[mod] = info
+    n = fmt_num(info["n"], 4)
+    b, a = info["before"], info["after"]
+    print(f"     · 折算 ×{n}：频率类 {info['n_lin']} 项 ×{n}"
+          + (f"（实测中位 {fmt_num(b)} → {fmt_num(a)} MHz）" if b is not None else "")
+          + f"，相噪/杂散 {info['n_db']} 项 {info['db']:+.2f} dB")
+
+
+def scale_title(info):
+    """折算这件事必须**印在表上**——它是取数条件，不是给填表人看的说明。
+
+    放大标题那一行：一张表一句，不在每一行的备注里重复 40 遍。
+    """
+    if not info:
+        return ""
+    n = fmt_num(info["n"], 4)
+    return f"（折算 ×{n}：频率 ×{n}，相噪/杂散 {info['db']:+.1f} dB）"
+
+
 def temp_view(sw, item):
     """{温度: [该温度经过的每一次的值]}。整趟温巡四段各走一遍，同温会有 2~4 个值。"""
     d = {}
@@ -463,6 +588,12 @@ def _cond_rows(ws, r, chips, data, st, n_chips):
     per_chip("温度范围 (℃)", temp_range)
     per_chip("温度点数", n_points)
     per_chip("测试频点 fLO (MHz)", lambda sw: cond_val(sw, "fLO_MHz"))
+    # 折算之后，"实测的是哪个频点"就只剩这一行还看得见了（结果行里的
+    # Freq 已经是折算后的载波）。没折算就不出这一行。
+    if any(getattr(s, "scale_info", None) for s in data.values() if s is not None):
+        per_chip("实测频点 (MHz)", lambda sw: (
+            fmt_num(getattr(sw, "scale_info", {}).get("before"))
+            if getattr(sw, "scale_info", None) else ""))
     per_chip("参考 fXO (MHz)", lambda sw: cond_val(sw, "fXO_MHz"))
     per_chip("锁定方式", lambda sw: f"{len(sw.legs)} 段，每段开头重锁一次")
     return r
@@ -604,7 +735,7 @@ def _limit_dropdown(ws, r0, r1):
     dv.add(f"{_cl(C_LIMIT)}{r0}:{_cl(C_LIMIT)}{r1}")
 
 
-def write_summary(wb, tables, chips, st, slim=False):
+def write_summary(wb, tables, chips, st, slim=False, sinfo=None):
     """tables = [(模块名, {芯片: Sweep}), ...]，一个模块一张表，从上到下排。"""
     ws = wb.create_sheet("PLL_Summary")
     n = len(chips)
@@ -631,7 +762,9 @@ def write_summary(wb, tables, chips, st, slim=False):
         items = canon_items(sweeps)
         tpick, tlabels = pick_temps(sweeps)
         t0 = r                                   # 这张表的第一行（大标题）
-        r = _header(ws, r, chips, st, f"{mod} PLL 性能汇总", n, tlabels)
+        r = _header(ws, r, chips, st,
+                    f"{mod} PLL 性能汇总{scale_title((sinfo or {}).get(mod))}",
+                    n, tlabels)
         r = _cond_rows(ws, r, chips, data, st, n)
         j0 = r
         for band, rows in items:
@@ -1006,7 +1139,7 @@ def op_vtune_of(sw):
     return None
 
 
-def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
+def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False, sinfo=None):
     """VCO 汇总表：每颗芯片的组内轴＝三个温度（不是 Min/Typ/Max）。
 
     ★ 为什么这里用温度当轴、PLL 那页用极值当轴：VCO 这些量本来就是"一个温度
@@ -1015,11 +1148,11 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False):
       压缩有真收益。
     """
     return write_grouped_page(wb, "VCO_Summary", "{mod} VCO 开环特性汇总",
-                              vtables, chips, st, vtemps, slim=slim)
+                              vtables, chips, st, vtemps, slim=slim, sinfo=sinfo)
 
 
 def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
-                       slim=False, item_w=26, note_w=46):
+                       slim=False, item_w=26, note_w=46, sinfo=None):
     """「一行一个量 × 每片若干温度」这种页的通用写法。
 
     ★ VCO 汇总页和电流页是同一个形状：行是结论量、组内轴是温度、汇总列对
@@ -1061,8 +1194,9 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
     for mod, data in vtables:
         t0 = r
         # ---- 三行表头 ----
-        c = put(ws, r, C_ITEM, title_fmt.format(mod=mod), st, st["f_sep"],
-                bold=True, align="left", size=12)
+        c = put(ws, r, C_ITEM,
+                title_fmt.format(mod=mod) + scale_title((sinfo or {}).get(mod)),
+                st, st["f_sep"], bold=True, align="left", size=12)
         ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
         c.alignment = _align("left", wrap=False)
         hr, ar = r + 1, r + 2
@@ -1731,6 +1865,12 @@ def main():
                          "把那一组写成 {\"keys\": [步骤键…], \"note\": \"…\"}。"
                          "★含真实模块名，放黄区本地/private，别提交。"
                          "不给＝所有关断步骤按文件顺序排成一组")
+    ap.add_argument("--scale", default="",
+                    help="把结果折算到倍频点上：`模块:类型=倍数`，逗号分隔，"
+                         "类型＝pll/vco，模块与类型都可以写 *。"
+                         "例：\"A:pll=4,A:vco=8,B:vco=2\"。"
+                         "频率与 Kvco ×倍数，相噪/杂散/IPN +20log10(倍数) dB；"
+                         "功率/压控电压/电流/温度不动。倍数印在表的大标题上")
     ap.add_argument("--cur-col", default=None, help="电流值列（默认自动找）")
     ap.add_argument("--key-col", default=None, help="步骤名那一列（默认自动找）")
     ap.add_argument("--no-current", action="store_true", help="不做电流页")
@@ -1792,6 +1932,12 @@ def main():
     # ---- 读 PLL 温扫 ----
     tables, failed, notes, warn_seen, vcharts = [], [], {}, {}, []
     excl_all = []
+    scale_rules = parse_scale(args.scale)
+    sinfo = {}
+    if scale_rules:
+        print()
+        print("折算规则: " + "，".join(
+"%s:%s ×%s" % (m, k, fmt_num(v, 4)) for m, k, v in scale_rules))
     for mod in modules:
         books = grid.get(KIND_PLL, {}).get(mod, {})
         if not books:
@@ -1812,6 +1958,8 @@ def main():
                 print(f"  {chip}: 读失败 —— {e}")
                 continue
             data[chip] = sw
+            note_scale(sinfo, KIND_PLL, mod, chip,
+                       scale_book(sw, scale_of(scale_rules, mod, KIND_PLL)))
             n_meas = sum(1 for lg in sw.legs for x in lg.rows if x.kind != "lock")
             notes[id(b)] = f"{sw.n_rows}行×{sw.n_cols}列"
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
@@ -1858,6 +2006,10 @@ def main():
                 failed.append((b, f"{type(e).__name__}: {e}"))
                 print(f"  {chip}: 读失败 —— {e}")
                 continue
+            # ★ 折算必须在 vco_rows 之前：Fmin/Fmax/Kvco/温漂全是拿 F 现算的，
+            #   先折算，它们自己就跟着 ×N 了。
+            note_scale(sinfo, KIND_VCO, mod, chip,
+                       scale_book(sw, scale_of(scale_rules, mod, KIND_VCO)))
             # 工作点用第一颗芯片的（CT 扫钉住的那个 Vtune）统一喂给全部芯片：
             # 否则各片的组名会变成「@ Vtune 0.4V」「@ Vtune 0.45V」，行对不齐
             if op is None:
@@ -2023,10 +2175,12 @@ def main():
     wb.remove(wb.active)
     st = styles()
     if tables:
-        write_summary(wb, tables, chips_pll, st, slim=args.slim)
+        write_summary(wb, tables, chips_pll, st, slim=args.slim,
+                      sinfo=sinfo.get(KIND_PLL))
         write_journey(wb, tables, chips_pll, st, no_charts=args.no_charts)
     if vtables:
-        write_vco_summary(wb, vtables, chips_vco, st, vtemps, slim=args.slim)
+        write_vco_summary(wb, vtables, chips_vco, st, vtemps, slim=args.slim,
+                          sinfo=sinfo.get(KIND_VCO))
         write_vco_charts(wb, vcharts, chips_vco, st, vtemps,
                          no_charts=args.no_charts)
     # 电流页放最后：前四页是成对的（汇总+过程），别插进它们中间
