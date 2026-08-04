@@ -1526,6 +1526,10 @@ def _label_points(s, idxs, numfmt="0.###", pos=None, color=None, sername=False):
     s.dLbls.showSerName = False
     s.dLbls.showCatName = False
     s.dLbls.showLegendKey = False
+    # ★ numfmt 对标签其实不生效：Excel 的数据标签**只认源格子的数字格式**
+    #   （单点上写、系列级上写、补 sourceLinked="0"，三种都试过，导图确认无效）。
+    #   所以标签的小数位＝数据块那一列的格子格式，要改得去改源格子。留着这个参数
+    #   是因为别的阅读器认，且无害。
     if sername:
         s.dLbls.separator = " "
     for i in sorted(set(idxs)):
@@ -1605,23 +1609,38 @@ CHART_ITEMS = {"vtune": ("Freq_MHz", "Power_dBm", "IPN_SSB", "Current_mA"),
                "ct": ("Freq_MHz", "IPN_SSB")}
 
 
-def _extreme_labels(sers, xrow, first):
-    """挑出全图的最低点和最高点，返回 {系列下标: [该系列里要标的点下标]}。"""
-    lo = hi = None
-    for i, d in enumerate(sers):
-        for x, v in d.items():
-            if x not in xrow:
-                continue
-            idx = xrow[x] - first
-            if lo is None or v < lo[0]:
-                lo = (v, i, idx)
-            if hi is None or v > hi[0]:
-                hi = (v, i, idx)
-    out = {}
-    for b in (lo, hi):
-        if b:
-            out.setdefault(b[1], []).append(b[2])
-    return out
+def room_series(groups, target=25.0):
+    """哪一条是常温那条（标注只标它）。"""
+    best = None
+    for i, g in enumerate(groups):
+        t = getattr(g, "temp", None)
+        if t is None:
+            continue
+        d = abs(t - target)
+        if best is None or d < best[0]:
+            best = (d, i)
+    return best[1] if best else 0
+
+
+def _extreme_labels(sers, xrow, first, pick=None):
+    """挑要标数值的点，返回 {系列下标: [该系列里要标的点下标]}。
+
+    ★★ 标的是**同一条线**（默认常温那条）的最低点和最高点，不是全图两个极值。
+      原来取全图极值：最高点落在 −40℃ 那条、最低点落在 105℃ 那条，
+      两个标签一蓝一绿分属两条线——用户："为什么最高点和最低点的颜色不一样？
+      感觉怪怪的，我觉得同一条曲线的最高最低才合理"。他是对的：同一条线的两端
+      才是一对能读出意思的数（这条线从哪走到哪）；跨温度的包络在表里有专门的行。
+    """
+    cand = [pick] if (pick is not None and 0 <= pick < len(sers)) else []
+    cand += [i for i in range(len(sers)) if i not in cand]
+    for i in cand:                      # 常温那条没点就顺延到下一条
+        d = sers[i]
+        pts = [(v, xrow[x] - first) for x, v in d.items() if x in xrow]
+        if not pts:
+            continue
+        lo, hi = min(pts), max(pts)
+        return {i: sorted({lo[1], hi[1]})}
+    return {}
 
 
 def write_charts(wb, panels, st, all_charts=False):
@@ -1640,7 +1659,8 @@ def write_charts(wb, panels, st, all_charts=False):
                           ylim=_nice(min(ys), max(ys)) if ys else None)
             # 关键点 = 每条线自己的首末点，标上数值，不用对着坐标轴猜
             xrow = lay["xrow"].get(it.col, {})
-            labels = _extreme_labels(sers, xrow, first)
+            labels = _extreme_labels(sers, xrow, first,
+                                     pick=room_series(groups))
             _add_series(ch, ws_src, n_col, head, first, last,
                         [len(d) for d in sers], labels,
                         target_idx=len(groups) if tgt is not None else None)
@@ -1659,7 +1679,8 @@ def write_slope_chart(grid, ws_slope, groups, anchor, title, xlabel, unit,
                   xlim=_nice(min(xs), max(xs)) if xs else None,
                   ylim=_nice(min(ys), max(ys)) if ys else None)
     _add_series(ch, ws_slope, len(groups), head, first, last, counts,
-                _extreme_labels(sers or [], xrow or {}, first))
+                _extreme_labels(sers or [], xrow or {}, first,
+                                pick=room_series(groups)))
     grid.add(ch)
 
 
@@ -1712,7 +1733,8 @@ def write_pn_chart(wb, grid, groups, pn_items, st, src_title, op_x=None):
     for _g, _xm, row in picks:
         pn_sers.append(dict((i, row.vals[it.col]) for i, it in enumerate(pn_items)
                             if row.vals.get(it.col) is not None))
-    pn_labels = _extreme_labels(pn_sers, pn_row, 3)
+    pn_labels = _extreme_labels(pn_sers, pn_row, 3,
+                                pick=room_series(groups))
 
     ch = _scatter("相噪 vs offset", "offset (MHz)", "dBc/Hz", logx=True)
     xref = Reference(ws, min_col=1, min_row=3, max_row=2 + len(pn_items))

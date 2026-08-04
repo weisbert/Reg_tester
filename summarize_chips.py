@@ -1471,15 +1471,23 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
         built[t] = (sr, color)
     if tag in VCO_LABELED and built:
         pos = {x: i for i, x in enumerate(xs)}
-        allp = [(y, t, x) for t in built for x, y in ser.get(t, [])]
-        if allp:
+        if built:
             # ★ 同一个系列上的多个标注要**一次交给它**：_label_points 每次调用都
             #   重建 s.dLbls，分两次调等于第二次把第一次的覆盖掉（曲线是直线时
             #   最低点和最高点落在同一条系列上，就会只剩一个标注）。
+            # ★★ 只标**一条线**（常温那条）的最低/最高。原来标的是全图两个极值：
+            #   最高点落在 −40℃ 那条、最低点落在 105℃ 那条，两个标签一蓝一绿
+            #   分属两条线——用户："为什么最高点和最低点的颜色不一样？感觉怪怪的，
+            #   我觉得同一条曲线的最高最低才合理"。同一条线的两端才是一对能读出
+            #   意思的数（这条线从哪走到哪）；跨温度的包络表里有专门的行。
             want = {}
-            for y, t, x in {min(allp), max(allp)}:
-                if x in pos:
-                    want.setdefault(t, []).append((pos[x], y))
+            for t_lab in sorted(built, key=lambda t: abs(t - 25.0)):
+                pts_ = [(y, x) for x, y in ser.get(t_lab, []) if x in pos]
+                if not pts_:
+                    continue                    # 常温那条没点就顺延
+                for y, x in {min(pts_), max(pts_)}:
+                    want.setdefault(t_lab, []).append((pos[x], y))
+                break
             for t, items in want.items():
                 sr_, color = built[t]
                 # 带系列名 + 染成本条线的颜色：三条线只有两个标签时，
