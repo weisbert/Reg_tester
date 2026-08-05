@@ -1288,9 +1288,12 @@ def summary_data(conn, config, chips=None):
                 siminfo[key] = (json.loads(sim_ids_j), sim_mode)
             if note:
                 if "不在被测LDO" in note:
-                    caliber_keys.add(key)
+                    caliber_keys.add(key)   # ★这个标记要留着：它是"不标红"的判据
+                # 正表备注只留跨模式标签映射。LDO 归并那句（"含模块8的实测delta，
+                # 8 不在被测 LDO 下…"）是写给出簿的人的口径说明，2026-08-05 移出正表——
+                # 口径在说明页/_审计 页；原始 note 仍在库里和 pivot 里，追得到。
                 keep = "；".join(x for x in note.split("；")
-                                 if "不在被测LDO" in x or ("映射" in x and "未映射" not in x))
+                                 if "映射" in x and "未映射" not in x)
                 if keep:
                     notes.setdefault(key, set()).add(keep)
     def _row_sort_key(k):
@@ -1605,6 +1608,10 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
     # 偏差红标改为写单元格时的双阈值静态染色（见 flag_red）——绝对偏差不在表内，
     # 条件格式无法做「|Δ%|>阈 且 |ΔµA|>阈」的联合判断，故用 Python 直接染红粗。
     ws.freeze_panes = ws.cell(row=r_freq, column=FIX + 1)
+    # 一条备注都没有就把这列藏了（空着的"备注"表头本身也是噪声）
+    if not any(ws.cell(row=r, column=note_col).value
+               for r in range(r_freq, (r_all or r_sum) + 1)):
+        ws.column_dimensions[get_column_letter(note_col)].hidden = True
 
     # ================= 温度趋势 =================
     n_charts = 0
@@ -2021,6 +2028,9 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
     _vedges(ws, 1, rr, SUM_C0, SUM_C1)
     for g in guides:
         _hguide(ws, g, 1, C_NOTE)
+    # 一条备注都没有就把这列藏了：空着的"备注"表头本身也是噪声
+    if not any(ws.cell(row=r, column=C_NOTE).value for r in range(3, rr + 1)):
+        ws.column_dimensions[get_column_letter(C_NOTE)].hidden = True
 
     # ================= _审计（隐藏页：口径与来源，不是读法） =================
     # 要追口径的人取消隐藏就能看到，评审打开簿子看到的仍然只有数。
