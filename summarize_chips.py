@@ -2164,11 +2164,14 @@ def _xfrm(sinfo, kind, mod, dsb, label, unit):
     return add, mul
 
 
-def _book_cell(wb, label, chip, temp):
+def _book_cell(wb, label, chip, temp, sheets):
     """在产出的簿子里找到 (行名, 芯片, 温度) 那一格。**按内容找，不按坐标算**——
     算坐标就等于把版式规则抄第二遍，版式一改追溯就悄悄指错格子。"""
+    # ★ 必须指定在哪一页找：同一个行名（IPN_DSB）PLL 页和 VCO 页都有，
+    #   按页序碰运气就会拿 PLL 的格子去对 VCO 的数，然后报一片 ✗。
+    #   （这个 bug 就是被这条检查自己抓出来的。）
     tag = f"{fmt_num(temp)}℃"
-    for name in ("PLL_Summary", "VCO_Summary", "Current_Summary"):
+    for name in sheets:
         if name not in wb.sheetnames:
             continue
         ws = wb[name]
@@ -2187,7 +2190,8 @@ def _book_cell(wb, label, chip, temp):
     return None, None
 
 
-def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None):
+def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None,
+         sheets=()):
     """把一格的来龙去脉打出来：原表哪几行 → 原始值 → 加了什么 → 等于多少。"""
     from openpyxl.utils import get_column_letter as gl
     print(f"  {chip}  {fmt_num(t)}℃")
@@ -2205,7 +2209,7 @@ def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None):
         line += f"  ×{fmt_num(mul, 4)}"
     line += f"  →  {round(base, 6)} {unit}"
     if wb is not None and label:
-        where, got = _book_cell(wb, label, chip, t)
+        where, got = _book_cell(wb, label, chip, t, sheets)
         if where is None:
             line += "   （表上不列这个温度）"
         else:
@@ -2246,7 +2250,8 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
                 med_after = median([p[3] for p in pts])
                 med_before = (med_after / mul) - sum(d for _n, d in add)
                 _say(chip, t, "", [(a, b, c) for a, b, c, _d in pts], med_before,
-                     add, mul, it.unit, f"{len(pts)} 个点的中位数", wb, label)
+                     add, mul, it.unit, f"{len(pts)} 个点的中位数", wb, label,
+                     ("PLL_Summary",))
     for mod, chips_ in vsweeps.items():           # VCO 页：工作点那一个点
         for chip, sw in chips_.items():
             it = next((x for x in sw.items if x.label == label), None)
@@ -2273,7 +2278,8 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
                     before = (after / mul) - sum(d for _n, d in add)
                     _say(chip, g.temp, "", [(r.xl, r.col_of(it), r.raw[r.col_of(it)])],
                          before, add, mul, it.unit,
-                         f"Vtune={fmt_num(x, 4)} 那一点", wb, label)
+                         f"Vtune={fmt_num(x, 4)} 那一点", wb, label,
+                         ("VCO_Summary",))
     if not hit:
         print(f"  没有哪份簿子有叫「{label}」的行。表上的行名照抄即可"
               f"（IPN_DSB / SpotPN@1kHz / Spur@26MHz / Freq_MHz …）")
