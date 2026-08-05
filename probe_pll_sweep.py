@@ -523,6 +523,61 @@ def cols_map(ws, reveal, hide, start="A", header_row=1):
     return out
 
 
+def rows_view(ws, want, where, header_row=1, cap=400):
+    """逐行只打指定的几列。给"某一格的数看着不对，去原表找那一行"用。
+
+    ★ 跟 --cols 是一对：那个横着看结构，这个竖着看数据。
+      列必须逐个点名（不支持通配），所以它跟 --reveal 一样是**显式脱敏例外**——
+      打出来的就是你自己点的那几列。
+    """
+    all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    if not all_rows:
+        return ["（空表）"]
+    header = ["" if h is None else str(h).strip()
+              for h in all_rows[header_row - 1]]
+    idx = {}
+    for name in want:
+        if name in header:
+            idx[name] = header.index(name)
+        else:
+            return ["找不到列 %r；表头里有：%s" % (name, "，".join(h for h in header if h)[:400])]
+    flt = []
+    for cond in where:
+        k, _sep, v = cond.partition("=")
+        k = k.strip()
+        if k not in header:
+            return ["--where 里找不到列 %r" % k]
+        flt.append((header.index(k), v.strip()))
+    out = ["%s: 只打这几列 —— %s" % (ws.title, " | ".join(want)),
+           "行 | " + " | ".join(want)]
+    n = 0
+    for i, r in enumerate(all_rows[header_row:], start=header_row + 1):
+        if all(is_blank(v) for v in r):
+            continue
+        ok = True
+        for ci, v in flt:
+            cell = ("" if ci >= len(r) or r[ci] is None
+                    else str(r[ci]).strip())
+            if cell != v and norm(cell) != norm(v):
+                try:
+                    ok = abs(float(cell) - float(v)) < 1e-9
+                except ValueError:
+                    ok = False
+            if not ok:
+                break
+        if not ok:
+            continue
+        n += 1
+        if n > cap:
+            out.append("…（还有更多，用 --where 收窄，或加大 --rows-cap）")
+            break
+        out.append("%d | " % i + " | ".join(
+            ("" if idx[c] >= len(r) or r[idx[c]] is None
+             else str(r[idx[c]]).strip()) for c in want))
+    out.append("共 %d 行" % min(n, cap))
+    return out
+
+
 def classify_only(ws, reveal, hide, max_patterns=4, max_empty_names=20):
     """最小输出：每种块只报一次 表头 -> 分类 -> 非空计数，先核对脱敏边界对不对。
 
@@ -694,6 +749,14 @@ def main():
                     help="逐列打一张「列字母|表头|分类|非空行数」清单（纯文本，零数值）。"
                          "可给起始列字母，例 --cols GA 只看尾部那一段。"
                          "认按列位置读的块（表头是数字或干脆没表头的）用这个")
+    ap.add_argument("--rows", default="",
+                    metavar="列1,列2",
+                    help="逐行只打这几列（逗号分隔表头名，要写全名）。"
+                         "跟 --cols 是一对：那个横着看结构，这个竖着看数据。"
+                         "★显式脱敏例外：打出来的就是你点名的那几列")
+    ap.add_argument("--where", default="", metavar="列=值",
+                    help="配合 --rows：只打该列等于这个值的行（多个条件用 ; 分隔）")
+    ap.add_argument("--rows-cap", type=int, default=400, help="--rows 最多打几行")
     ap.add_argument("--conds", action="store_true",
                     help="只出条件面：条件列取值+出现次数 + 逐行条件表（零性能数值）；"
                          "用来看扫描维度怎么组合、同一条件是否重复测了多轮")
@@ -726,6 +789,13 @@ def main():
                          else "conds-only" if args.conds else args.level),
         "note": "cond/setpoint 列出全值；perf 列默认不出任何数值",
     }
+    if args.rows:
+        want = [c.strip() for c in args.rows.split(",") if c.strip()]
+        where = [c for c in args.where.split(";") if c.strip()]
+        for n in names:
+            print(chr(10).join(rows_view(wb[n], want, where, cap=args.rows_cap)))
+            print()
+        return
     if args.cols:
         # 纯文本直接打，不走 JSON：这张表是给人肉眼看列位置的
         for n in names:
