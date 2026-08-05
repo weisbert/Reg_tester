@@ -2145,6 +2145,103 @@ def check_scale(imp, n, chip, kind_label, tol=0.10):
               f"要么在 {CONFIG_NAME} 里配 scale，要么确认这份就该按实测报")
 
 
+# ---------------------------------------------------------------- 追溯
+
+def _xfrm(sinfo, kind, mod, dsb, label, unit):
+    """这一行在折算里被加了多少 dB / 乘了多少。返回 (加法项列表, 乘数)。"""
+    add, mul = [], 1.0
+    info = (sinfo.get(kind) or {}).get(mod)
+    how = unit_scaling(unit)
+    if info and how == "lin":
+        mul = info["n"]
+    elif info and how == "db":
+        add.append((f"×{fmt_num(info['n'], 4)} 折算", info["db"]))
+    if dsb and label.startswith("IPN"):
+        add.append(("SSB→DSB", DSB_DB))
+    return add, mul
+
+
+def _say(chip, t, srcname, rows, agg, add, mul, unit, how):
+    """把一格的来龙去脉打出来：原表哪几行 → 原始值 → 加了什么 → 等于多少。"""
+    from openpyxl.utils import get_column_letter as gl
+    print(f"  {chip}  {fmt_num(t)}℃")
+    for xl, col, raw in rows[:8]:
+        print(f"      原表 {srcname} 行{xl} 列{gl(col + 1)}  {raw}")
+    if len(rows) > 8:
+        print(f"      …共 {len(rows)} 行（{how}）")
+    base = agg
+    line = f"      {how} = {round(base, 6)}"
+    for name, d in add:
+        base += d
+        line += f"  {name} {d:+.2f}"
+    if mul != 1.0:
+        base *= mul
+        line += f"  ×{fmt_num(mul, 4)}"
+    print(line + f"  →  {round(base, 6)} {unit}")
+
+
+def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg):
+    """把某一行的数一路追回原表。**用来分清是程序算错了还是数据本身就这样。**
+
+    ★ 这个问题会反复出现：某一格看着离谱（IPN 是正的、杂散差 60 dB、
+      复测差 58%），第一反应总是"是不是脚本弄错了"。争论没用，把原表的
+      行号列号、原始值、加了几 dB、加完等不等于表上那个数，一路摊开就完了。
+    """
+    from summarize_vco_sweep import group_series
+    print()
+    print(f"=== 追溯「{label}」===")
+    hit = False
+    for mod, data in tables:                      # PLL 页：该温度全部经过点的中位数
+        for chip, sw in data.items():
+            it = sw.item(label)
+            if it is None:
+                continue
+            hit = True
+            print(f"[{mod} PLL 温扫] {os.path.basename(sw.path)}")
+            add, mul = _xfrm(sinfo, KIND_PLL, mod, dsb, label, it.unit)
+            for t in sw.temps:
+                pts = [(r.xl, r.col_of(it), r.raw[r.col_of(it)], r.vals[it.col])
+                       for lg in sw.legs for r in lg.rows
+                       if r.kind != "lock" and r.temp == t
+                       and r.vals.get(it.col) is not None]
+                if not pts:
+                    continue
+                # 表上那格 = 折算后各点的中位数；反推回折算前好跟原表对
+                med_after = median([p[3] for p in pts])
+                med_before = (med_after / mul) - sum(d for _n, d in add)
+                _say(chip, t, "", [(a, b, c) for a, b, c, _d in pts], med_before,
+                     add, mul, it.unit, f"{len(pts)} 个点的中位数")
+    for mod, chips_ in vsweeps.items():           # VCO 页：工作点那一个点
+        for chip, sw in chips_.items():
+            it = next((x for x in sw.items if x.label == label), None)
+            if it is None:
+                continue
+            hit = True
+            print(f"[{mod} VCO 开环] {os.path.basename(sw.path)}")
+            add, mul = _xfrm(sinfo, KIND_VCO, mod, dsb, label, it.unit)
+            op = op_cfg if op_cfg else op_vtune_of(sw)
+            for kind, groups in sw.by_kind:
+                if kind != "vtune":
+                    continue
+                for g in groups:
+                    ser = group_series(g, it)
+                    if not ser or g.temp is None or op is None:
+                        continue
+                    x = min(ser, key=lambda z: abs(z - op))
+                    r = next((rr for rr in g.rows
+                              if rr.vt is not None and abs(rr.vt - x) < 1e-9
+                              and rr.vals.get(it.col) is not None), None)
+                    if r is None:
+                        continue
+                    after = r.vals[it.col]
+                    before = (after / mul) - sum(d for _n, d in add)
+                    _say(chip, g.temp, "", [(r.xl, r.col_of(it), r.raw[r.col_of(it)])],
+                         before, add, mul, it.unit, f"Vtune={fmt_num(x, 4)} 那一点")
+    if not hit:
+        print(f"  没有哪份簿子有叫「{label}」的行。表上的行名照抄即可"
+              f"（IPN_DSB / SpotPN@1kHz / Spur@26MHz / Freq_MHz …）")
+
+
 # ---------------------------------------------------------------- 出稿自查
 
 def selfcheck(path):
@@ -2289,6 +2386,11 @@ def main():
                          "把那一组写成 {\"keys\": [步骤键…], \"note\": \"…\"}。"
                          "★含真实模块名，放黄区本地/private，别提交。"
                          "不给＝所有关断步骤按文件顺序排成一组")
+    ap.add_argument("--trace", default="",
+                    help="把某一行的数一路追到原表：给行名（如 IPN_DSB / Freq_MHz / "
+                         "SpotPN@1kHz），逐芯片逐温度打出「原表第几行第几列、原始值多少、"
+                         "折算加了多少、加完等不等于表上那个数」。"
+                         "用来分清「是程序算错了」还是「数据本身就这样」")
     ap.add_argument("--chart-w", type=float, default=None,
                     help=f"每张图的宽度 cm（默认 {CHART_W_CM}）。芯片竖条的列宽会跟着"
                          "等比撑开，保证放得下——图宽和列宽是同一个数推出来的，"
@@ -2467,7 +2569,7 @@ def main():
         warn_seen.clear()
 
     # ---- 读 VCO 开环 ----
-    vtables, vtemps = [], []
+    vtables, vtemps, vsweeps = [], [], {}
     for mod in modules:
         books = grid.get(KIND_VCO, {}).get(mod, {})
         if not books or args.no_vco:
@@ -2508,6 +2610,7 @@ def main():
             fv, kv, fc, fd = _vco_series(sw, temps)
             vrows[chip] = rows
             vdata[chip] = {"v": fv, "k": kv, "c": fc, "d": fd}
+            vsweeps.setdefault(mod, {})[chip] = sw      # --trace 要用
             notes[id(b)] = f"{sw.ws_val.max_row}行×{sw.ws_val.max_column}列"
             coarse = coarse_temps(sw)
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
@@ -2752,6 +2855,8 @@ def main():
         print(f"  提示: {len(chips)} 颗芯片＝实测区 {len(chips) * CHIP_W} 列，"
               f"横着容易数不清第几片。加 --slim 每片只显示常温列"
               f"（其余折起来，点 ＋ 就能展开核对）。")
+    if args.trace:
+        trace_item(args.trace, tables, vsweeps, sinfo, dsb, op_vtune_cfg)
     fails, n_agg, n_f = selfcheck(out)
     print(f"  自查: {n_agg} 个汇总格子都能在同一行的格子里找到；"
           f"{n_f} 个判定公式没有留下缓存值"
