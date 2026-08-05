@@ -28,7 +28,8 @@ summarize_chips.py — 一个目录里的多颗芯片 → 一份给评审看的�
     · 正表里不写使用说明、不写告警、不写排除记录——那些打在控制台。
     · 讲不清的参数不进表：压控电压/片上温度/电流都**不进**汇总表
       （压控看「温巡」页的图，电流另有专门的表格，格式定了再加页）。
-    · 判定只看 Spec Min/Max 两头，Typ 与仿真列只作对照。
+    · 判定看 Limit 列的方向 + Spec 的 Min/Max：≤ 只判上限、≥ 只判下限、
+      range 两头都判。Typ 与仿真列只作对照，不参与判定。
 
 用法：
     python summarize_chips.py <根目录>
@@ -734,18 +735,49 @@ def _cond_rows(ws, r, chips, data, st, n_chips):
     return r
 
 
-def _judge_formula(r):
-    """判定公式：Spec 一头没填就只判填了的那头，两头都没填就不判（留空）。
+def _cells(r):
+    """判定要用到的四个格子：Spec 的 Min/Max、汇总的 Min/Max。"""
+    return (f"${_cl(C_SPEC)}{r}", f"${_cl(C_SPEC + 2)}{r}",
+            f"{_cl(C_SUM)}{r}", f"{_cl(C_SUM + 2)}{r}")
 
-    只用 Spec 的 Min/Max 判，跟 Limit 列无关——Limit 只是给填 spec 的人
-    提示方向（≤/≥/range）。判的对象是**汇总列**，不是逐片判。
+
+def _bound(r, kind):
+    """单边指标的那一道界在哪一格。
+
+    `≤` 优先看 Max 格、`≥` 优先看 Min 格；那一格空着就用另一格。
+    ★ 不强求填在"对"的格子里：`Fmin ≤ 2884` 这种要求，人会很自然地把 2884
+      写进 **Min** 格（它说的是频率能下探到哪）。硬要求填对格子，代价是
+      那一行**悄悄不判**——比判错还难发现。外面有 COUNT 两格的总护栏，
+      两格都空时这个表达式取到的 0 不会被用上。
     """
-    dmin, dmax = f"${_cl(C_SPEC)}{r}", f"${_cl(C_SPEC + 2)}{r}"
-    smin, smax = f"{_cl(C_SUM)}{r}", f"{_cl(C_SUM + 2)}{r}"
+    dmin, dmax, _l, _h = _cells(r)
+    a, b = (dmax, dmin) if kind == "≤" else (dmin, dmax)
+    return f"IF(COUNT({a})>0,{a},{b})"
+
+
+def _judge_formula(r):
+    """判定公式：**Limit 列说的方向** + Spec 的 Min/Max。两格都空就不判（留空）。
+
+    ★★ 2026-08-05 修的错：原来只按"必须落在 [Min, Max] 窗口里"判，**完全不看
+      Limit 列**（当时把它当成"只是给填表人提示方向"）。可 `Fmin ≤ 2884` 的意思
+      是"至少要能压到 2884"——实测 2800 是覆盖更宽、该 PASS，却被判成"低于 Min"；
+      `Fmax ≥ 3423` 实测 3500 同理。**能往好的方向超出去的量，只判一头。**
+    ★ 方向读的是格子 `$C{r}` 而不是生成时定死：Limit 是带下拉的可填列，
+      在 Excel 里改完方向，判定得当场跟着变，不然那个下拉就是个摆设。
+    判的对象是**汇总列**（全部芯片全温的最差值），不是逐片判：
+    上限看汇总 Max（最大的那个最坏），下限看汇总 Min。Typ 与仿真列不参与判定。
+    """
+    dmin, dmax, smin, smax = _cells(r)
+    lim = f"${_cl(C_LIMIT)}{r}"
+    le = (f"IF(AND(COUNT({smax})>0,{smax}>{_bound(r, '≤')}),"
+          f"\"FAIL\",\"PASS\")")
+    ge = (f"IF(AND(COUNT({smin})>0,{smin}<{_bound(r, '≥')}),"
+          f"\"FAIL\",\"PASS\")")
     over = f"AND(COUNT({dmax})>0,COUNT({smax})>0,{smax}>{dmax})"
     under = f"AND(COUNT({dmin})>0,COUNT({smin})>0,{smin}<{dmin})"
+    both = f"IF(OR({over},{under}),\"FAIL\",\"PASS\")"
     return (f"=IF(COUNT({dmin},{dmax})=0,\"\","
-            f"IF(OR({over},{under}),\"FAIL\",\"PASS\"))")
+            f"IF({lim}=\"≤\",{le},IF({lim}=\"≥\",{ge},{both})))")
 
 
 def _fill_spec(ws, r, st, nd, sp, fill=None):
@@ -770,7 +802,8 @@ def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick,
     nd = ND.get(unit, 2)
     put(ws, r, C_ITEM, label, st, st["f_res"], align="left")
     put(ws, r, C_UNIT, unit, st, st["f_res"], size=9)
-    # Limit 只是提示：相噪/杂散越小越好 -> 填上限；频率/功率两头都可能有要求
+    # Limit ＝ 判定方向（不是提示）：相噪/杂散越小越好 -> ≤，只判上限；
+    # 频率/功率两头都可能有要求 -> range。见 _judge_formula
     sp = spec.row(band, label) if spec is not None else None
     lim = (sp or {}).get("limit") or (
         "≤" if any(label.startswith(p) for p in ("IPN", "SpotPN@", "Spur@"))
@@ -831,19 +864,30 @@ def _over_spec_cf(ws, r0, r1, st):
 
     只有判定列变红的话，一行 20 多个格子里到底是哪头超了还得自己比，
     评审时那一秒的迟疑就会变成一个问题。
+
+    ★ 这里的判据必须跟 `_judge_formula` **逐条对应**：单边指标只有"坏"的那头
+      会红（`≤` 只红汇总 Max，`≥` 只红汇总 Min）。两边一漂移就会出现
+      "判定 PASS、格子却是红的"，那种表比没有标色更糟。
     """
     from openpyxl.formatting.rule import FormulaRule
     if r1 < r0:
         return
     red = st["Font"](bold=True, color=COLOR_FLAG)
-    dmin, dmax = f"${_cl(C_SPEC)}{r0}", f"${_cl(C_SPEC + 2)}{r0}"
-    for col, cond in ((C_SUM, f"AND(COUNT({dmin})>0,COUNT({_cl(C_SUM)}{r0})>0,"
-                              f"{_cl(C_SUM)}{r0}<{dmin})"),
-                      (C_SUM + 2, f"AND(COUNT({dmax})>0,COUNT({_cl(C_SUM+2)}{r0})>0,"
-                                  f"{_cl(C_SUM+2)}{r0}>{dmax})")):
-        ws.conditional_formatting.add(
-            f"{_cl(col)}{r0}:{_cl(col)}{r1}",
-            FormulaRule(formula=[cond], font=red, stopIfTrue=False))
+    dmin, dmax, smin, smax = _cells(r0)
+    lim = f"${_cl(C_LIMIT)}{r0}"
+    two = f"AND({lim}<>\"≤\",{lim}<>\"≥\")"      # range / 留空 ＝ 两头都判
+    have = f"COUNT({dmin},{dmax})>0"
+    for col, conds in (
+            (C_SUM, [f"AND({two},COUNT({dmin})>0,COUNT({smin})>0,{smin}<{dmin})",
+                     f"AND({lim}=\"≥\",{have},COUNT({smin})>0,"
+                     f"{smin}<{_bound(r0, '≥')})"]),
+            (C_SUM + 2, [f"AND({two},COUNT({dmax})>0,COUNT({smax})>0,{smax}>{dmax})",
+                         f"AND({lim}=\"≤\",{have},COUNT({smax})>0,"
+                         f"{smax}>{_bound(r0, '≤')})"])):
+        for cond in conds:
+            ws.conditional_formatting.add(
+                f"{_cl(col)}{r0}:{_cl(col)}{r1}",
+                FormulaRule(formula=[cond], font=red, stopIfTrue=False))
 
 
 def _pass_fail_cf(ws, col_letter, r0, r1, st):
@@ -887,6 +931,15 @@ def _limit_dropdown(ws, r0, r1):
     from openpyxl.worksheet.datavalidation import DataValidation
     dv = DataValidation(type="list", formula1='"≤,≥,range"', allow_blank=True)
     dv.error = "只能填 ≤ / ≥ / range"
+    # ★ 这段提示只在**点进格子要填的时候**弹出来，不打印、不占版面——
+    #   正表不写给填表人看的话，说的是纸面上的字。而"填 ≤ 会怎么判"
+    #   恰恰是填的那一秒最该知道的事（判错方向就是 2026-08-05 那个 bug）。
+    dv.promptTitle = "判定方向"
+    dv.prompt = ("≤ 只判上限（往小超出算好，PASS）\n"
+                 "≥ 只判下限（往大超出算好，PASS）\n"
+                 "range 两头都判（必须落在 Min~Max 里）\n"
+                 "单边时界填 Min 格或 Max 格都认")
+    dv.showInputMessage = True
     ws.add_data_validation(dv)
     dv.add(f"{_cl(C_LIMIT)}{r0}:{_cl(C_LIMIT)}{r1}")
 
