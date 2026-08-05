@@ -1760,22 +1760,27 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
     #      40 列宽的表里最先丢的信息是「我现在看的是哪一颗芯片」，一条实心竖栏比给整块
     #      上底色更省视觉预算（Gestalt common region），灰度打印下照样成立。
     #      编号/模块/单位 ▏仿真 ▏片1 ▏片2 … ▏[极差 极差%] 均值 偏差% ▏备注
+    #      ★仿真值、各片均值、偏差% 是**一件事**（仿测对比），必须挨在一起：把仿真放最左、
+    #      偏差甩到最右，等于让人横跨整张表去对一个比值。片间极差反而该贴着实测区右边——
+    #      它是从那几竖条算出来的。
     FIX = 3
-    C_R0, C_SIM, C_R1 = FIX + 1, FIX + 2, FIX + 3
+    C_R0 = FIX + 1
+    C_SIM, C_MEAN, C_DEV = C_R0 + 1, C_R0 + 2, C_R0 + 3        # 仿测对比组
+    C_R1 = C_DEV + 1
     C_CHIP = C_R1 + 1
     CHIP_W = n_t + 1                         # 每片：n_t 个温度列 + 1 条竖栏
     after = C_CHIP + n_chip * CHIP_W         # 最后一片的竖栏之后
     spread = n_chip > 1                      # 只有一颗芯片时「片间极差」是废列，不出
     C_SPREAD, C_SPCT = (after, after + 1) if spread else (None, None)
-    C_MEAN = after + (2 if spread else 0)
-    C_DEV = C_MEAN + 1
-    C_R2, C_NOTE = C_DEV + 1, C_DEV + 2
-    SUM_C0, SUM_C1 = (C_SPREAD if spread else C_MEAN), C_DEV   # 汇总组左右边界
+    C_NOTE = (after + 3) if spread else after
+    C_R2 = (after + 2) if spread else None   # 片间组与备注之间的竖栏
+    SUM_C0, SUM_C1 = C_SIM, C_DEV            # 加粗框住的是仿测对比组（判断对着它做）
 
     def cc(chip_i, ti):
         return C_CHIP + chip_i * CHIP_W + ti
 
-    rails = [C_R0, C_R1, C_R2] + [C_CHIP + j * CHIP_W + n_t for j in range(n_chip)]
+    rails = [c for c in (C_R0, C_R1, C_R2) if c] + \
+            [C_CHIP + j * CHIP_W + n_t for j in range(n_chip)]
 
     def paint_rails(ws_, r):
         """把竖栏画到这一行上。band 行例外——它要横贯整表，不留缝。"""
@@ -1820,17 +1825,17 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
 
     for c, (title, w) in enumerate(zip(["编号", "模块 (OFF 步)", "单位"], [9, 30, 6]), 1):
         head_single(c, title, w)
-    head_single(C_SIM, f"仿真\n{d.sim_note} {d.tier}", 11)
+    # 括号里是定义不是说明——列名自带口径，评审就不用去翻别的页
+    head_group(C_SIM, C_DEV, "仿测对比",
+               [f"仿真\n{d.sim_note} {d.tier}", "各片均值\n@%g℃" % d.sim_temp_c, "偏差%"],
+               [11, 11, 10])
     for j, chip in enumerate(chip_ids):
         head_group(cc(j, 0), cc(j, n_t - 1), chip,
                    [_t(t) if t is not None else "?" for t in temps], [10] * n_t)
     if spread:
-        # 括号里是定义不是说明——列名自带口径，评审就不用去翻别的页
         head_group(C_SPREAD, C_SPCT, "片间一致性",
                    ["极差 µA\n(全温最坏)", "极差 %\n(÷常温)"], [11, 10])
-    head_group(C_MEAN, C_DEV, "与仿真对比",
-               ["各片均值\n@%g℃" % d.sim_temp_c, "偏差%"], [11, 10])
-    head_single(C_NOTE, "备注", 46)
+    head_single(C_NOTE, "备注", 34)
     for c in rails:
         ws.column_dimensions[get_column_letter(c)].width = 2
     for r in (1, 2):
@@ -1897,11 +1902,9 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
                           getval=lambda j, ti, _m=mode, _s=src: _s.get((_m, chip_ids[j], temps[ti])),
                           C_SPREAD=C_SPREAD, C_SPCT=C_SPCT, i25=i25, spread=spread,
                           fill=C_SETTING, fmt=FMT_MA, ref=ref)
-            _cell(ws, rr, C_MEAN, "", fill=C_SETTING)
-            _cell(ws, rr, C_DEV, "", fill=C_SETTING)
-            _cell(ws, rr, C_NOTE, "基线=末个 Lock_step，整机电流，不与仿真直接对比"
-                  if name.startswith("锁定") else "末个 OFF 步实测=全部关断后仍在流的电流",
-                  fill=C_SETTING, align="left")
+            # 备注留空：「基线=末个 Lock_step」这类是口径不是发现，写在正表上
+            # 只会让评审停下来读一句他本来不需要知道的话（口径在隐藏的 _审计 页）
+            _cell(ws, rr, C_NOTE, "", fill=C_SETTING, align="left")
             rr += 1
 
         # -- 结果行：每个模块组一行
@@ -1911,7 +1914,9 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
         for n_in_block, key in enumerate(mode_rows):
             disp, step_name = key
             paint_rails(ws, rr)
-            for c in range(SUM_C0, SUM_C1 + 1):
+            # 两个派生组（仿测对比、片间一致性）浅蓝，实测竖条留白：
+            # 底色区分的是"算出来的"和"测出来的"，不是区分组
+            for c in list(range(SUM_C0, SUM_C1 + 1)) + ([C_SPREAD, C_SPCT] if spread else []):
                 _cell(ws, rr, c, fill=C_SUM)
             _cell(ws, rr, 1, disp)
             _cell(ws, rr, 2, sim_names.get(key) or step_name, align="left")
@@ -1950,13 +1955,13 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
             if (dv is not None and key not in d.caliber_keys
                     and abs(dv) > d.thr and abs(mv - sv) > d.abs_thr):
                 ws.cell(row=rr, column=C_DEV).font = red_font
+            # 备注只写「这个数不是你以为的那个数」——LDO 归并导致口径不可比、
+            # 仿真值取自另一个仿真阶段。空仿真格本身就说明没有仿真值，不必再写一句
+            # 「标签行，仿真未映射」；解释性的话一律不进正表。
             note = sorted(d.notes.get(key, ()))
             fb = d.sim_fb.get((key, mode))
             if fb:
-                note.append(f"仿真 {','.join(str(x) for x in fb)} {d.stage_main} 为 0/缺项，"
-                            f"取{d.other_stage}")
-            if sv is None and key not in lo_keys:
-                note.append("标签行，仿真未映射")
+                note.append(f"仿真 {','.join(str(x) for x in fb)} 取自{d.other_stage}仿")
             _cell(ws, rr, C_NOTE, "；".join(note), align="left")
             all_rows.append(rr)
             if key in lo_keys:
@@ -2019,12 +2024,13 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
                       rnd(dv, 4) if dv is not None else None, fill=C_SUM, fmt=FMT_PCT)
                 if dv is not None and abs(dv) > d.thr and abs(mv - sv_sum) > d.abs_thr:
                     ws.cell(row=rr, column=C_DEV).font = red_font
-                _cell(ws, rr, C_NOTE, "口径与仿真一致（不含标签行）", fill=C_SUM, align="left")
+                _cell(ws, rr, C_NOTE, "", fill=C_SUM, align="left")
             else:
+                # 行名已经写着「Σ 总合计（含标签行）」，仿真格空着——再补一句
+                # 「仿真未覆盖，无对比」是把同一件事说第二遍
                 _cell(ws, rr, C_MEAN, "", fill=C_SUM)
                 _cell(ws, rr, C_DEV, "", fill=C_SUM)
-                _cell(ws, rr, C_NOTE, "含 DCO 等标签行，仿真未覆盖，无对比",
-                      fill=C_SUM, align="left")
+                _cell(ws, rr, C_NOTE, "", fill=C_SUM, align="left")
             rr += 1
         rr += 1     # 段间空行
 
