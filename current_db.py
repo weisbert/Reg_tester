@@ -1354,43 +1354,35 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
     # ================= 说明 =================
     ws = wb.active
     ws.title = "说明"
-    ws["A1"] = "各模式功耗汇总簿 · 读法"
-    ws["A1"].font = Font(name=FONT_NAME, bold=True, size=14)
+    ws["A1"] = "口径与来源"
+    ws["A1"].font = Font(name=FONT_NAME, bold=True, size=12)
+    # ★ 只写口径和来源，不写读法。原来这一页有「行=模块…列=…」「【颜色】黄=表头…」
+    #   这类整段教人怎么读表的话，还捎带 config 键名——那是写给出簿的人的，
+    #   评审看到只会停下来读一句他本来不需要知道的话。
     lines = [
         "",
-        f"导出时间 {now_iso()}；数据源 current.db（current_db.py summary 生成）",
-        f"实测：{len(runs)} 个 run（模式×温度），温度点 {', '.join(_t(t) for t in temps if t is not None) or '未知'}；"
-        f"源文件 {', '.join(sorted(src_files))}",
-        f"仿真：档位 {tier or '未过滤'} / {stage_main}-sim"
-        f"（{'pre' if stage_main == 'post' else 'post'}-sim 在「对比明细」页）/ 温度 {sim_note or '未标注'}",
-        ((f"  仿真取值：优先 {stage_main}-sim；个别模块该阶段为 0/缺项（≤{zero_ua:g}µA 计作缺项）时取"
-          f"{'pre' if stage_main == 'post' else 'post'}-sim（前仿已做 back annotate，两者可比），"
-          f"逐模块判断，两阶段都为 0 则留空。本簿共 {len(sim_fb)} 处，逐项见「对比明细」页备注列。")
-         if (fb_stage and sim_fb) else
-         "  仿真列全部取自同一阶段，无跨阶段补值。")
+        f"导出 {now_iso()}  current_db.py summary  数据源 current.db",
+        f"实测：{len(runs)} 个 run（模式×芯片×温度，重复测取 run_ts 最新一次）；"
+        f"温度点 {'、'.join(_t(t) for t in temps if t is not None) or '未知'}",
+        f"源文件：{'、'.join(sorted(src_files))}",
+        f"仿真：{tier or '未过滤'} / {stage_main}-sim / {sim_note or '温度未标注'}"
+        f"（{'pre' if stage_main == 'post' else 'post'}-sim 在「对比明细」页）",
+        ((f"跨阶段补值：{stage_main} 为 0 或 ≤{zero_ua:g}µA 计作缺项时取 "
+          f"{'pre' if stage_main == 'post' else 'post'}（前仿已做 back annotate）；两阶段都缺则留空。"
+          f"共 {len(sim_fb)} 处，逐处见「对比明细」页备注列。")
+         if (fb_stage and sim_fb) else "仿真列全部取自同一阶段，无跨阶段补值。")
         + ("  【本簿为自查版：补过的格子标成蓝色斜体】" if (mark_fb and sim_fb) else ""),
-        "",
-        "【总览页】行=模块（按 buffer 编号从低到高，组合组取组内最小号，DCO 标签行在最后），",
-        "  列=模式×温度的实测电流 + 仿真参考 + 偏差%。顶部条件行：测试频率（2G=2.5GHz/5G=5.8GHz）、",
-        "  锁定后总电流（做差基线）、全关残留电流（末个 OFF 步实测=全部关断后的末态）。",
-        f"  偏差% = (实测插值到{'%g' % sim_temp_c}℃ − 仿真post) / 仿真post。仿真是{'%g' % sim_temp_c}℃"
-        "单点，故把实测按 −40/25/105 三点线性插值到该温度再比（偏差列表头带 * 标注），",
-        "  消除单点仿真 vs 多温实测的系统性温差；三温实测原值仍分列可见。",
-        f"  标红=双阈值：|偏差%|>{thr * 100:.0f}% 且 |绝对偏差|>{abs_thr:.0f}µA 才红——避免小电流"
-        "模块被百分比放大成假红（阈值 delta_flag_pct / delta_flag_abs_ua 可改）。",
-        "",
-        "【颜色】黄=表头；米色=条件/汇总行（mA）；白=模块行（µA）；蓝=Σ合计；红粗=双阈值超标偏差。",
-        "",
-        "【计算规则】",
-        "  基线 = 每模式段第一个 OFF 前最后一行（末个 Lock_step）；模块电流 = 上一行 − 本行。",
-        "  底部 Σ 分两行：Σ LO 模块合计（不含 DCO 等标签行，口径与仿真一致、带偏差%）；",
-        "  Σ 总合计（含标签行，只有实测）。锁定后总电流是整机电流，不与仿真直接对比。",
-        f"  LDO 归并 {config.get('ldo_reparent')}：子模块实测并入父组、仿真侧不计子模块，"
-        "故父组(如 6/26)实测含子、仿真不含=口径不可比，偏差仅供参考、不标红（见该行备注）。",
-        "  多 run 时每个 模式×芯片×温度 取时间最新一次。",
-        "",
-        "偏差%、Σ 合计是 Excel 公式（改动实测/仿真数值会自动重算），同时已写入当前计算",
-        "结果的缓存值，任何软件（含不自动重算的预览器）打开都能立即看到数字。",
+        "基线：每模式段第一个 OFF 行之前最后一行（末个 Lock_step）；模块电流 = 上一行 − 本行",
+        "锁定后总电流为整机电流，不与仿真直接对比",
+        f"偏差% = (实测线性插值到 {'%g' % sim_temp_c}℃ − 仿真) ÷ 仿真"
+        f"（仿真为 {'%g' % sim_temp_c}℃ 单点，插值消除系统性温差；三温实测原值仍分列可见）",
+        f"标红：|偏差%| > {thr * 100:.0f}% 且 |绝对偏差| > {abs_thr:.0f}µA（双阈值同时满足）",
+        "LDO 归并 "
+        + ("、".join(f"{k}→{v}" for k, v in sorted((config.get("ldo_reparent") or {}).items()))
+           or "无")
+        + "：子模块实测并入父组、仿真侧不计子模块 -> 父组口径不可比，偏差保留但不标红",
+        "Σ LO 模块合计不含标签行（DCO 等），口径与仿真一致；Σ 总合计含标签行、仿真未覆盖",
+        "偏差% / Σ 为 Excel 公式，并已写入当前结果的缓存值",
     ]
     for i, line in enumerate(lines, 2):
         ws.cell(row=i, column=1, value=line).font = Font(name=FONT_NAME, size=10)
@@ -1442,17 +1434,10 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
     r_lo_last = r_sum - 1 - n_label         # 最后一个 LO 模块行（SUM 范围用）
     lo_keys = row_keys[:len(row_keys) - n_label]  # LO 模块行（标签行排最后 n_label 个）
 
-    # 编号交叠提示：同一物理编号在不同模式被分到不同关断组（如 25 单独 vs 25,24,23），
-    # 合并矩阵里就会出现两行含该编号——但各模式列错开填充、互不冲突，加注说明防误读。
-    id_sets = {k: set(parse_ids(str(k[0]).replace("+", ",")) or []) for k in row_keys}
-    overlap = {}
-    for k in row_keys:
-        if not id_sets[k]:
-            continue
-        partners = sorted({str(j[0]) for j in row_keys if j is not k and id_sets[j] & id_sets[k]})
-        if partners:
-            overlap[k] = "编号与「%s」重叠：不同模式的不同关断组，各模式列互不冲突" \
-                % "、".join(partners)
+    # ★ 这里原来给「编号交叠」的行加一句备注（同一编号在不同模式被分到不同关断组，
+    #   如 25 单独 vs 25,24,23）。2026-08-05 删掉——那句话的内容是"各模式列互不冲突"，
+    #   等于叫人别担心，而正表上凭空出现一句"别担心"只会让人开始担心。各模式的列本来
+    #   就错开填充，看数看得出来。（sim_col_sum 的 has_meas 门控才是真防线，那个还在。）
 
     # 偏差%/Σ 都写公式；缓存值由 fcell 记录、保存后注入，使不重算的查看器也能显示。
     def has_meas(key, mode, chip):
@@ -1531,12 +1516,10 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         _cell(ws, r_end, c0 + n_t, "", fill=C_SETTING)
         _cell(ws, r_base, c0 + n_t + 1, "", fill=C_SETTING)
         _cell(ws, r_end, c0 + n_t + 1, "", fill=C_SETTING)
-    _cell(ws, r_freq, note_col, "2G 模式=2.5GHz，5G 模式=5.8GHz（config.mode_freq 可改）",
-          fill=C_SETTING, align="left")
-    _cell(ws, r_base, note_col, "基线=末个 Lock_step（含 DCO 及未列模块，仿真对比看 Σ LO 行）",
-          fill=C_SETTING, align="left")
-    _cell(ws, r_end, note_col, "末个 OFF 步实测=全部关断后仍在流的电流（≈基线−Σ模块）",
-          fill=C_SETTING, align="left")
+    # 条件行不写备注：这三行原来各挂一句定义（频率怎么推的、基线是哪一行、残留是什么），
+    # 都是口径不是发现，而且还捎带 config 键名。口径在说明页，正表上不重复。
+    for r in (r_freq, r_base, r_end):
+        _cell(ws, r, note_col, "", fill=C_SETTING, align="left")
 
     # -- 模块行（白，µA）
     for i, key in enumerate(row_keys):
@@ -1568,12 +1551,11 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
                     ws.cell(row=rr, column=dc).font = red_font
             else:
                 _cell(ws, rr, dc, "", fmt=FMT_PCT)
-        note_parts = sorted(notes.get(key, ()))
-        if key in overlap:
-            note_parts.append(overlap[key])
-        if key not in siminfo and parse_ids(str(disp).replace("+", ",")) is None:
-            note_parts.append("仿真无对应项（标签未映射，config.label_groups 可配）")
-        _cell(ws, rr, note_col, "；".join(note_parts), align="left")
+        # 备注只写「这个数不是你以为的那个数」（LDO 归并口径不可比、标签跨模式映射）。
+        # 删掉的两条：编号重叠提示（"各模式列互不冲突"＝叫人别担心，反而招人担心）、
+        # "仿真无对应项（标签未映射…）"（仿真格空着本身就是这个意思，还捎带 config 键名——
+        # 那是写给出簿的人的）。口径都在说明页。
+        _cell(ws, rr, note_col, "；".join(sorted(notes.get(key, ()))), align="left")
 
     # -- Σ合计（蓝）：LO 模块行（可与仿真对）+ 总合计行（含 DCO 等标签行，只有实测）
     _cell(ws, r_sum, 1, fill=C_SEP)
@@ -1602,8 +1584,9 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
                 ws.cell(row=r_sum, column=dc).font = red_font
         else:
             _cell(ws, r_sum, dc, "", bold=True, fill=C_SEP, fmt=FMT_PCT)
-    _cell(ws, r_sum, note_col, "不含下方标签行（DCO 等），口径与仿真一致" if n_label else "",
-          fill=C_SEP, align="left")
+    # 行名已经写着「Σ LO 模块合计」/「Σ 总合计（含 DCO 等标签行）」，
+    # 再补一句"不含下方标签行"「仿真未覆盖」是把同一件事说第二遍
+    _cell(ws, r_sum, note_col, "", fill=C_SEP, align="left")
     if r_all:
         _cell(ws, r_all, 1, fill=C_SEP)
         _cell(ws, r_all, 2, "Σ 总合计（含 DCO 等标签行）", bold=True, fill=C_SEP, align="left")
@@ -1617,7 +1600,7 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
                       rnd(v, 1) if v is not None else None, bold=True, fill=C_SEP, fmt=FMT_UA)
             _cell(ws, r_all, c0 + n_t, "", fill=C_SEP)
             _cell(ws, r_all, c0 + n_t + 1, "", fill=C_SEP)
-        _cell(ws, r_all, note_col, "仿真未覆盖标签行，无对比", fill=C_SEP, align="left")
+        _cell(ws, r_all, note_col, "", fill=C_SEP, align="left")
 
     # 偏差红标改为写单元格时的双阈值静态染色（见 flag_red）——绝对偏差不在表内，
     # 条件格式无法做「|Δ%|>阈 且 |ΔµA|>阈」的联合判断，故用 Python 直接染红粗。
