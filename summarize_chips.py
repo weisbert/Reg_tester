@@ -2164,19 +2164,27 @@ def _xfrm(sinfo, kind, mod, dsb, label, unit):
     return add, mul
 
 
-def _book_cell(wb, label, chip, temp, sheets):
+def _book_cell(wb, label, chip, temp, sheets, mod):
     """在产出的簿子里找到 (行名, 芯片, 温度) 那一格。**按内容找，不按坐标算**——
     算坐标就等于把版式规则抄第二遍，版式一改追溯就悄悄指错格子。"""
     # ★ 必须指定在哪一页找：同一个行名（IPN_DSB）PLL 页和 VCO 页都有，
     #   按页序碰运气就会拿 PLL 的格子去对 VCO 的数，然后报一片 ✗。
     #   （这个 bug 就是被这条检查自己抓出来的。）
+    #   还得认是**哪个模块那一块**：一页上下叠着两张表（模块 A / 模块 B），
+    #   行名一模一样、芯片列名也一模一样，只按行名找必然撞到上面那张。
+    #   大标题那一行的特征＝它下一行是「测试项」。
     tag = f"{fmt_num(temp)}℃"
     for name in sheets:
         if name not in wb.sheetnames:
             continue
         ws = wb[name]
+        cur = ""
         for r in range(1, ws.max_row + 1):
-            if txt(ws.cell(row=r, column=C_ITEM).value) != label:
+            v1 = txt(ws.cell(row=r, column=C_ITEM).value)
+            if v1 and txt(ws.cell(row=r + 1, column=C_ITEM).value) == "测试项":
+                cur = v1
+                continue
+            if v1 != label or not cur.startswith(str(mod)):
                 continue
             for hr in range(r - 1, 0, -1):          # 往上找最近那行表头
                 c0 = next((c for c in range(1, ws.max_column + 1)
@@ -2191,7 +2199,7 @@ def _book_cell(wb, label, chip, temp, sheets):
 
 
 def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None,
-         sheets=()):
+         sheets=(), mod=""):
     """把一格的来龙去脉打出来：原表哪几行 → 原始值 → 加了什么 → 等于多少。"""
     from openpyxl.utils import get_column_letter as gl
     print(f"  {chip}  {fmt_num(t)}℃")
@@ -2209,7 +2217,7 @@ def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None,
         line += f"  ×{fmt_num(mul, 4)}"
     line += f"  →  {round(base, 6)} {unit}"
     if wb is not None and label:
-        where, got = _book_cell(wb, label, chip, t, sheets)
+        where, got = _book_cell(wb, label, chip, t, sheets, mod)
         if where is None:
             line += "   （表上不列这个温度）"
         else:
@@ -2251,7 +2259,7 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
                 med_before = (med_after / mul) - sum(d for _n, d in add)
                 _say(chip, t, "", [(a, b, c) for a, b, c, _d in pts], med_before,
                      add, mul, it.unit, f"{len(pts)} 个点的中位数", wb, label,
-                     ("PLL_Summary",))
+                     ("PLL_Summary",), mod)
     for mod, chips_ in vsweeps.items():           # VCO 页：工作点那一个点
         for chip, sw in chips_.items():
             it = next((x for x in sw.items if x.label == label), None)
@@ -2279,7 +2287,7 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
                     _say(chip, g.temp, "", [(r.xl, r.col_of(it), r.raw[r.col_of(it)])],
                          before, add, mul, it.unit,
                          f"Vtune={fmt_num(x, 4)} 那一点", wb, label,
-                         ("VCO_Summary",))
+                         ("VCO_Summary",), mod)
     if not hit:
         print(f"  没有哪份簿子有叫「{label}」的行。表上的行名照抄即可"
               f"（IPN_DSB / SpotPN@1kHz / Spur@26MHz / Freq_MHz …）")
