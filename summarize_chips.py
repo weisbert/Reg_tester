@@ -406,20 +406,23 @@ def ipn_order_check(sw, chip, tol=0.5):
         if a_ is None or b_ is None:
             continue
         d = b_ - a_                       # >0 ＝ Omit 更差 ＝ 不该发生
-        st = by_t.setdefault(t, [0, 0, 0.0])
+        st = by_t.setdefault(t, [[], 0])
         st[1] += 1
         if d > tol:
-            st[0] += 1
-            st[2] = max(st[2], d)
-    out = []
-    for t, (bad, tot, worst) in sorted(by_t.items(), key=lambda x: (x[0] is None, x[0])):
-        if not bad:
+            st[0].append(d)
+    seg = []
+    for t, (ds, tot) in sorted(by_t.items(), key=lambda x: (x[0] is None, x[0])):
+        if not ds:
             continue
-        out.append(f"{chip} {fmt_num(t)}℃: {bad}/{tot} 行里 {omt.label} 比 "
-                   f"{ipn.label} **还差**（最多 {worst:.2f} dB）。剔掉杂散只可能更好，"
-                   f"反过来说明这两个积分不是同一次测出来的——"
-                   f"{worst:.1f} dB 就是这一趟的重复性下限，比它小的片间差不作数")
-    return out
+        # ★ 报中位数，不只报最大值：275 行里的最大值是极值统计，
+        #   拿它当"重复性"会把这批数据说得比实际更糟。
+        seg.append(f"{fmt_num(t)}℃ {len(ds)}/{tot}（中位 {median(ds):.1f}、"
+                   f"最多 {max(ds):.1f} dB）")
+    if not seg:
+        return []
+    return [f"{chip} {omt.label} 比 {ipn.label} **还差**：" + "；".join(seg)
+            + "。剔掉杂散只可能更好，反过来说明这两个积分不是同一次测出来的，"
+              "反向差就是这一趟的重复性下限——比它小的片间差不作数"]
 
 
 def note_dsb(n, chip):
@@ -2528,7 +2531,7 @@ def main():
                                 spur_tol=spur_tol)
             except Exception as e:                    # noqa: B902
                 failed.append((b, f"{type(e).__name__}: {e}"))
-                print(f"  {chip}: 读失败 —— {e}")
+                print(f"  {chip}: 读失败 —— {type(e).__name__}: {e}")
                 continue
             data[chip] = sw
             for _q in ipn_order_check(sw, chip):
@@ -2588,7 +2591,7 @@ def main():
                               spur_tol=spur_tol)
             except Exception as e:                    # noqa: B902
                 failed.append((b, f"{type(e).__name__}: {e}"))
-                print(f"  {chip}: 读失败 —— {e}")
+                print(f"  {chip}: 读失败 —— {type(e).__name__}: {e}")
                 continue
             # ★ 折算必须在 vco_rows 之前：Fmin/Fmax/Kvco/温漂全是拿 F 现算的，
             #   先折算，它们自己就跟着 ×N 了。
@@ -2610,7 +2613,12 @@ def main():
             fv, kv, fc, fd = _vco_series(sw, temps)
             vrows[chip] = rows
             vdata[chip] = {"v": fv, "k": kv, "c": fc, "d": fd}
-            vsweeps.setdefault(mod, {})[chip] = sw      # --trace 要用
+            # ★ 只有真要 --trace 才留着整份簿子。每份 VCO 簿子在内存里是几百 MB
+            #   （4.7MB 的 xlsx 展开几十倍），六份攒着直接 MemoryError——
+            #   而 MemoryError 的 str() 是**空字符串**，报出来就是"读失败 ——"，
+            #   什么线索都没有。2026-08-05 就是这么崩的。
+            if args.trace:
+                vsweeps.setdefault(mod, {})[chip] = sw
             notes[id(b)] = f"{sw.ws_val.max_row}行×{sw.ws_val.max_column}列"
             coarse = coarse_temps(sw)
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
@@ -2683,7 +2691,7 @@ def main():
                                        key_col=args.key_col, val_col=args.cur_col)
                 except Exception as e:                # noqa: B902
                     failed.append((b, f"{type(e).__name__}: {e}"))
-                    print(f"  {chip}: 读失败 —— {e}")
+                    print(f"  {chip}: 读失败 —— {type(e).__name__}: {e}")
                     continue
                 notes[id(b)] = f"{cur.n_rows}行×{cur.n_cols}列"
                 # ★ 一个测量点都没有就别建页：模板复制品（表头齐、值全空）也能
