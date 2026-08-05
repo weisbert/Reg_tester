@@ -1173,7 +1173,16 @@ VCO_NOTE_SET = {
 # ★ 空的：`Kvco @工作点` 请回来了。我当初提议删它的理由是"它落在 Kvco min/max
 #   之间、判定上冗余"——那个理由依赖 min/max 存在。min/max 一走，它就是环路带宽
 #   真正用的那个数，而且是全表唯一说得清"工作点增益"的行。
-VCO_DROP_PREFIX = ()
+# ★★ 开环 VCO 不报 IPN（2026-08-05，用户师父指出，物理上站得住）：
+#   自由振荡的 VCO 相噪在低 offset 上按 1/f³、1/f² **发散**，积分完全被最低那个
+#   offset 支配——那个数说的是"从哪儿起积"，不是 VCO 好坏；而且自由振荡会**漂**，
+#   测量期间载波自己在走，近端"相噪"其实是频率漂移。这一段恰恰是闭环里被环路
+#   压掉的，所以开环 IPN 既不反映 VCO、也不预测系统。
+#   ★这条一次解释掉三个"数据怪怪的"：IPN 出现**正值**（>1 弧度 RMS）、
+#   IPN 与 IPN_Omit 散布 5~10 dB、跟工作频率走 11.6 dB。都是发散积分 + 漂移。
+#   开环该看的是**指定 offset 的单点相噪**（SpotPN@* 八档都在），删掉不丢东西。
+#   PLL 页照旧报 IPN——闭环下它是真指标。单簿脚本的结论页也还留着。
+VCO_DROP_PREFIX = ("IPN",)
 
 
 def vco_rows(sw, ref_temp, op_vtune):
@@ -2652,10 +2661,8 @@ def main():
                 continue
             # ★ 折算必须在 vco_rows 之前：Fmin/Fmax/Kvco/温漂全是拿 F 现算的，
             #   先折算，它们自己就跟着 ×N 了。
-            for _q in ipn_order_check(sw, chip):
-                print(f"     ⚠ {_q}")
-                quality_all.append((chip, mod, KIND_LABEL[KIND_VCO],
-                                    [("IPN vs IPN_Omit", _q)]))
+            # ★ VCO 页已经不报 IPN 了（开环下这个指标没意义，见 VCO_DROP_PREFIX），
+            #   再为它喊重复性就是噪声。这条哨兵只留给 PLL 页。
             imp = implied_scale(sw, KIND_VCO)          # 必须在折算之前算
             n_scale = scale_of(scale_rules, mod, KIND_VCO)
             note_scale(sinfo, KIND_VCO, mod, chip, scale_book(sw, n_scale))
