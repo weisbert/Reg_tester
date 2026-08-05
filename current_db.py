@@ -69,7 +69,8 @@ DEFAULT_CONFIG = {
     "_说明": {
         "sim_workbook": "仿真长表所在工作簿（相对 root 或绝对路径）；null=自动找 Current_all_mode*.xlsx",
         "sim_sheet": "仿真长表的 tab 名",
-        "result_glob": "每个模式文件夹里匹配实测文件的通配符",
+        "result_glob": "匹配实测文件的通配符；**可以给一个数组**（命名换过词序就再加一条，"
+                       "不用改代码）。没匹配上的 xlsx 会在 build/inspect 里报出来，不静默跳过",
         "result_sheet": "实测数据所在 tab；null=自动扫描含 NO./Current 表头的第一个 tab",
         "skip_dirs": "扫描 root 子目录时跳过的文件夹",
         "mode_map": "文件夹名 -> 仿真表 Mode 名 的映射（同名可省略）",
@@ -2280,6 +2281,38 @@ def walk_xlsx(root, skip_dirs, exclude_globs=()):
             yield os.path.join(dirpath, f)
 
 
+def result_globs(config):
+    """result_glob 允许写成字符串或数组。
+
+    ★ 实测文件的命名已经换过两次词序（`*_all_mode_Current_*` -> `*_Current_all_mode_*`），
+      一条通配符钉不住。给数组，加一条就完事，别改代码。"""
+    g = (config or {}).get("result_glob", "Result*.xlsx")
+    return [g] if isinstance(g, str) else [str(x) for x in g]
+
+
+def is_result_file(name, globs):
+    return any(fnmatch.fnmatch(name, p) for p in globs)
+
+
+def report_skipped(files, globs, root, sim_wb=None):
+    """扫到但没匹配 result_glob 的 xlsx —— 必须报出来。
+
+    ★ 真实事故：新芯片的文件名换了词序，通配符匹配不上，build 静默跳过，
+      簿子上少一颗芯片而控制台干干净净。"跳过"是要出声的事。"""
+    sim = os.path.abspath(sim_wb) if sim_wb else None
+    odd = [f for f in files
+           if not is_result_file(os.path.basename(f), globs) and os.path.abspath(f) != sim]
+    if not odd:
+        return odd
+    print(f"[跳过] {len(odd)} 个 xlsx 不匹配 result_glob {globs}（不是实测文件就不用管；"
+          "是的话把它的命名加进 config.result_glob 数组）:")
+    for f in odd[:8]:
+        print(f"    {os.path.relpath(f, root)}")
+    if len(odd) > 8:
+        print(f"    …还有 {len(odd) - 8} 个")
+    return odd
+
+
 def chip_of_path(path, root, sim_modes, mode_map, fallback):
     """实测文件 -> (芯片号, 当模式名用的文件夹名)。
 
@@ -2307,12 +2340,12 @@ def find_sim_candidates(root, config, verbose=False):
     sim_sheet = norm(config.get("sim_sheet", "Current_data"))
     skip = set(config.get("skip_dirs") or [])
     excl = list(config.get("exclude_globs") or [])
-    result_glob = config.get("result_glob", "Result*.xlsx")
+    globs = result_globs(config)
     out = []
     for path in walk_xlsx(root, skip, excl):
         # 实测文件不会是仿真长表；跳过省一次开簿（openpyxl 开一个大 xlsm 很贵，
         # 且这些文件稍后还要再开一次读数据）
-        if fnmatch.fnmatch(os.path.basename(path), result_glob):
+        if is_result_file(os.path.basename(path), globs):
             continue
         if verbose:
             print(f"  [扫描] {os.path.relpath(path, root)}", flush=True)
@@ -2390,14 +2423,15 @@ def cmd_build(args):
     excl = list(config.get("exclude_globs") or [])
     out = args.out or os.path.join(root, "Current_compare_pivot.xlsx")
     excl.append(os.path.basename(out))
-    result_glob = config.get("result_glob", "Result*.xlsx")
+    globs = result_globs(config)
     sim_modes = {r[0] for r in conn.execute("SELECT DISTINCT mode FROM sim_current")}
     n_runs = 0
     mapping = {}  # mode_raw -> (mode, how)
     fallback_chip = args.chip or "C1"
+    all_xlsx = list(walk_xlsx(root, skip, excl))
+    report_skipped(all_xlsx, globs, root, sim_wb)
     plan = [(f,) + chip_of_path(f, root, sim_modes, config.get("mode_map"), fallback_chip)
-            for f in walk_xlsx(root, skip, excl)
-            if fnmatch.fnmatch(os.path.basename(f), result_glob)]
+            for f in all_xlsx if is_result_file(os.path.basename(f), globs)]
     dir_chips = sorted({c for _f, c, fm in plan if fm is None})
     # 目录已经按芯片分好时 --chip 是有害的：它会把几颗芯片的 run 全贴成同一个名字，
     # 而汇总簿按 (模式,芯片,温度) 只取最新一次 -> 后测的那颗静默顶掉先测的，簿子上看不出来
@@ -2481,7 +2515,7 @@ def cmd_inspect(args):
     print(f"配置:   {cfg_path}"
           f"{'' if os.path.exists(cfg_path) else '   ← 不存在，本次用内置默认值（build 时才会生成）'}")
     print(f"        sim_tier={tier or '(不过滤——多档共存会重复求和!)'}  sim_stage={stage_main}  "
-          f"sim_sheet={config.get('sim_sheet')!r}  result_glob={config.get('result_glob')!r}")
+          f"sim_sheet={config.get('sim_sheet')!r}  result_glob={result_globs(config)!r}")
     print(f"        sim_zero_ua={zero_ua:g}µA（≤此值计作缺项）  "
           f"sim_stage_fallback={'开 -> 缺项取 ' + stage_alt if fb_stage else '关 -> 缺项保持空'}")
 
@@ -2621,13 +2655,16 @@ def cmd_inspect(args):
     mode_map = config.get("mode_map") or {}
     skip = set(config.get("skip_dirs") or [])
     excl = list(config.get("exclude_globs") or [])
-    result_glob = config.get("result_glob", "Result*.xlsx")
+    globs = result_globs(config)
     how_disp = {"config": "config 指定", "auto": "自动匹配", "folder": "⚠ 按文件夹名",
                 "ambig": "⚠ 多个候选未映射", "none": "⚠ 仿真表无此模式"}
     n_files = 0
     chips_seen = {}
-    for f in walk_xlsx(root, skip, excl):
-        if not fnmatch.fnmatch(os.path.basename(f), result_glob):
+    all_xlsx = list(walk_xlsx(root, skip, excl))
+    if report_skipped(all_xlsx, globs, root, sim_wb):
+        problems.append("有 xlsx 不匹配 result_glob 被跳过 -> 确认里面没有实测文件")
+    for f in all_xlsx:
+        if not is_result_file(os.path.basename(f), globs):
             continue
         n_files += 1
         # 与 build 同一条规则：文件夹名对得上仿真 Mode 就当模式名，否则当芯片号
@@ -2719,7 +2756,7 @@ def cmd_inspect(args):
                       + (" …" if len(labels) > 8 else ""))
     if n_files == 0:
         print(f"\n  ⚠ 没扫到任何匹配 {result_glob} 的文件")
-        problems.append(f"没有扫到 {result_glob}")
+        problems.append(f"没有扫到 {globs}")
     elif len(chips_seen) > 1:
         print(f"\n  芯片 {len(chips_seen)} 颗（按子目录名）: "
               + " / ".join(f"{c}×{len(v)} 个文件" for c, v in sorted(chips_seen.items())))
