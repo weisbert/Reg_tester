@@ -1806,6 +1806,32 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
     return out
 
 
+def _norm(x):
+    return re.sub(r"[^0-9a-z]", "", txt(x).lower())
+
+
+def guess_key(missing, avail):
+    """清单里这个键没对上，文件里最像的是哪个。avail = {键: Mode}。
+
+    ★ 最常见的写错就是**把 Mode 列的话当成键**（`OFF L5 LO PreBUF` 对应的键
+      其实叫 `L5_LOPRE`）。所以候选要拿 键 和 Mode 两个都比一遍。
+    """
+    import difflib
+    t = _norm(missing)
+    if not t:
+        return None
+    best, score = None, 0.0
+    for k, m in avail.items():
+        for cand in (k, m):
+            c = _norm(cand)
+            if not c:
+                continue
+            r = 1.0 if (t in c or c in t) else                 difflib.SequenceMatcher(None, t, c).ratio()
+            if r > score:
+                best, score = k, r
+    return best if score >= 0.6 else None
+
+
 def _mode_note(key, mode):
     """Mode 列只在它**不是步骤名的换皮**时才写进备注。
 
@@ -2583,9 +2609,20 @@ def main():
                             if k not in have and k not in miss.get(chip, ()):
                                 miss.setdefault(chip, []).append(k)
                 ctables.append((gname, rowsg))
+            # ★ 没找到的键，顺手猜一个最像的报出来。真事故：清单里写了
+            #   `L5 LO PreBUF`（那是 Mode 列的话），文件里的**键**叫 `L5_LOPRE`——
+            #   只说"没找到"就得再跑一趟探查、再来回一轮。
             for chip, ks in miss.items():
+                avail = {}
+                for t in cdata[chip].temps:
+                    for k, m, _i, _d in cdata[chip].runs[t]["steps"]:
+                        avail.setdefault(k, m)
+                tips = []
+                for k in ks:
+                    g = guess_key(k, avail)
+                    tips.append(f"{k}" + (f"（是不是 {g}？）" if g else ""))
                 print(f"  ⚠ {chip}: 清单里这些步骤在文件里没找到（或没有电流值）: "
-                      + ", ".join(ks[:10])
+                      + "，".join(tips[:10])
                       + (f" …共 {len(ks)} 个" if len(ks) > 10 else ""))
 
     # ★★ 每一页只列**这一页真有数据**的芯片，不拿全局芯片表去铺列。
