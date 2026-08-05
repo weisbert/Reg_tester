@@ -123,13 +123,72 @@ class Book:
         return (self.ts, os.path.getmtime(self.path))
 
 
-def discover(root, only_chips=None, only_modules=None):
+def _norm_mod(x):
+    """模块名比对用的归一化：只抹掉大小写和分隔符，**别的字符一个都不能丢**。
+
+    ★★ 不能用电流那边的 `_norm`（`[^0-9a-z]` 全删）：它会把中文整段抹掉，
+      `前缀_模块B` 和 `模块B` 压出来一模一样，"名字被前缀带偏了"这条判据当场失效。
+      2026-08-05 第一版就是这么写的，在复现用例上一声不吭。
+    """
+    return re.sub(r"[\s_\-.#()（）\[\]]+", "", str(x).lower())
+
+
+def alias_of(mod, alias):
+    """文件名前缀改过 -> 认成两个模块。别名表把它并回去。
+
+    别名表是人手写的，`前缀_模块B` / `前缀 模块B` / `前缀-模块b` 该算同一条，
+    所以除了原样，再拿归一化后的形式找一遍。
+    """
+    if not alias:
+        return mod
+    return alias.get(mod) or alias.get(_norm_mod(mod)) or mod
+
+
+def near_modules(picked):
+    """名字互相包含、而且**从不属于同一颗芯片**的模块对 —— 多半是文件名前缀改过。
+
+    ★★ 真事故（2026-08-05）：`<模块B>PLL_..._<芯片>.xlsx` 更新时改名成
+      `前缀_<模块B>PLL_..._<芯片>.xlsx`，模块名就从 `模块B` 变成 `前缀_模块B`。
+      那颗芯片在原模块那一栏**整块消失**、另起一个只有它一片的新模块，
+      温巡页于是空出两个图位（用户原话"往下空了两个身位才是下一个模块"）。
+      表照样出得来，一个字都不报——这正是最该报的那种错。
+    ★ 判据要两条都满足才开口：名字包含 **且** 两边的芯片集合不相交。
+      同一颗芯片两个名字都有，那就真是两个模块（比如 `A` 和 `A_LP`），
+      喊了就是假阳性——而警告有一次假阳性，下次真的那条就被当噪声划过去。
+    ★★ 芯片集合要**按类型分开**比，不能拿全部文件混在一起比。改名的往往只有
+      一种文件（只有温扫那份加了前缀，VCO 那份还是老名字），混着比的话
+      那颗芯片在原模块名下照样出现（来自 VCO），两边就"相交"了，
+      这条哨兵当场哑掉——2026-08-05 第一版就是这么写的，在复现用例上没响。
+    """
+    who = {}
+    for (chip, mod, kind) in picked:
+        who.setdefault((kind, mod), set()).add(chip)
+    out = []
+    for (kind, a), ca in sorted(who.items()):
+        for (kind2, b), cb in sorted(who.items()):
+            if kind2 != kind or a == b:
+                continue
+            na, nb = _norm_mod(a), _norm_mod(b)
+            if not nb or nb not in na or (ca & cb):
+                continue
+            # 长的那个才是"被前缀带偏的"。压完一模一样时（只差大小写/分隔符）
+            # 两个方向都成立，靠字典序只报一次
+            if len(na) == len(nb) and a >= b:
+                continue
+            out.append((a, b, KIND_LABEL[kind],
+                        sorted(ca, key=natkey), sorted(cb, key=natkey)))
+    return out
+
+
+def discover(root, only_chips=None, only_modules=None, alias=None):
     """扫目录 -> (选中的, 同类被跳过的, 认不出来的, 散放的, 被 --chips/--modules 滤掉的)。
 
     ★ 过滤掉的也要报出来。模块名是从文件名前缀认出来的，同一个模块的几份文件
       前缀不一致很常见（`<模块>PLL_...` 但电流那份写成 `<芯片系列>_<模块>_CURRENT_...`），
       这时候一给 --modules / modules 配置，那份就**安静地消失**——
       报表少一页，控制台一个字都没有。
+    ★ 别名在**模块过滤之前**换：不然配了 `modules` 之后，被前缀带偏的那几份
+      先被滤掉，别名再对也救不回来（顺序反了就是白写）。
     """
     dirs = sorted((d for d in os.listdir(root)
                    if os.path.isdir(os.path.join(root, d))), key=natkey)
@@ -157,6 +216,7 @@ def discover(root, only_chips=None, only_modules=None):
             if mod is None or kind is None:
                 unknown.append((chip, f, "模块" if kind is not None else "类型"))
                 continue
+            mod = alias_of(mod, alias)
             if only_modules and mod not in only_modules:
                 filtered.append((chip, f, f"模块认成 {mod!r}，不在指定的模块清单里"))
                 continue
@@ -1100,6 +1160,27 @@ def _jchart(ws, kind, chip, mod, col0, r_data, n_rows, bounds, st, title_extra="
     return ch
 
 
+def _chart_hole(ws, c0, r0, w, h, text, st):
+    """这颗芯片没有这个模块的数据 —— 图位空着，但**必须写明空的是什么**。
+
+    ★★ 图位不能挪：横着一条 band 就是"同一个模块同一张图的各片对照"，
+      往上顶一格，右边那颗芯片的图就跟左边错开一行，整页对照关系当场作废。
+      所以只能留洞。
+    ★★ 但**留白不写字**就是 2026-08-05 用户报的这条："某颗芯片前两张图正常，
+      再往下空了两个身位才是下一个模块"——一块无字空白在版面上读起来是
+      "图没画出来 / 布局有 bug"，而不是"这颗片子没有这个模块的文件"。
+      下面的数据块本来就写着「模块：芯片 未测」，图区却是哑的，两边说法不一致。
+      这不算"正表写说明"：它陈述的是**这个位置为什么没有数**，是事实不是用法。
+    """
+    for r in range(r0, r0 + h):
+        for c in range(c0, c0 + w):
+            put(ws, r, c, None, st, st["f_group"])
+    cell = put(ws, r0, c0, text, st, st["f_group"], size=11, color=COLOR_MUTED)
+    ws.merge_cells(start_row=r0, start_column=c0,
+                   end_row=r0 + h - 1, end_column=c0 + w - 1)
+    cell.alignment = _align("center")
+
+
 def write_journey(wb, tables, chips, st, no_charts=False, chart_w=CHART_W_CM):
     """一页里：每颗芯片一个竖条；条内每模块两张图 + 两块数据。
 
@@ -1188,6 +1269,8 @@ def write_journey(wb, tables, chips, st, no_charts=False, chart_w=CHART_W_CM):
         for kind, bounds, band in (("vt", b_vt, 0), ("df", b_df, 1)):
             for k, chip in enumerate(chips):
                 if chip not in got:
+                    _chart_hole(ws, 1 + k * STRIP_W, row + band * CHART_H,
+                                STRIP_W - 1, CHART_H, f"{mod}：{chip} 未测", st)
                     continue
                 first, cnt, _rows, f0 = got[chip]      # _rows 用来定位极值点
                 extra = (f"（相对首点 {fmt_num(f0, 6)} MHz）"
@@ -1704,6 +1787,8 @@ def write_vco_charts(wb, vtables, chips, st, vtemps, no_charts=False,
             bounds = axis_bounds(allv)
             for k, chip in enumerate(chips):
                 if chip not in got:
+                    _chart_hole(ws, 1 + k * VSTRIP_W, row, VSTRIP_W - 1,
+                                VCHART_H, f"{mod} · {VCO_TITLE[tag]}：{chip} 未测", st)
                     continue
                 first, cnt, ser, xs = got[chip]
                 ws.add_chart(_vco_chart(ws, tag, chip, mod, 1 + k * VSTRIP_W,
@@ -1937,7 +2022,7 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
         #   恢复常常是分几步写回的（真数据里阶梯后面还挂着十来行），
         #   取第一个回升点＝拿"刚恢复了一小半"的状态去跟全开基线比，
         #   算出来是"差了 58%"这种吓人的数，其实只是取错了行。
-        #   （TT011 105℃ 就是这么报出 −9.58 mA 的。）
+        #   （真数据上就是这么报出 −9.58 mA 的。）
         tail = pts[cut:] if cut is not None else []
         out.runs[t] = {"baseline": base, "baseline_key": pts[0][1],
                        "steps": steps, "recheck": (tail[-1] if tail else None),
@@ -2530,6 +2615,10 @@ def main():
                     help="只处理这几个模块，并按这个顺序上下排（逗号分隔）。"
                          "不给＝从文件名前缀自动认出全部模块，按名字排序")
     ap.add_argument("--chips", default="", help="只处理这几颗（逗号分隔）")
+    ap.add_argument("--module-alias", default="",
+                    help="把认成两个的同一个模块并回去：`认出来的名字=真名`，逗号分隔。"
+                         "文件名前缀改过（`补充_XXXPLL_...`）就会多认出一个模块，"
+                         "那颗芯片在原模块里整块消失。配置里写 module_alias 也行")
     ap.add_argument("--leg-col", default="Mode", help="判断重锁用的列（默认 Mode）")
     ap.add_argument("--lock-pattern", default=r"_lock$",
                     help="该列匹配这个正则的行 = 一次重锁（默认 _lock$）")
@@ -2639,8 +2728,18 @@ def main():
                 or [str(m).strip() for m in (cfg.get("modules") or [])])
     only = ({c.strip() for c in args.chips.split(",") if c.strip()}
             or {str(c).strip() for c in (cfg.get("chips") or [])} or None)
+    alias = {}
+    for k, v in (cfg.get("module_alias") or {}).items():
+        alias[str(k)] = str(v)
+        alias[_norm_mod(k)] = str(v)
+    for pair in args.module_alias.split(","):
+        a, sep, b = pair.partition("=")
+        if sep and a.strip() and b.strip():
+            alias[a.strip()] = b.strip()
+            alias[_norm_mod(a)] = b.strip()
     picked, dropped, unknown, loose, filtered = discover(root, only,
-                                                        set(want_mod) or None)
+                                                        set(want_mod) or None,
+                                                        alias)
     if not picked:
         sys.exit(f"{root} 下没找到能认出来的 .xlsx —— 文件名要长成 "
                  f"`<模块><类型>_...`（类型＝ PLL / VCO / Current）")
@@ -2663,6 +2762,15 @@ def main():
                 miss = [c for c in chips if c not in got]
                 print(f"  {mod:<6} {KIND_LABEL[kind]:<8} {len(got)} 份"
                       + (f"   缺: {', '.join(miss)}" if miss else ""))
+    for a, b, klabel, ca, cb in near_modules(picked):
+        print(f"  ⚠⚠ {klabel}：模块「{a}」只有 {', '.join(ca)}，"
+              f"「{b}」只有 {', '.join(cb)}，"
+              f"两边没有一颗芯片重合——「{a}」多半就是「{b}」，"
+              f"只是那几份文件名前缀不一样（模块名＝文件名里 PLL/VCO/Current "
+              f"前面那一截）。**这样出表，{', '.join(ca)} 在「{b}」那几栏是空的**"
+              f"（温巡页会空出图位）。要么把文件名改回去，要么在 "
+              f"{os.path.basename(cfg_path or CONFIG_NAME)} 里写："
+              f'  "module_alias": {{"{a}": "{b}"}}')
     for b, w in dropped:
         print(f"  ↷ 跳过 {b.chip}/{b.name}（同类里有更新的 {w.ts or w.name}）")
     for chip, f, why in unknown:
