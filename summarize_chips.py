@@ -384,6 +384,44 @@ def to_dsb(sw):
     return n
 
 
+def ipn_order_check(sw, chip, tol=0.5):
+    """IPN_Omit 只可能比 IPN **好**（剔掉杂散再积分）。反过来就是个信号。
+
+    ★ 反向差多少，就是这两次积分之间的散布下限——它们本该是同一段谱算出来的
+      两个数，一个比另一个"更差"只能来自重复性。真数据上：一颗片子 −40℃ 开环
+      的反向差到 5 dB，另一颗只有 0.7 dB。**散布 5 dB 的时候，3 dB 的片间差
+      就说明不了任何事**，而表上那两个数看着一样体面。
+    ★ 走控制台 + 审计页，不进正表（正表不写告警）。
+    """
+    ipn = next((i for i in sw.items
+                if i.label.startswith("IPN") and "Omit" not in i.label), None)
+    omt = next((i for i in sw.items if i.label.startswith("IPN")
+                and "Omit" in i.label), None)
+    if ipn is None or omt is None:
+        return []
+    by_t = {}
+    for r in sw.rows:
+        a_, b_ = r.vals.get(ipn.col), r.vals.get(omt.col)
+        t = getattr(r, "temp", None)
+        if a_ is None or b_ is None:
+            continue
+        d = b_ - a_                       # >0 ＝ Omit 更差 ＝ 不该发生
+        st = by_t.setdefault(t, [0, 0, 0.0])
+        st[1] += 1
+        if d > tol:
+            st[0] += 1
+            st[2] = max(st[2], d)
+    out = []
+    for t, (bad, tot, worst) in sorted(by_t.items(), key=lambda x: (x[0] is None, x[0])):
+        if not bad:
+            continue
+        out.append(f"{chip} {fmt_num(t)}℃: {bad}/{tot} 行里 {omt.label} 比 "
+                   f"{ipn.label} **还差**（最多 {worst:.2f} dB）。剔掉杂散只可能更好，"
+                   f"反过来说明这两个积分不是同一次测出来的——"
+                   f"{worst:.1f} dB 就是这一趟的重复性下限，比它小的片间差不作数")
+    return out
+
+
 def note_dsb(n, chip):
     if n:
         print(f"     · 积分相噪 SSB→DSB：{n} 项 {DSB_DB:+.2f} dB，行名改成 IPN_DSB")
@@ -1693,7 +1731,7 @@ def write_audit(wb, picked, dropped, unknown, failed, notes, st,
             ("排除的行（逐行原因；这些行不进统计）",
              [(chip, mod, kind, f"行{xl}", why)
               for chip, mod, kind, ex in excl_all for xl, why in ex]),
-            ("逐级关断这一趟的可信度（恢复后复测 vs 全开基线）",
+            ("数据可信度（这些只进这里和控制台，不进正表）",
              [(chip, mod, kind, what, why)
               for chip, mod, kind, ex in quality_all for what, why in ex])):
         if not rowsrc:
@@ -2359,7 +2397,7 @@ def main():
     # ---- 读 PLL 温扫 ----
     tables, failed, notes, warn_seen, vcharts = [], [], {}, {}, []
     excl_all = []
-    quality_all = []          # 电流那趟的可信度：控制台 + 审计页，不进正表
+    quality_all = []          # 数据可信度（重复性/自相矛盾）：控制台 + 审计页，不进正表
     scale_rules = parse_scale(args.scale) or scale_from_cfg(cfg.get("scale"))
     sinfo = {}
     if scale_rules:
@@ -2391,6 +2429,10 @@ def main():
                 print(f"  {chip}: 读失败 —— {e}")
                 continue
             data[chip] = sw
+            for _q in ipn_order_check(sw, chip):
+                print(f"     ⚠ {_q}")
+                quality_all.append((chip, mod, KIND_LABEL[KIND_PLL],
+                                    [("IPN vs IPN_Omit", _q)]))
             imp = implied_scale(sw, KIND_PLL)          # 必须在折算之前算
             n_scale = scale_of(scale_rules, mod, KIND_PLL)
             note_scale(sinfo, KIND_PLL, mod, chip, scale_book(sw, n_scale))
@@ -2448,6 +2490,10 @@ def main():
                 continue
             # ★ 折算必须在 vco_rows 之前：Fmin/Fmax/Kvco/温漂全是拿 F 现算的，
             #   先折算，它们自己就跟着 ×N 了。
+            for _q in ipn_order_check(sw, chip):
+                print(f"     ⚠ {_q}")
+                quality_all.append((chip, mod, KIND_LABEL[KIND_VCO],
+                                    [("IPN vs IPN_Omit", _q)]))
             imp = implied_scale(sw, KIND_VCO)          # 必须在折算之前算
             n_scale = scale_of(scale_rules, mod, KIND_VCO)
             note_scale(sinfo, KIND_VCO, mod, chip, scale_book(sw, n_scale))
