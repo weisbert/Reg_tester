@@ -90,8 +90,11 @@ DEFAULT_CONFIG = {
         "delta_flag_pct": "汇总簿标红：|偏差%| 超过该值才可能标红（默认 20）",
         "delta_flag_abs_ua": "汇总簿标红的绝对偏差下限 µA（默认 40）：|偏差%| 与 |ΔµA| 双双"
                              "超阈才标红，避免小电流模块被百分比放大成假红",
-        "sim_temp_c": "仿真数据的温度（℃，默认从 sim_temp_note 解析数字）；偏差列把实测线性"
-                      "插值到该温度再对仿真，消除单点仿真 vs 多温实测的系统性温差",
+        "sim_temp_c": "仿真数据的温度（℃，默认从 sim_temp_note 解析数字）",
+        "delta_ref_temp": "偏差用哪个**实测**温度点去对仿真（默认 25=常温，取最接近的实测点）；"
+                          "设成 null 则改回「把实测线性插值到 sim_temp_c 再比」。"
+                          "★用实测点=表上只出现测到的数，代价是仿真与实测温度不同，"
+                          "偏差里含系统性温差（电流随温升上升 -> 偏差偏负），口径页已写明",
         "mode_freq": "汇总簿测试频率条件行：模式名 -> 显示文本；不在表里的按名字推断"
                      "（含 2G -> 2.5GHz，含 5G -> 5.8GHz）",
     },
@@ -113,7 +116,7 @@ DEFAULT_CONFIG = {
     "sim_temp_note": "55C",
     "delta_flag_pct": 20,
     "delta_flag_abs_ua": 40,
-    "delta_ref_temp": None,
+    "delta_ref_temp": 25,
     "sim_temp_c": None,
     "mode_freq": {},
 }
@@ -1217,6 +1220,12 @@ def summary_data(conn, config, chips=None):
         m = re.search(r"-?\d+(?:\.\d+)?", str(config.get("sim_temp_note") or ""))
         sim_temp_c = float(m.group(0)) if m else (temps[0] if temps[0] is not None else 25)
     d.sim_temp_c = sim_temp_c
+    # 偏差拿哪个数去对仿真：
+    #   delta_ref_temp 给了值 -> 用最接近它的**实测温度点**（表上只出现测到的数）
+    #   给 null          -> 用插值到 sim_temp_c 的推算值（消掉系统性温差，但表上多一个
+    #                       实测里没有的温度，看表的人第一反应是"这个温度哪来的"）
+    ref = config.get("delta_ref_temp", 25)
+    d.ref_temp = _closest(temps, float(ref)) if (ref is not None and temps[0] is not None) else None
 
     def interp_to(pairs, target):
         """线性插值到 target 温度；范围外取最近端点（不外推）；单点直接返回。"""
@@ -1338,6 +1347,7 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
     thr, abs_thr = d.thr, d.abs_thr
     runs, sim_modes, multi_chip = d.runs, d.sim_modes, d.multi_chip
     temps, n_t, sim_temp_c, interp_to = d.temps, d.n_t, d.sim_temp_c, d.interp_to
+    ref_temp = d.ref_temp   # 有值=偏差用该实测温度点；None=插值到 sim_temp_c
     col_keys, col_title = d.col_keys, d.col_title
     base_ma, end_ma, per_groups, src_files = d.base_ma, d.end_ma, d.per_groups, d.src_files
     matrix, notes, caliber_keys, row_keys = d.matrix, d.notes, d.caliber_keys, d.row_keys
@@ -1377,8 +1387,11 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         + ("  【本簿为自查版：补过的格子标成蓝色斜体】" if (mark_fb and sim_fb) else ""),
         "基线：每模式段第一个 OFF 行之前最后一行（末个 Lock_step）；模块电流 = 上一行 − 本行",
         "锁定后总电流为整机电流，不与仿真直接对比",
-        f"偏差% = (实测线性插值到 {'%g' % sim_temp_c}℃ − 仿真) ÷ 仿真"
-        f"（仿真为 {'%g' % sim_temp_c}℃ 单点，插值消除系统性温差；三温实测原值仍分列可见）",
+        (f"偏差% = (实测 {_t(ref_temp)} − 仿真) ÷ 仿真。★仿真为 {'%g' % sim_temp_c}℃ 单点，"
+         f"与实测温度不同：电流随温升上升，故偏差含系统性温差（实测温度低于仿真时偏负）"
+         if ref_temp is not None else
+         f"偏差% = (实测线性插值到 {'%g' % sim_temp_c}℃ − 仿真) ÷ 仿真"
+         f"（仿真为 {'%g' % sim_temp_c}℃ 单点，插值消除系统性温差；三温实测原值仍分列可见）"),
         f"标红：|偏差%| > {thr * 100:.0f}% 且 |绝对偏差| > {abs_thr:.0f}µA（双阈值同时满足）",
         "LDO 归并 "
         + ("、".join(f"{k}→{v}" for k, v in sorted((config.get("ldo_reparent") or {}).items()))
@@ -1421,10 +1434,11 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         for ti, t in enumerate(temps):
             _cell(ws, 3, c0 + ti, _t(t) if t is not None else "?", bold=True, fill=C_HEADER)
         _cell(ws, 3, c0 + n_t, (f"{sim_note} {tier}".strip() or "post"), bold=True, fill=C_HEADER)
-        # 原来写 `vs55℃*`，星号的含义只在说明页里——那句话删了之后星号就成了谜。
-        # 列名直接把口径写清楚：实测插值到仿真那个温度再比。
-        _cell(ws, 3, c0 + n_t + 1, f"vs{'%g' % sim_temp_c}℃\n(实测插值)", bold=True,
-              fill=C_HEADER)
+        # 列名直接把口径写清楚：拿哪个实测值去对仿真（原来写 `vs55℃*`，
+        # 星号的含义只在说明页里，说明页一删星号就成了谜）
+        _cell(ws, 3, c0 + n_t + 1,
+              (f"vs仿真\n({_t(ref_temp)}实测)" if ref_temp is not None
+               else f"vs{'%g' % sim_temp_c}℃\n(实测插值)"), bold=True, fill=C_HEADER)
         for ti in range(n_t):
             ws.column_dimensions[get_column_letter(c0 + ti)].width = 9.5
         ws.column_dimensions[get_column_letter(c0 + n_t)].width = 10
@@ -1464,10 +1478,14 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         return (m - s) / s if (m is not None and s not in (None, 0)) else None
 
     def meas_at_sim(key, mode, chip):
-        """该行实测插值到仿真温度（sim_temp_c）。"""
+        """该行参与对比的实测值：某个实测温度点，或插值到 sim_temp_c。"""
+        if ref_temp is not None:
+            return matrix[key].get((mode, chip, ref_temp))
         return interp_to([(t, matrix[key].get((mode, chip, t))) for t in temps], sim_temp_c)
 
     def lo_meas_at_sim(mode, chip):
+        if ref_temp is not None:
+            return col_sum(lo_keys, mode, chip, ref_temp)
         return interp_to([(t, col_sum(lo_keys, mode, chip, t)) for t in temps], sim_temp_c)
 
     def flag_red(dev, meas, sim, key):
@@ -1477,7 +1495,10 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         return abs(dev) > thr and abs(meas - sim) > abs_thr
 
     def interp_expr(rr, c0):
-        """该行实测插值到 sim_temp_c 的 Excel 表达式（引用温度列单元格，随实测联动）。"""
+        """该行参与对比的实测值的 Excel 表达式（引用温度列单元格，随实测联动）：
+        ref_temp 有值就是那一列本身，否则是插值到 sim_temp_c 的加权式。"""
+        if ref_temp is not None:
+            return ref(rr, c0 + temps.index(ref_temp))
         pts = sorted((t, i) for i, t in enumerate(temps) if t is not None)
         if not pts:
             return None
@@ -1819,12 +1840,12 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
     for c, (title, w) in enumerate(zip(["编号", "模块 (OFF 步)", "单位"], [9, 30, 6]), 1):
         head_single(c, title, w)
     # 括号里是定义不是说明——列名自带口径，评审就不用去翻别的页
-    # ★「@55℃」必须带「插值」二字：55℃ 是仿真的单点温度，不是实测温度点
-    #   （实测只有 -40/25/105）。不写清楚，看表的人第一反应是"这个 55 哪来的"。
+    # 均值列的温度必须写在列名上，且写的是它真实的出处：实测点就写该温度，
+    # 插值就明说插值（55℃ 是仿真的单点温度，实测里根本没有这个点）
+    mean_lbl = ("各片均值\n@%s" % _t(d.ref_temp) if d.ref_temp is not None
+                else "各片均值\n@%g℃(插值)" % d.sim_temp_c)
     head_group(C_SIM, C_DEV, "仿测对比",
-               [f"仿真\n{d.sim_note} {d.tier}",
-                "各片均值\n@%g℃(插值)" % d.sim_temp_c, "偏差%"],
-               [11, 12, 10])
+               [f"仿真\n{d.sim_note} {d.tier}", mean_lbl, "偏差%"], [11, 12, 10])
     for j, chip in enumerate(chip_ids):
         head_group(cc(j, 0), cc(j, n_t - 1), chip,
                    [_t(t) if t is not None else "?" for t in temps], [10] * n_t)
@@ -1846,8 +1867,12 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
     red_font = Font(name=FONT_NAME, size=10, bold=True, color=C_FLAG)
     i25 = temps.index(_closest(temps, 25)) if temps[0] is not None else 0
 
-    def interp_expr(rr, j):
-        """该片这一行插值到 sim_temp_c 的表达式（引用温度列，随实测联动）。"""
+    ref_i = temps.index(d.ref_temp) if d.ref_temp is not None else None
+
+    def val_expr(rr, j):
+        """这一片参与仿测对比的那个数：某个实测温度点，或插值到 sim_temp_c 的表达式。"""
+        if ref_i is not None:
+            return ref(rr, cc(j, ref_i))
         pts = sorted((t, ti) for ti, t in enumerate(temps) if t is not None)
         if not pts:
             return ref(rr, cc(j, 0))
@@ -1862,6 +1887,11 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
                 a, b = ref(rr, cc(j, i0)), ref(rr, cc(j, i1))
                 return f"({a}+{w:g}*({b}-{a}))"
         return ref(rr, cc(j, pts[-1][1]))
+
+    def val_cells(rr, j):
+        """val_expr 引用到的格子（公式护栏 COUNT 用）。"""
+        return ([ref(rr, cc(j, ref_i))] if ref_i is not None
+                else [ref(rr, cc(j, ti)) for ti in range(n_t)])
 
     rr, guides = 3, []
     for mode in modes:
@@ -1936,10 +1966,11 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
             # 均值@sim_temp / 偏差%
             mv = _mean_at(d, [[vals.get((j, ti)) for ti in range(n_t)] for j in present])
             if present:
-                expr = "+".join(interp_expr(rr, j) for j in present)
-                guard = ",".join(ref(rr, cc(j, ti)) for j in present for ti in range(n_t))
+                expr = "+".join(val_expr(rr, j) for j in present)
+                cells = [c for j in present for c in val_cells(rr, j)]
                 fcell(ws, rr, C_MEAN,
-                      f"=IF(COUNT({guard})<{len(present) * n_t},\"\",({expr})/{len(present)})",
+                      f"=IF(COUNT({','.join(cells)})<{len(cells)},\"\","
+                      f"({expr})/{len(present)})",
                       rnd(mv, 1), fmt=FMT_UA)
             else:
                 _cell(ws, rr, C_MEAN, "", fmt=FMT_UA)
@@ -2006,7 +2037,7 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
                           C_SPREAD=C_SPREAD, C_SPCT=C_SPCT, i25=i25, spread=spread,
                           fill=C_SUM, fmt=FMT_UA, ref=ref)
             if with_sim and present:
-                expr = "+".join(interp_expr(rr, j) for j in present)
+                expr = "+".join(val_expr(rr, j) for j in present)
                 mv = _mean_at(d, [[
                     sum(v for v in (matrix[k].get((mode, chip_ids[j], temps[ti]))
                                     for k in mode_rows if k in lo_keys) if v is not None)
@@ -2062,7 +2093,11 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
             + ("、".join(f"{k}→{v}" for k, v in sorted((config.get("ldo_reparent") or {}).items()))
                or "无")
             + "：子模块实测并入父组、仿真侧不计子模块 -> 父组口径不可比，偏差保留但不标红",
-            f"偏差% = (各片均值线性插值到 {'%g' % d.sim_temp_c}℃ − 仿真) ÷ 仿真",
+            (f"偏差% = (各片 {_t(d.ref_temp)} 实测均值 − 仿真) ÷ 仿真。"
+             f"★仿真为 {'%g' % d.sim_temp_c}℃ 单点，与实测温度不同：电流随温升上升，"
+             "故偏差含系统性温差（实测温度低于仿真时偏负）"
+             if d.ref_temp is not None else
+             f"偏差% = (各片均值线性插值到 {'%g' % d.sim_temp_c}℃ − 仿真) ÷ 仿真"),
             f"标红：|偏差%| > {d.thr * 100:.0f}% 且 |绝对偏差| > {d.abs_thr:.0f}µA（双阈值同时满足）",
         ]
         if spread:
@@ -2116,10 +2151,14 @@ def _closest(temps, target):
 
 
 def _mean_at(d, per_chip_series):
-    """各片先各自插值到 sim_temp_c，再取平均；有片缺值就返回 None。"""
+    """各片取参与对比的那个值，再取平均；有片缺值就返回 None。
+    ref_temp 有值 = 直接取该实测温度点；为 None = 插值到 sim_temp_c。"""
     vals = []
     for series in per_chip_series:
-        v = d.interp_to(list(zip(d.temps, series)), d.sim_temp_c)
+        if d.ref_temp is not None:
+            v = series[d.temps.index(d.ref_temp)]
+        else:
+            v = d.interp_to(list(zip(d.temps, series)), d.sim_temp_c)
         if v is None:
             return None
         vals.append(v)
