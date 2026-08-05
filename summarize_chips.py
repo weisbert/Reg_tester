@@ -2624,6 +2624,24 @@ def main():
                 print(f"  ⚠ {chip}: 清单里这些步骤在文件里没找到（或没有电流值）: "
                       + "，".join(tips[:10])
                       + (f" …共 {len(ks)} 个" if len(ks) > 10 else ""))
+            # ★ 反方向也要说：**文件里有、清单里没有**的步骤。它们仍然在
+            #   「全部关断步骤」那张全量表上，但不进任何一份总功耗——
+            #   该进而漏掉了的话，两份报告就少算了电流，而且一声不响。
+            #   这是"排除了什么逐条说出来"那条纪律的另一半。
+            if wanted:
+                inlist = {k for _g, parts, _t in wanted
+                          for _pn, kk, _x in parts for k in (kk or ())}
+                for chip, cur in cdata.items():
+                    outside = []
+                    for t in cur.temps:
+                        for k, _m, _i, _d in cur.runs[t]["steps"]:
+                            if k not in inlist and k not in outside:
+                                outside.append(k)
+                    if outside:
+                        print(f"  · {chip}: 文件里另有 {len(outside)} 步不在任何一份"
+                              f"总功耗里（只出现在「全部关断步骤」表上）: "
+                              + "，".join(outside[:12])
+                              + (" …" if len(outside) > 12 else ""))
 
     # ★★ 每一页只列**这一页真有数据**的芯片，不拿全局芯片表去铺列。
     #   性能和电流常常不是同一个人测的、测的也不是同一颗 die（一个目录只有温扫、
