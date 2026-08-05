@@ -17,7 +17,9 @@ summarize_chips.py — 一个目录里的多颗芯片 → 一份给评审看的�
                  列 = 测试项 | Unit | Limit | Spec(Min/Typ/Max) | 仿真(Min/Typ/Max)
                       | 汇总(Min/Typ/Max) | 判定 | 每颗芯片(常温/最低/最高温 + 全温MAX
                       + MAX出现在哪) | 备注
-                 Spec 与仿真列留空给人填，填完判定列（Excel 公式）自动出 PASS/FAIL。
+                 Spec 与仿真列给人填，填完判定列（Excel 公式）自动出 PASS/FAIL。
+                 填过一次就别再填第二次：`spec_from_xlsx.py <填好的簿子>
+                 --merge <配置>` 把它们存成数据，以后每次重出都自带。
     温巡          每颗芯片一个**竖条**，条内每个模块两张图（压控温巡 + 频率漂移），
                  一张图只画一颗芯片一个模块（不叠线）；图下面就是它们的数据源。
     _审计         每个数字出自哪一份文件、哪些文件被跳过。**默认隐藏**
@@ -42,6 +44,7 @@ import re
 import sys
 from collections import OrderedDict
 
+from spec_book import SpecBook
 from summarize_vco_sweep import load_vco
 from sweep_lib import (
     COLOR_FLAG, COLOR_MUTED, COLOR_PASS, FILL_FAIL, FILL_PASS,
@@ -71,7 +74,10 @@ KIND_LABEL = {KIND_PLL: "PLL 温扫", KIND_VCO: "VCO 开环", KIND_CUR: "电流"
 # 文件名里的时间戳 _2026-07-28-15-27-19
 TS_RE = re.compile(r"_(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})")
 # 自己的产物 / Excel 临时文件，别把它们当输入读回来
-SKIP_RE = re.compile(r"(^~\$)|(_summary\.xlsx$)|(_chips_summary\.xlsx$)", re.I)
+# `_spec.xlsx` 是手填 Spec 的那份（自己产物的副本）——它的文件名里同样带着
+# 模块名和 pll/vco 字样，掉进根目录里会被当成一份数据簿读进来
+SKIP_RE = re.compile(r"(^~\$)|(_summary\.xlsx$)|(_chips_summary\.xlsx$)"
+                     r"|(_spec\.xlsx$)", re.I)
 
 
 def natkey(s):
@@ -742,16 +748,35 @@ def _judge_formula(r):
             f"IF(OR({over},{under}),\"FAIL\",\"PASS\"))")
 
 
-def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick):
+def _fill_spec(ws, r, st, nd, sp, fill=None):
+    """把 Spec / 仿真 那六格填上（没有 spec 就还是留空给人手填）。
+
+    ★ 写的是**字面数字**，不是公式：下一轮 spec_from_xlsx.py 还要把这份簿子
+      再读回去（人在这份上接着改），公式读回来就成了一串 "=…"。
+    """
+    fill = fill or st["f_in"]
+    d = sp or {}
+    for base, key in ((C_SPEC, "spec"), (C_SIM, "sim")):
+        vals = d.get(key) or {}
+        for j, ax in enumerate(AXES):
+            v = vals.get(ax.lower())
+            cell = put(ws, r, base + j, v, st, fill)
+            if isinstance(v, (int, float)):
+                cell.number_format = "0." + "0" * nd
+
+
+def _result_row(ws, r, label, unit, chips, data, st, n_chips, tpick,
+                band="", spec=None):
     nd = ND.get(unit, 2)
     put(ws, r, C_ITEM, label, st, st["f_res"], align="left")
     put(ws, r, C_UNIT, unit, st, st["f_res"], size=9)
     # Limit 只是提示：相噪/杂散越小越好 -> 填上限；频率/功率两头都可能有要求
-    lim = "≤" if any(label.startswith(p) for p in ("IPN", "SpotPN@", "Spur@")) else "range"
+    sp = spec.row(band, label) if spec is not None else None
+    lim = (sp or {}).get("limit") or (
+        "≤" if any(label.startswith(p) for p in ("IPN", "SpotPN@", "Spur@"))
+        else "range")
     put(ws, r, C_LIMIT, lim, st, st["f_in"], size=9)
-    for j in range(3):
-        put(ws, r, C_SPEC + j, None, st, st["f_in"])
-        put(ws, r, C_SIM + j, None, st, st["f_in"])
+    _fill_spec(ws, r, st, nd, sp)
     for c in rail_cols(len(chips)):
         put(ws, r, c, None, st, st["f_rail"])
 
@@ -866,7 +891,8 @@ def _limit_dropdown(ws, r0, r1):
     dv.add(f"{_cl(C_LIMIT)}{r0}:{_cl(C_LIMIT)}{r1}")
 
 
-def write_summary(wb, tables, chips, st, slim=False, sinfo=None, dsb=False):
+def write_summary(wb, tables, chips, st, slim=False, sinfo=None, dsb=False,
+                  spec=None):
     """tables = [(模块名, {芯片: Sweep}), ...]，一个模块一张表，从上到下排。"""
     ws = wb.create_sheet("PLL_Summary")
     n = len(chips)
@@ -893,16 +919,19 @@ def write_summary(wb, tables, chips, st, slim=False, sinfo=None, dsb=False):
         items = canon_items(sweeps)
         tpick, tlabels = pick_temps(sweeps)
         t0 = r                                   # 这张表的第一行（大标题）
-        r = _header(ws, r, chips, st,
-                    f"{mod} PLL 性能汇总{scale_title((sinfo or {}).get(mod), dsb)}",
-                    n, tlabels)
+        # 表键＝没加折算注解那截标题：折算倍数换了 spec 也还认得出是同一张表
+        base = f"{mod} PLL 性能汇总"
+        full = base + scale_title((sinfo or {}).get(mod), dsb)
+        sp = spec.table(ws.title, base, full) if spec is not None else None
+        r = _header(ws, r, chips, st, full, n, tlabels)
         r = _cond_rows(ws, r, chips, data, st, n)
         j0 = r
         for band, rows in items:
             r = _band(ws, r, band, st, n)
             b0 = r
             for label, unit in rows:
-                r = _result_row(ws, r, label, unit, chips, data, st, n, tpick)
+                r = _result_row(ws, r, label, unit, chips, data, st, n, tpick,
+                                band=band, spec=sp)
             # 组内超过 4 行就每 4 行给一条横向导引线（SpotPN 有 8 行）
             if r - b0 > 4:
                 for rr in range(b0 + 3, r - 1, 4):
@@ -1292,7 +1321,7 @@ def op_vtune_of(sw):
 
 
 def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False,
-                      sinfo=None, dsb=False):
+                      sinfo=None, dsb=False, spec=None):
     """VCO 汇总表：每颗芯片的组内轴＝三个温度（不是 Min/Typ/Max）。
 
     ★ 为什么这里用温度当轴、PLL 那页用极值当轴：VCO 这些量本来就是"一个温度
@@ -1302,11 +1331,12 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False,
     """
     return write_grouped_page(wb, "VCO_Summary", "{mod} VCO 开环特性汇总",
                               vtables, chips, st, vtemps, slim=slim,
-                              sinfo=sinfo, dsb=dsb)
+                              sinfo=sinfo, dsb=dsb, spec=spec)
 
 
 def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
-                       slim=False, item_w=26, note_w=46, sinfo=None, dsb=False):
+                       slim=False, item_w=26, note_w=46, sinfo=None, dsb=False,
+                       spec=None):
     """「一行一个量 × 每片若干温度」这种页的通用写法。
 
     ★ VCO 汇总页和电流页是同一个形状：行是结论量、组内轴是温度、汇总列对
@@ -1348,8 +1378,10 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
     for mod, data in vtables:
         t0 = r
         # ---- 三行表头 ----
-        c = put(ws, r, C_ITEM,
-                title_fmt.format(mod=mod) + scale_title((sinfo or {}).get(mod), dsb),
+        base = title_fmt.format(mod=mod)
+        full = base + scale_title((sinfo or {}).get(mod), dsb)
+        sp = spec.table(sheet, base, full) if spec is not None else None
+        c = put(ws, r, C_ITEM, full,
                 st, st["f_sep"], bold=True, align="left", size=12)
         ws.merge_cells(start_row=r, start_column=C_ITEM, end_row=r, end_column=vnote())
         c.alignment = _align("left", wrap=False)
@@ -1418,13 +1450,12 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
                 j0 = r
             nd = nd_ or (3 if unit == "MHz" else 2)
             body = st["f_res"] if is_res else st["f_group"]
+            spr = sp.row(cat, item) if (sp is not None and is_res) else None
             put(ws, r, C_ITEM, item, st, body, align="left", bold=strong)
             put(ws, r, C_UNIT, unit, st, body, size=9)
-            put(ws, r, C_LIMIT, dr if is_res else None, st,
-                st["f_in"] if is_res else body, size=9)
-            for j in range(3):
-                put(ws, r, C_SPEC + j, None, st, st["f_in"] if is_res else body)
-                put(ws, r, C_SIM + j, None, st, st["f_in"] if is_res else body)
+            put(ws, r, C_LIMIT, ((spr or {}).get("limit") or dr) if is_res
+                else None, st, st["f_in"] if is_res else body, size=9)
+            _fill_spec(ws, r, st, nd, spr, st["f_in"] if is_res else body)
             for cc in vrails():
                 put(ws, r, cc, None, st, st["f_rail"])
 
@@ -1710,7 +1741,7 @@ def _vco_chart(ws, tag, chip, mod, col0, r_data, n_rows, vtemps, bounds, ser, xs
 # ---------------------------------------------------------------- 审计页
 
 def write_audit(wb, picked, dropped, unknown, failed, notes, st,
-                excl_all=(), quality_all=()):
+                excl_all=(), quality_all=(), spec_rows=()):
     """每个数出自哪份文件 + 哪些文件没用上。**隐藏页**——正表不写这些。"""
     ws = wb.create_sheet("_审计")
     ws.sheet_state = "hidden"
@@ -1745,7 +1776,13 @@ def write_audit(wb, picked, dropped, unknown, failed, notes, st,
               for chip, mod, kind, ex in excl_all for xl, why in ex]),
             ("数据可信度（这些只进这里和控制台，不进正表）",
              [(chip, mod, kind, what, why)
-              for chip, mod, kind, ex in quality_all for what, why in ex])):
+              for chip, mod, kind, ex in quality_all for what, why in ex]),
+            # 存着 spec、这次却没落到格子上的行。不报出来的话，表上那一行的
+            # Spec 列是空的、判定列也是空的——看着像"这项没定 spec"，
+            # 其实是名字对不上，静悄悄地漏判了
+            ("Spec 没对上的行（配置里填了，这次表上没有这一行）",
+             [(sheet, tkey, cat, item, why)
+              for sheet, tkey, cat, item, why in spec_rows])):
         if not rowsrc:
             continue
         put(ws, r, 1, title, st, st["f_sep"], bold=True, align="left")
@@ -2475,6 +2512,11 @@ def main():
                          "里面可以放 scale / groups / modules / chips / "
                          "op_vtune / ref_temp / spur_tol，命令行给了就以命令行为准。"
                          "★含真实模块名，跟数据放一起，别提交")
+    ap.add_argument("--spec", default=None,
+                    help="Spec / 仿真 / Limit 那七列的来源 JSON（spec_from_xlsx.py "
+                         "从填好的簿子里读出来的）。不给＝用配置文件里的 spec 块")
+    ap.add_argument("--no-spec", action="store_true",
+                    help="七列一律留空给人手填（盖掉配置里的 spec）")
     ap.add_argument("--spur-tol", type=float, default=None,
                     help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
                          "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
@@ -2522,6 +2564,23 @@ def main():
     op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
     dsb = bool(pick_opt(args.dsb, "dsb", False))
     chart_w = float(pick_opt(args.chart_w, "chart_w", CHART_W_CM))
+
+    # Spec / 仿真 / Limit：手填一次，存成数据，以后每次重出都自带
+    spec = None
+    if not args.no_spec:
+        sd, stt, ssrc = cfg.get("spec"), \
+            (cfg.get("spec_meta") or {}).get("titles"), \
+            os.path.basename(cfg_path or "") or CONFIG_NAME
+        if args.spec:
+            if not os.path.isfile(args.spec):
+                sys.exit(f"找不到 spec 文件: {args.spec}")
+            with open(args.spec, encoding="utf-8") as f:
+                sj = json.load(f)
+            sd = sj.get("spec", sj)
+            stt = (sj.get("spec_meta") or {}).get("titles")
+            ssrc = os.path.basename(args.spec)
+        if sd:
+            spec = SpecBook(sd, stt, ssrc)
 
     want_mod = ([m.strip() for m in args.modules.split(",") if m.strip()]
                 or [str(m).strip() for m in (cfg.get("modules") or [])])
@@ -2885,22 +2944,22 @@ def main():
     st = styles()
     if tables:
         write_summary(wb, tables, chips_pll, st, slim=args.slim,
-                      sinfo=sinfo.get(KIND_PLL), dsb=dsb)
+                      sinfo=sinfo.get(KIND_PLL), dsb=dsb, spec=spec)
         write_journey(wb, tables, chips_pll, st, no_charts=args.no_charts,
                       chart_w=chart_w)
     if vtables:
         write_vco_summary(wb, vtables, chips_vco, st, vtemps, slim=args.slim,
-                          sinfo=sinfo.get(KIND_VCO), dsb=dsb)
+                          sinfo=sinfo.get(KIND_VCO), dsb=dsb, spec=spec)
         write_vco_charts(wb, vcharts, chips_vco, st, vtemps,
                          no_charts=args.no_charts, chart_w=chart_w)
     # 电流页放最后：前四页是成对的（汇总+过程），别插进它们中间
     if ctables:
         write_grouped_page(wb, "Current_Summary", "{mod}（逐级关断电流）",
                            ctables, chips_cur, st, ctemps, slim=args.slim,
-                           item_w=24, note_w=52)
+                           item_w=24, note_w=52, spec=spec)
     if not args.no_audit:
         write_audit(wb, picked, dropped, unknown, failed, notes, st, excl_all,
-                    quality_all)
+                    quality_all, spec.audit_rows() if spec else ())
     wb.calculation.fullCalcOnLoad = True
 
     out = args.out or os.path.join(os.path.dirname(root),
@@ -2917,8 +2976,16 @@ def main():
             gone = [c for c in chips if c not in cs]
             print(f"  {nm} 只列了 {', '.join(cs)}；{', '.join(gone)} 没有这类数据，"
                   f"不给它留空列（谁有哪类数据见隐藏的 _审计 页）。")
-    print("  各汇总页的 Spec / 仿真 / Limit 列留空，填进 Spec Min/Max "
-          "判定列自动出 PASS/FAIL 并上色。")
+    if spec:
+        print()
+        for line in spec.report():
+            print("  " + line)
+        print("  改 spec: 在这份簿子上直接改 → "
+              "python spec_from_xlsx.py <这份簿子> --merge <配置>")
+    else:
+        print("  各汇总页的 Spec / 仿真 / Limit 列留空，填进 Spec Min/Max "
+              "判定列自动出 PASS/FAIL 并上色。填完用 spec_from_xlsx.py 存进配置，"
+              "以后每次重出都自带。")
     if args.slim:
         print("  --slim: 两张汇总表每片只显示常温列，其余温度列已折起——"
               "点表头上方的 ＋（或左上角的「2」）展开，数一个都没少。"
