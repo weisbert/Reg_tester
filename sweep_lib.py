@@ -188,8 +188,11 @@ def find_spur_list(header, rows, min_pairs=2):
 
     ★ 判据全是结构性的，不认列字母也不认表头名（不同批次导出列位会挪）：
       ① 落在最后一个有表头的列**右边** ② 自己没有表头 ③ 成对出现、
-      两列的非空行数相等 ④ 偶数列非负（偏移频率）、奇数列为负（dBc）。
+      两列的非空行数相等 ④ **奇数列为负**（dBc 电平），偶数列是数（偏移频率）。
       四条都过才认。认错了是**安静地把两列错位读成杂散**，比读不到糟得多。
+    ★ 偏移**允许为负**：有的簿子把载波下边那一侧记成 −26 MHz。原来要求
+      偶数列非负，于是带负偏移的那份直接认不出来（真数据上 18/62 反例）。
+      判据仍然挡得住"整体错开一列"——那种情况下奇数列会拿到正的频率值。
 
     返回 (pairs, why)：pairs=[(偏移列, 电平列), …]，认不出来时 pairs 为空、
     why 说明卡在哪一条。
@@ -228,10 +231,10 @@ def find_spur_list(header, rows, min_pairs=2):
             v = num(r[lc]) if lc < len(r) else None
             if f is None or v is None:
                 continue
-            ok, bad = (ok + 1, bad) if (f >= 0 and v < 0) else (ok, bad + 1)
+            ok, bad = (ok + 1, bad) if v < 0 else (ok, bad + 1)
         pairs.append((fc, lc))
     if not ok or bad > ok * 0.02:
-        return [], (f"偶数列非负/奇数列为负 这条不成立（{bad}/{ok + bad} 反例），"
+        return [], (f"奇数列该是负的 dBc，这条不成立（{bad}/{ok + bad} 反例），"
                     f"这段多半不是杂散清单")
     return pairs, ""
 
@@ -247,7 +250,8 @@ def spur_picker(pairs, target, tol):
         for fc, lc in pairs:
             f = num(raw[fc]) if fc < len(raw) else None
             v = num(raw[lc]) if lc < len(raw) else None
-            if f is None or v is None or abs(f - target) > tol:
+            # 偏移可能记成负数（载波下边那一侧），按绝对值对标称频点
+            if f is None or v is None or abs(abs(f) - target) > tol:
                 continue
             if best is None or v > best[1]:
                 best = (lc, v)

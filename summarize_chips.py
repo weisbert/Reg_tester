@@ -1785,16 +1785,23 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
             out.excluded.append((0, f"{fmt_num(t)}℃ 这一趟一个测量点都没有", ""))
             continue
         base = pts[0][3]
-        steps, recheck, prev = [], None, base
-        for n, k, m, i in pts[1:]:
-            # 回升超过基线 5% ＝ 恢复段的复测点，阶梯到此为止
+        steps, prev, cut = [], base, None
+        for idx, (n, k, m, i) in enumerate(pts[1:], start=1):
+            # 回升超过基线 5% ＝ 恢复段开始了，阶梯到此为止
             if i - prev > abs(base) * 0.05:
-                recheck = (n, k, m, i)
+                cut = idx
                 break
             steps.append((k, m, i, prev - i))
             prev = i
+        # ★★ 恢复后复测取**这一趟的最后一个测量点**，不是第一个回升的那个。
+        #   恢复常常是分几步写回的（真数据里阶梯后面还挂着十来行），
+        #   取第一个回升点＝拿"刚恢复了一小半"的状态去跟全开基线比，
+        #   算出来是"差了 58%"这种吓人的数，其实只是取错了行。
+        #   （TT011 105℃ 就是这么报出 −9.58 mA 的。）
+        tail = pts[cut:] if cut is not None else []
         out.runs[t] = {"baseline": base, "baseline_key": pts[0][1],
-                       "steps": steps, "recheck": recheck}
+                       "steps": steps, "recheck": (tail[-1] if tail else None),
+                       "tail_n": len(tail)}
     out.temps = sorted(out.runs)
     return out
 
@@ -1842,6 +1849,8 @@ def run_quality(cur, chip):
         msg = (f"{chip} {fmt_num(t)}℃: 恢复后复测 {fmt_num(rc[3], 4)} mA，"
                f"全开基线 {fmt_num(base, 4)} mA，差 {d:+.4f}（{pct:.1f}%）"
                f"——差值的误差下限就是这个数")
+        if run.get("tail_n", 0) > 1:
+            msg += f"（阶梯后面共 {run['tail_n']} 个点，取的是最后一个）"
         if small:
             msg += (f"；{len(small)}/{len(run['steps'])} 个台阶比它还小"
                     + (f"（{', '.join(small[:6])}"
