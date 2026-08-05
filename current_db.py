@@ -1734,8 +1734,8 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
     return len(runs), len(row_keys), n_charts
 
 
-def cmd_chips_export(conn, out_path, config, chips=None):
-    """跨芯片评审版汇总簿：说明 + 一页总览。
+def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
+    """跨芯片评审版汇总簿：一页总览（+ 隐藏的 _审计 页存口径）。
 
     与单芯片版（cmd_summary_export）的区别只在**摆法**，读数走同一个 summary_data：
       - 仿真列只出现一次（仿真与芯片无关，单芯片版每个模式×芯片块都重复一遍）
@@ -1793,56 +1793,12 @@ def cmd_chips_export(conn, out_path, config, chips=None):
     def ref(r, c):
         return f"{get_column_letter(c)}{r}"
 
-    # ================= 说明 =================
+    # ================= 总览（这本簿唯一可见的页） =================
+    # ★ 不做"说明/读法"页：簿子是给评审看的，评审要的是数。教人怎么读表、
+    #   阈值还没定这类话是写给操作者的，一律出簿——口径进隐藏的 _审计 页，
+    #   给操作者的话回控制台。（同一条规矩在 summarize_chips 已经踩过一次）
     ws = wb.active
-    ws.title = "说明"
-    ws["A1"] = "跨芯片功耗汇总簿 · 读法"
-    ws["A1"].font = Font(name=FONT_NAME, bold=True, size=14)
-    lines = [
-        "",
-        f"导出时间 {now_iso()}；数据源 current.db（current_db.py summary-chips 生成）",
-        f"芯片 {n_chip} 颗：{', '.join(chip_ids)}；模式 {len(modes)} 个；"
-        f"温度点 {', '.join(_t(t) for t in temps if t is not None) or '未知'}；"
-        f"实测 {len(d.runs)} 个 run（模式×芯片×温度，重复测取最新一次）",
-        f"源文件 {', '.join(sorted(d.src_files))}",
-        f"仿真：档位 {d.tier or '未过滤'} / {d.stage_main}-sim / 温度 {d.sim_note or '未标注'}；"
-        "仿真与芯片无关，故只有一列，各片共用。",
-        ((f"  仿真取值：优先 {d.stage_main}-sim；某模块该阶段为 0/缺项（≤{d.zero_ua:g}µA 计作缺项）"
-          f"时取{d.other_stage}-sim（前仿已做 back annotate，两者可比），逐模块判断，"
-          f"两阶段都为 0 则留空。本簿共 {len(d.sim_fb)} 处，逐处在该行备注列写明。")
-         if (d.fb_stage and d.sim_fb) else "  仿真列全部取自同一阶段，无跨阶段补值。"),
-        "",
-        "【总览页】一个模式一段（灰底 band 行），段内：",
-        "  条件行 = 锁定后总电流（做差基线）、全关残留电流（末个 OFF 步=全关后的末态），单位 mA；",
-        "  结果行 = 每个模块组一行，单位 µA；段末 Σ LO 模块合计（口径与仿真一致）与 Σ 总合计。",
-        "  列：仿真 1 列（各片共用）→ 每颗芯片一竖条（各温度实测）"
-        + ("→ 片间极差 → 均值@%g℃ → 偏差%%。" % d.sim_temp_c if spread
-           else "→ 均值@%g℃ → 偏差%%。" % d.sim_temp_c),
-    ]
-    if spread:
-        lines += [
-            f"  片间极差 = 同一温度下各片的 max−min，取三个温度里最大的那个（最坏情况）；"
-            f"极差% = 极差 ÷ 常温({_t(_closest(temps, 25))})各片均值。",
-            "  某颗芯片这一组没测时极差留空——不同覆盖度的片之间不做减法。",
-            "  ★极差不标色：多大算超标要你定（片间一致性没有 spec），定了我再加判据。",
-        ]
-    lines += [
-        f"  偏差% = (各片均值插值到{'%g' % d.sim_temp_c}℃ − 仿真) ÷ 仿真。仿真是"
-        f"{'%g' % d.sim_temp_c}℃单点，实测按三温线性插值到该温度再比，消除系统性温差。",
-        f"  标红=双阈值：|偏差%|>{d.thr * 100:.0f}% 且 |绝对偏差|>{d.abs_thr:.0f}µA 才红"
-        "（避免小电流模块被百分比放大成假红）。",
-        f"  LDO 归并 {config.get('ldo_reparent')}：子模块实测并入父组、仿真侧不计子模块，"
-        "父组口径不可比 -> 偏差仅供参考、不标红（见该行备注）。",
-        "",
-        "极差/均值/偏差/Σ 都是 Excel 公式（改实测或仿真会自动重算），同时写入了当前结果的",
-        "缓存值，不自动重算的查看器打开也能直接看到数字。",
-    ]
-    for i, line in enumerate(lines, 2):
-        ws.cell(row=i, column=1, value=line).font = Font(name=FONT_NAME, size=10)
-    ws.column_dimensions["A"].width = 112
-
-    # ================= 总览 =================
-    ws = wb.create_sheet("总览")
+    ws.title = "总览"
     ws.sheet_view.showGridLines = False
     for r in (1, 2):
         for c in range(1, C_NOTE + 1):
@@ -1869,7 +1825,9 @@ def cmd_chips_export(conn, out_path, config, chips=None):
         head_group(cc(j, 0), cc(j, n_t - 1), chip,
                    [_t(t) if t is not None else "?" for t in temps], [10] * n_t)
     if spread:
-        head_group(C_SPREAD, C_SPCT, "片间一致性", ["极差 µA", "极差 %"], [10, 9])
+        # 括号里是定义不是说明——列名自带口径，评审就不用去翻别的页
+        head_group(C_SPREAD, C_SPCT, "片间一致性",
+                   ["极差 µA\n(全温最坏)", "极差 %\n(÷常温)"], [11, 10])
     head_group(C_MEAN, C_DEV, "与仿真对比",
                ["各片均值\n@%g℃" % d.sim_temp_c, "偏差%"], [11, 10])
     head_single(C_NOTE, "备注", 46)
@@ -2075,9 +2033,50 @@ def cmd_chips_export(conn, out_path, config, chips=None):
     for g in guides:
         _hguide(ws, g, 1, C_NOTE)
 
+    # ================= _审计（隐藏页：口径与来源，不是读法） =================
+    # 要追口径的人取消隐藏就能看到，评审打开簿子看到的仍然只有数。
+    if audit:
+        aw = wb.create_sheet("_审计")
+        aw.sheet_state = "hidden"
+        aw["A1"] = "口径与来源"
+        aw["A1"].font = Font(name=FONT_NAME, bold=True, size=12)
+        one_temp = _t(_closest(temps, 25)) if temps[0] is not None else "?"
+        alines = [
+            f"导出 {now_iso()}  current_db.py summary-chips  数据源 current.db",
+            f"芯片 {n_chip} 颗：{'、'.join(chip_ids)}",
+            f"源文件：{'、'.join(sorted(d.src_files))}",
+            f"模式 {len(modes)} 个；温度点 {'、'.join(_t(t) for t in temps if t is not None) or '未知'}；"
+            f"实测 {len(d.runs)} 个 run；同一 (模式,芯片,温度) 重复测取 run_ts 最新一次",
+            f"仿真：{d.tier or '未过滤'} / {d.stage_main}-sim / {d.sim_note or '温度未标注'}；"
+            "与芯片无关，各片共用同一列",
+            (f"跨阶段补值：{d.stage_main} 为 0 或 ≤{d.zero_ua:g}µA 计作缺项时取 {d.other_stage}"
+             f"（前仿已做 back annotate）；两阶段都缺则留空。共 {len(d.sim_fb)} 处，"
+             "逐处写在该行备注列" if (d.fb_stage and d.sim_fb) else "仿真列全部取自同一阶段，无补值"),
+            "基线：每模式段第一个 OFF 行之前最后一行（末个 Lock_step）；模块电流 = 上一行 − 本行",
+            "LDO 归并 "
+            + ("、".join(f"{k}→{v}" for k, v in sorted((config.get("ldo_reparent") or {}).items()))
+               or "无")
+            + "：子模块实测并入父组、仿真侧不计子模块 -> 父组口径不可比，偏差保留但不标红",
+            f"偏差% = (各片均值线性插值到 {'%g' % d.sim_temp_c}℃ − 仿真) ÷ 仿真",
+            f"标红：|偏差%| > {d.thr * 100:.0f}% 且 |绝对偏差| > {d.abs_thr:.0f}µA（双阈值同时满足）",
+        ]
+        if spread:
+            alines += [
+                f"片间极差：同一温度下各片 max−min，取全温最大者；极差% = 极差 ÷ 常温({one_temp})各片均值",
+                "某片该组未测时极差留空（覆盖度不同的片之间不做减法）；片间一致性无 spec，不设标色判据",
+            ]
+        alines += [
+            "Σ LO 模块合计不含标签行（DCO 等），口径与仿真一致；Σ 总合计含标签行、仿真未覆盖",
+            "极差 / 均值 / 偏差 / Σ 为 Excel 公式，并已写入当前结果的缓存值",
+        ]
+        for i, line in enumerate(alines, 3):
+            aw.cell(row=i, column=1, value=line).font = Font(name=FONT_NAME, size=10)
+        aw.column_dimensions["A"].width = 110
+
     wb.save(out_path)
     _inject_cached_values(out_path, fcache)
-    return len(d.runs), len(modes), n_chip
+    return {"runs": len(d.runs), "modes": len(modes), "chips": chip_ids,
+            "n_fb": len(d.sim_fb), "spread": spread, "cols": C_NOTE}
 
 
 _MEDIUM = Side(style="medium", color="FF000000")
@@ -2248,10 +2247,18 @@ def cmd_chips(args):
     chips = None
     if args.chip:
         chips = [c.strip() for arg in args.chip for c in str(arg).split(",") if c.strip()]
-    n_runs, n_modes, n_chip = cmd_chips_export(conn, args.out, config, chips=chips)
+    r = cmd_chips_export(conn, args.out, config, chips=chips, audit=not args.no_audit)
     conn.close()
-    print(f"[完成] 跨芯片汇总簿: {args.out}"
-          f"（{n_chip} 颗芯片 × {n_modes} 个模式，{n_runs} 个 run）")
+    print(f"[完成] 跨芯片汇总簿: {args.out}")
+    print(f"       {len(r['chips'])} 颗芯片（{'、'.join(r['chips'])}）× {r['modes']} 个模式，"
+          f"{r['runs']} 个 run，总览 {r['cols']} 列")
+    # 下面这些是给出簿的人看的，**所以只在控制台**：簿子是给评审的，
+    # 里面出现"阈值还没定"这类话，评审会停下来问这行字是干嘛的
+    if r["n_fb"]:
+        print(f"       仿真跨阶段补值 {r['n_fb']} 处（逐处写在总览备注列；口径在隐藏的 _审计 页）")
+    if r["spread"]:
+        print("       片间极差未设标色判据——片间一致性没有 spec，定了阈值再加")
+    print("       正簿只有「总览」一页；口径与来源在隐藏页 _审计（--no-audit 可不出）")
 
 
 def cmd_summary(args):
@@ -2887,6 +2894,8 @@ def main():
     mc.add_argument("--config", help="配置文件路径（默认取 db 同目录 current_config.json）")
     mc.add_argument("--chip", action="append",
                     help="只出这些芯片（可重复或逗号分隔）；默认库里有几颗出几颗")
+    mc.add_argument("--no-audit", action="store_true",
+                    help="连隐藏的 _审计 页也不出（正簿本来就只有总览一页）")
     mc.set_defaults(func=cmd_chips)
     m.add_argument("--mark-fallback", action="store_true",
                    help="把跨阶段补值的仿真格标成蓝色斜体（自查版用；默认不标，"
