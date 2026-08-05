@@ -2202,11 +2202,6 @@ def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None,
          sheets=(), mod=""):
     """把一格的来龙去脉打出来：原表哪几行 → 原始值 → 加了什么 → 等于多少。"""
     from openpyxl.utils import get_column_letter as gl
-    print(f"  {chip}  {fmt_num(t)}℃")
-    for xl, col, raw in rows[:8]:
-        print(f"      原表 {srcname} 行{xl} 列{gl(col + 1)}  {raw}")
-    if len(rows) > 8:
-        print(f"      …共 {len(rows)} 行（{how}）")
     base = agg
     line = f"      {how} = {round(base, 6)}"
     for name, d in add:
@@ -2216,14 +2211,23 @@ def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None,
         base *= mul
         line += f"  ×{fmt_num(mul, 4)}"
     line += f"  →  {round(base, 6)} {unit}"
+    where = got = None
     if wb is not None and label:
         where, got = _book_cell(wb, label, chip, t, sheets, mod)
-        if where is None:
-            line += "   （表上不列这个温度）"
-        else:
+        if where is not None:
             ok = got is not None and abs(float(got) - base) < 0.006
             line += f"   簿子 {where} = {got}  {'✓' if ok else '✗ 对不上！'}"
+    # ★ 表上没有这个温度就整段不打。PLL 温扫有 16 档温度、表上只列 3 档，
+    #   其余 13 档每档刷四行「表上不列」——追溯是拿来核对的，不是拿来倒数据的。
+    if wb is not None and where is None:
+        return False
+    print(f"  {chip}  {fmt_num(t)}℃")
+    for xl, col, raw in rows[:8]:
+        print(f"      原表 行{xl} 列{gl(col + 1)}  {raw}")
+    if len(rows) > 8:
+        print(f"      …共 {len(rows)} 行（{how}）")
     print(line)
+    return True
 
 
 def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
@@ -2247,6 +2251,7 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
             hit = True
             print(f"[{mod} PLL 温扫] {os.path.basename(sw.path)}")
             add, mul = _xfrm(sinfo, KIND_PLL, mod, dsb, label, it.unit)
+            skipped = 0
             for t in sw.temps:
                 pts = [(r.xl, r.col_of(it), r.raw[r.col_of(it)], r.vals[it.col])
                        for lg in sw.legs for r in lg.rows
@@ -2257,9 +2262,13 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
                 # 表上那格 = 折算后各点的中位数；反推回折算前好跟原表对
                 med_after = median([p[3] for p in pts])
                 med_before = (med_after / mul) - sum(d for _n, d in add)
-                _say(chip, t, "", [(a, b, c) for a, b, c, _d in pts], med_before,
-                     add, mul, it.unit, f"{len(pts)} 个点的中位数", wb, label,
-                     ("PLL_Summary",), mod)
+                if not _say(chip, t, "", [(a, b, c) for a, b, c, _d in pts],
+                            med_before, add, mul, it.unit,
+                            f"{len(pts)} 个点的中位数", wb, label,
+                            ("PLL_Summary",), mod):
+                    skipped += 1
+            if skipped:
+                print(f"      （另有 {skipped} 档温度表上不列，略）")
     for mod, chips_ in vsweeps.items():           # VCO 页：工作点那一个点
         for chip, sw in chips_.items():
             it = next((x for x in sw.items if x.label == label), None)
