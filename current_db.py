@@ -1421,7 +1421,10 @@ def cmd_summary_export(conn, out_path, config, mark_fb=False, chips=None):
         for ti, t in enumerate(temps):
             _cell(ws, 3, c0 + ti, _t(t) if t is not None else "?", bold=True, fill=C_HEADER)
         _cell(ws, 3, c0 + n_t, (f"{sim_note} {tier}".strip() or "post"), bold=True, fill=C_HEADER)
-        _cell(ws, 3, c0 + n_t + 1, f"vs{'%g' % sim_temp_c}℃*", bold=True, fill=C_HEADER)
+        # 原来写 `vs55℃*`，星号的含义只在说明页里——那句话删了之后星号就成了谜。
+        # 列名直接把口径写清楚：实测插值到仿真那个温度再比。
+        _cell(ws, 3, c0 + n_t + 1, f"vs{'%g' % sim_temp_c}℃\n(实测插值)", bold=True,
+              fill=C_HEADER)
         for ti in range(n_t):
             ws.column_dimensions[get_column_letter(c0 + ti)].width = 9.5
         ws.column_dimensions[get_column_letter(c0 + n_t)].width = 10
@@ -1816,9 +1819,12 @@ def cmd_chips_export(conn, out_path, config, chips=None, audit=True):
     for c, (title, w) in enumerate(zip(["编号", "模块 (OFF 步)", "单位"], [9, 30, 6]), 1):
         head_single(c, title, w)
     # 括号里是定义不是说明——列名自带口径，评审就不用去翻别的页
+    # ★「@55℃」必须带「插值」二字：55℃ 是仿真的单点温度，不是实测温度点
+    #   （实测只有 -40/25/105）。不写清楚，看表的人第一反应是"这个 55 哪来的"。
     head_group(C_SIM, C_DEV, "仿测对比",
-               [f"仿真\n{d.sim_note} {d.tier}", "各片均值\n@%g℃" % d.sim_temp_c, "偏差%"],
-               [11, 11, 10])
+               [f"仿真\n{d.sim_note} {d.tier}",
+                "各片均值\n@%g℃(插值)" % d.sim_temp_c, "偏差%"],
+               [11, 12, 10])
     for j, chip in enumerate(chip_ids):
         head_group(cc(j, 0), cc(j, n_t - 1), chip,
                    [_t(t) if t is not None else "?" for t in temps], [10] * n_t)
