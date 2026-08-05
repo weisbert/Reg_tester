@@ -2164,7 +2164,30 @@ def _xfrm(sinfo, kind, mod, dsb, label, unit):
     return add, mul
 
 
-def _say(chip, t, srcname, rows, agg, add, mul, unit, how):
+def _book_cell(wb, label, chip, temp):
+    """在产出的簿子里找到 (行名, 芯片, 温度) 那一格。**按内容找，不按坐标算**——
+    算坐标就等于把版式规则抄第二遍，版式一改追溯就悄悄指错格子。"""
+    tag = f"{fmt_num(temp)}℃"
+    for name in ("PLL_Summary", "VCO_Summary", "Current_Summary"):
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        for r in range(1, ws.max_row + 1):
+            if txt(ws.cell(row=r, column=C_ITEM).value) != label:
+                continue
+            for hr in range(r - 1, 0, -1):          # 往上找最近那行表头
+                c0 = next((c for c in range(1, ws.max_column + 1)
+                           if txt(ws.cell(row=hr, column=c).value) == chip), None)
+                if c0 is None:
+                    continue
+                for c in range(c0, ws.max_column + 1):
+                    if txt(ws.cell(row=hr + 1, column=c).value) == tag:
+                        return f"{name}!{_cl(c)}{r}", ws.cell(row=r, column=c).value
+                break
+    return None, None
+
+
+def _say(chip, t, srcname, rows, agg, add, mul, unit, how, wb=None, label=None):
     """把一格的来龙去脉打出来：原表哪几行 → 原始值 → 加了什么 → 等于多少。"""
     from openpyxl.utils import get_column_letter as gl
     print(f"  {chip}  {fmt_num(t)}℃")
@@ -2180,19 +2203,29 @@ def _say(chip, t, srcname, rows, agg, add, mul, unit, how):
     if mul != 1.0:
         base *= mul
         line += f"  ×{fmt_num(mul, 4)}"
-    print(line + f"  →  {round(base, 6)} {unit}")
+    line += f"  →  {round(base, 6)} {unit}"
+    if wb is not None and label:
+        where, got = _book_cell(wb, label, chip, t)
+        if where is None:
+            line += "   （表上不列这个温度）"
+        else:
+            ok = got is not None and abs(float(got) - base) < 0.006
+            line += f"   簿子 {where} = {got}  {'✓' if ok else '✗ 对不上！'}"
+    print(line)
 
 
-def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg):
+def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg, out_path=None):
     """把某一行的数一路追回原表。**用来分清是程序算错了还是数据本身就这样。**
 
     ★ 这个问题会反复出现：某一格看着离谱（IPN 是正的、杂散差 60 dB、
       复测差 58%），第一反应总是"是不是脚本弄错了"。争论没用，把原表的
       行号列号、原始值、加了几 dB、加完等不等于表上那个数，一路摊开就完了。
     """
+    import openpyxl
     from summarize_vco_sweep import group_series
+    wb = openpyxl.load_workbook(out_path, data_only=True) if out_path else None
     print()
-    print(f"=== 追溯「{label}」===")
+    print(f"=== 追溯「{label}」——  原表 → 折算 → 簿子上那一格，三头对一遍 ===")
     hit = False
     for mod, data in tables:                      # PLL 页：该温度全部经过点的中位数
         for chip, sw in data.items():
@@ -2213,7 +2246,7 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg):
                 med_after = median([p[3] for p in pts])
                 med_before = (med_after / mul) - sum(d for _n, d in add)
                 _say(chip, t, "", [(a, b, c) for a, b, c, _d in pts], med_before,
-                     add, mul, it.unit, f"{len(pts)} 个点的中位数")
+                     add, mul, it.unit, f"{len(pts)} 个点的中位数", wb, label)
     for mod, chips_ in vsweeps.items():           # VCO 页：工作点那一个点
         for chip, sw in chips_.items():
             it = next((x for x in sw.items if x.label == label), None)
@@ -2239,7 +2272,8 @@ def trace_item(label, tables, vsweeps, sinfo, dsb, op_cfg):
                     after = r.vals[it.col]
                     before = (after / mul) - sum(d for _n, d in add)
                     _say(chip, g.temp, "", [(r.xl, r.col_of(it), r.raw[r.col_of(it)])],
-                         before, add, mul, it.unit, f"Vtune={fmt_num(x, 4)} 那一点")
+                         before, add, mul, it.unit,
+                         f"Vtune={fmt_num(x, 4)} 那一点", wb, label)
     if not hit:
         print(f"  没有哪份簿子有叫「{label}」的行。表上的行名照抄即可"
               f"（IPN_DSB / SpotPN@1kHz / Spur@26MHz / Freq_MHz …）")
@@ -2864,7 +2898,7 @@ def main():
               f"横着容易数不清第几片。加 --slim 每片只显示常温列"
               f"（其余折起来，点 ＋ 就能展开核对）。")
     if args.trace:
-        trace_item(args.trace, tables, vsweeps, sinfo, dsb, op_vtune_cfg)
+        trace_item(args.trace, tables, vsweeps, sinfo, dsb, op_vtune_cfg, out)
     fails, n_agg, n_f = selfcheck(out)
     print(f"  自查: {n_agg} 个汇总格子都能在同一行的格子里找到；"
           f"{n_f} 个判定公式没有留下缓存值"
