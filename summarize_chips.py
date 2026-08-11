@@ -39,6 +39,7 @@ summarize_chips.py — 一个目录里的多颗芯片 → 一份给评审看的�
 """
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -121,6 +122,46 @@ class Book:
     def sort_key(self):
         # 时间戳优先（字符串可比：年-月-日-时-分-秒 定宽），没有时间戳的看 mtime
         return (self.ts, os.path.getmtime(self.path))
+
+
+def xlsx_shape(path):
+    """读失败时补一句线索：文件多大、表**自己声明的范围**有多大、解压后多大。
+
+    ★★ `MemoryError` 的 str() 是**空字符串**，报出来就是「读失败 —— MemoryError:」，
+      后面什么都没有，下一步只能靠猜（2026-08-05 崩过一次，这次又崩了三份）。
+      而这类失败最常见的成因恰好是**表声明的范围被撑大**：整列套了格式或数据校验，
+      `<dimension>` 就写成 `A1:HG1048576`，openpyxl 非 read_only 会照着这个范围
+      一格一格建对象，几十万空行也建。文件才几 MB、声明却上百万行——
+      这两个数并排一放，是"表虚胖"还是"真的太大"当场就分清了。
+    ★ 只读 zip 里的 XML 头，不进 openpyxl：正在为内存报错的时候，
+      诊断本身不能再要一份内存。
+    """
+    import zipfile
+
+    def mb(n):
+        # 不足 1 MB 的写 KB：小文件全印成「0.0 MB」的话，这句诊断自己看着就像坏了
+        return "%.1f MB" % (n / 1048576.0) if n >= 1048576 else "%.0f KB" % (n / 1024.0)
+
+    out = []
+    try:
+        out.append("文件 %s" % mb(os.path.getsize(path)))
+    except OSError:
+        return ""
+    try:
+        with zipfile.ZipFile(path) as z:
+            out.append("解压后 %s" % mb(sum(i.file_size for i in z.infolist())))
+            # 第一张工作表的 <dimension>：它就在 XML 开头，读 64KB 足够
+            sheets = sorted(n for n in z.namelist()
+                            if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+            if sheets:
+                with z.open(sheets[0]) as f:
+                    head = f.read(65536).decode("utf-8", "replace")
+                m = re.search(r'<dimension ref="([^"]+)"', head)
+                out.append("表自己声明的范围 %s" % m.group(1) if m
+                           else "表里没写 <dimension>")
+    except Exception:                             # noqa: B902
+        pass                                      # 诊断失败不许盖掉原来那个异常
+    return "（" + "，".join(out) + "）"
 
 
 def _norm_mod(x):
@@ -401,20 +442,24 @@ def scale_book(sw, n):
 
 
 def note_scale(sinfo, kind, mod, chip, info):
-    """记下折算结果，并当场把折算前后的频点打出来。
+    """记下折算结果，并**返回**那句"折算前后的频点"（调用方在芯片那一行之后打）。
 
     ★ 折算是最容易"看着对、其实错一个倍数"的改动：差 2 倍，表和图都还长得
       像那么回事。所以每份簿子都报一句实测中位频点 → 折算后频点，
       对不对一眼就知道。
+    ★★ 为什么返回而不是当场 print：折算必须在算行之前做，而"是哪颗芯片"那一行
+      要等行算完才打得出来——当场打的话这句就落在**上一颗**芯片名下。真输出里
+      第一颗片子没有温扫文件，它名下却挂着一句「折算 ×4」（那是下一颗的），
+      最后一颗反而看着没折算。护栏挂错名字，等于没有护栏。
     """
     if not info:
-        return
+        return []
     sinfo.setdefault(kind, {})[mod] = info
     n = fmt_num(info["n"], 4)
     b, a = info["before"], info["after"]
-    print(f"     · 折算 ×{n}：频率类 {info['n_lin']} 项 ×{n}"
-          + (f"（实测中位 {fmt_num(b)} → {fmt_num(a)} MHz）" if b is not None else "")
-          + f"，相噪/杂散 {info['n_db']} 项 {info['db']:+.2f} dB")
+    return [f"     · 折算 ×{n}：频率类 {info['n_lin']} 项 ×{n}"
+            + (f"（实测中位 {fmt_num(b)} → {fmt_num(a)} MHz）" if b is not None else "")
+            + f"，相噪/杂散 {info['n_db']} 项 {info['db']:+.2f} dB"]
 
 
 # 单边带 → 双边带：10·log10(2)
@@ -493,8 +538,10 @@ def ipn_order_check(sw, chip, tol=0.5):
 
 
 def note_dsb(n, chip):
-    if n:
-        print(f"     · 积分相噪 SSB→DSB：{n} 项 {DSB_DB:+.2f} dB，行名改成 IPN_DSB")
+    """同 note_scale：返回给调用方，别在芯片那一行之前打。"""
+    if not n:
+        return []
+    return [f"     · 积分相噪 SSB→DSB：{n} 项 {DSB_DB:+.2f} dB，行名改成 IPN_DSB"]
 
 
 def scale_title(info, dsb=False):
@@ -2080,6 +2127,14 @@ def run_quality(cur, chip):
       9.58 mA（基线的 17%），比 27 个模块每一个的 ΔI 都大——那不是
       "27 个模块都不可信"，那是"这一趟没恢复回去"。挂在每一行上只会让人
       问"这个 ⚠ 是什么"，而且正表里根本不该出现告警。
+    ★★ 上面这条分档**必须落到措辞上**（2026-08-11 补）：原来不管差多少都写
+      "差值的误差下限就是这个数"，于是真数据上出现过「复测比基线差 58%、
+      45/45 个台阶都比它小」还叫"误差下限"——那不是重复性，是这一趟压根没恢复。
+      两件事的结论完全相反：
+        · 差得比最大的那个台阶还小 → 它就是这一趟的重复性下限，比它小的片间差不作数。
+        · 差得比**每一个**台阶都大 → 这个数说不了重复性，只说明"没恢复回去"。
+          阶梯本身的 ΔI 还在（关断发生在恢复之前），但这一趟**没有任何观测**
+          能说出它们的误差有多大——别把它读成"这一列全是错的"，也别读成"没问题"。
     返回控制台/审计页用的字符串列表；一条都没有就是这趟干净。
     """
     out = []
@@ -2093,19 +2148,27 @@ def run_quality(cur, chip):
         d = rc[3] - base
         if not base:
             continue
-        small = [k for k, _m, _i, dd in run["steps"] if abs(dd) < abs(d)]
+        steps = run["steps"]
+        small = [k for k, _m, _i, dd in steps if abs(dd) < abs(d)]
         pct = abs(d) / abs(base) * 100.0
         if abs(d) < abs(base) * 0.01 and not small:
             continue                       # 回到基线的 1% 以内，且没有更小的台阶
+        # 比每一个台阶都大 ＝ 这个数不可能是"重复性"，只能是没恢复回去
+        broke = bool(steps) and len(small) == len(steps)
         msg = (f"{chip} {fmt_num(t)}℃: 恢复后复测 {fmt_num(rc[3], 4)} mA，"
                f"全开基线 {fmt_num(base, 4)} mA，差 {d:+.4f}（{pct:.1f}%）"
-               f"——差值的误差下限就是这个数")
+               + ("——这一趟**没恢复回去**" if broke else "——差值的误差下限就是这个数"))
         if run.get("tail_n", 0) > 1:
             msg += f"（阶梯后面共 {run['tail_n']} 个点，取的是最后一个）"
         if small:
-            msg += (f"；{len(small)}/{len(run['steps'])} 个台阶比它还小"
+            msg += (f"；{len(small)}/{len(steps)} 个台阶比它还小"
                     + (f"（{', '.join(small[:6])}"
                        + (" …" if len(small) > 6 else "") + "）" if small else ""))
+        if broke:
+            msg += ("。它比**每一个**台阶都大，所以这个数说不了重复性；"
+                    "阶梯的 ΔI 还在（关断发生在恢复之前），但这一趟没有任何观测"
+                    "能说出它们的误差有多大——这个温度的那一列，"
+                    "发出去之前得先弄清恢复那一步为什么没生效")
         out.append(msg)
     return out
 
@@ -2313,23 +2376,25 @@ def check_scale(imp, n, chip, kind_label, tol=0.10):
       范围，中位数当分母只能算个毛估——比值落在 1.6 这种地方，说明这份簿子
       压根没有"整数倍频"这层关系，那就没有判据，闭嘴比瞎喊强。
       警告一旦有假阳性，下次真的那条也会被当噪声划过去。
+    ★ 跟 note_scale 一样**返回**行，不当场打——原因同上（会挂到上一颗芯片名下）。
     """
     if not imp:
-        return
+        return []
     r = imp["ratio"]
     n0 = round(r)
     if n0 < 1 or abs(r - n0) > tol * n0:
-        return
+        return []
     if n and n != 1.0:
         if abs(n0 - n) > 1e-9:
-            print(f"     ⚠⚠ {chip}: 折算配的是 ×{fmt_num(n, 4)}，但这份簿子自己说的是 "
-                  f"{fmt_num(imp['target'])} ÷ 实测 {fmt_num(imp['meas'])} ≈ "
-                  f"×{n0} —— 两个只有一个是对的，别就这么发出去")
+            return [f"     ⚠⚠ {chip}: 折算配的是 ×{fmt_num(n, 4)}，但这份簿子自己说的是 "
+                    f"{fmt_num(imp['target'])} ÷ 实测 {fmt_num(imp['meas'])} ≈ "
+                    f"×{n0} —— 两个只有一个是对的，别就这么发出去"]
     elif n0 > 1:
-        print(f"     ⚠⚠ {chip}: **没配折算**，但这份 {kind_label} 簿子自己写着目标频点 "
-              f"{fmt_num(imp['target'])} MHz、实测才 {fmt_num(imp['meas'])} MHz "
-              f"（≈ ×{n0}）。相噪/杂散没折算到真实载波上就跟 spec 对不上——"
-              f"要么在 {CONFIG_NAME} 里配 scale，要么确认这份就该按实测报")
+        return [f"     ⚠⚠ {chip}: **没配折算**，但这份 {kind_label} 簿子自己写着目标频点 "
+                f"{fmt_num(imp['target'])} MHz、实测才 {fmt_num(imp['meas'])} MHz "
+                f"（≈ ×{n0}）。相噪/杂散没折算到真实载波上就跟 spec 对不上——"
+                f"要么在 {CONFIG_NAME} 里配 scale，要么确认这份就该按实测报"]
+    return []
 
 
 # ---------------------------------------------------------------- 追溯
@@ -2816,25 +2881,31 @@ def main():
                                 temp_col=args.temp_col, keep_original=False,
                                 spur_tol=spur_tol)
             except Exception as e:                    # noqa: B902
-                failed.append((b, f"{type(e).__name__}: {e}"))
-                print(f"  {chip}: 读失败 —— {type(e).__name__}: {e}")
+                why = f"{type(e).__name__}: {e}{xlsx_shape(b.path)}"
+                failed.append((b, why))
+                print(f"  {chip}: 读失败 —— {why}")
                 continue
             data[chip] = sw
+            # ★ 这几句都**攒着**，等芯片那一行打完再打：它们必须在算行之前做，
+            #   当场打就落在上一颗芯片名下（见 note_scale 的注释）。
+            pend = []
             for _q in ipn_order_check(sw, chip):
-                print(f"     ⚠ {_q}")
+                pend.append(f"     ⚠ {_q}")
                 quality_all.append((chip, mod, KIND_LABEL[KIND_PLL],
                                     [("IPN vs IPN_Omit", _q)]))
             imp = implied_scale(sw, KIND_PLL)          # 必须在折算之前算
             n_scale = scale_of(scale_rules, mod, KIND_PLL)
-            note_scale(sinfo, KIND_PLL, mod, chip, scale_book(sw, n_scale))
-            check_scale(imp, n_scale, chip, KIND_LABEL[KIND_PLL])
+            pend += note_scale(sinfo, KIND_PLL, mod, chip, scale_book(sw, n_scale))
+            pend += check_scale(imp, n_scale, chip, KIND_LABEL[KIND_PLL])
             if dsb:
-                note_dsb(to_dsb(sw), chip)
+                pend += note_dsb(to_dsb(sw), chip)
             n_meas = sum(1 for lg in sw.legs for x in lg.rows if x.kind != "lock")
             notes[id(b)] = f"{sw.n_rows}行×{sw.n_cols}列"
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
                   f"{n_meas} 测点 / 指标 {len(sw.items)} 个 / 排除 {len(sw.excluded)} 行"
                   f"   [{b.name}]")
+            for ln in pend:
+                print(ln)
             for sn in getattr(sw, "spur_notes", ()):
                 print(f"     · {sn}")
             print_excluded(sw.excluded)
@@ -2867,17 +2938,26 @@ def main():
         print()
         print("=== %s VCO 开环 ===" % mod)
         op = None
+        sw = None
         for chip in chips:
             b = books.get(chip)
             if b is None:
                 print(f"  {chip}: 没有这个模块的开环文件")
                 continue
+            # ★ 先放手上一份簿子，再读下一份：不放手的话 `sw` 一直指着上一份，
+            #   load_vco 建新的那一刻内存里是**两份**，峰值白涨一倍。
+            #   而且 openpyxl 的 ws.parent 是反向引用（簿子是个引用环），
+            #   光丢引用不会立刻回收，得让 gc 跑一趟。--trace 那条路留在
+            #   vsweeps 里的引用不受影响，该留的照样留着。
+            sw = None
+            gc.collect()
             try:
                 sw = load_vco(b.path, temp_col=args.temp_col, keep_original=False,
                               spur_tol=spur_tol)
             except Exception as e:                    # noqa: B902
-                failed.append((b, f"{type(e).__name__}: {e}"))
-                print(f"  {chip}: 读失败 —— {type(e).__name__}: {e}")
+                why = f"{type(e).__name__}: {e}{xlsx_shape(b.path)}"
+                failed.append((b, why))
+                print(f"  {chip}: 读失败 —— {why}")
                 continue
             # ★ 折算必须在 vco_rows 之前：Fmin/Fmax/Kvco/温漂全是拿 F 现算的，
             #   先折算，它们自己就跟着 ×N 了。
@@ -2885,10 +2965,11 @@ def main():
             #   再为它喊重复性就是噪声。这条哨兵只留给 PLL 页。
             imp = implied_scale(sw, KIND_VCO)          # 必须在折算之前算
             n_scale = scale_of(scale_rules, mod, KIND_VCO)
-            note_scale(sinfo, KIND_VCO, mod, chip, scale_book(sw, n_scale))
-            check_scale(imp, n_scale, chip, KIND_LABEL[KIND_VCO])
+            # ★ 攒着，等芯片那一行打完再打（见 note_scale 的注释）
+            pend = note_scale(sinfo, KIND_VCO, mod, chip, scale_book(sw, n_scale))
+            pend += check_scale(imp, n_scale, chip, KIND_LABEL[KIND_VCO])
             if dsb:
-                note_dsb(to_dsb(sw), chip)          # 要在 vco_rows 之前
+                pend += note_dsb(to_dsb(sw), chip)  # 要在 vco_rows 之前
             # 工作点用第一颗芯片的（CT 扫钉住的那个 Vtune）统一喂给全部芯片：
             # 否则各片的组名会变成「@ Vtune 0.4V」「@ Vtune 0.45V」，行对不齐
             if op is None:
@@ -2908,6 +2989,8 @@ def main():
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
                   f"结论行 {sum(1 for x in rows if x['kind'] == 'result')} 条 / "
                   f"指标 {len(sw.items)} 个   [{b.name}]")
+            for ln in pend:
+                print(ln)
             if coarse:
                 print(f"     · CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
                       f"（只测几个码）")
@@ -2974,8 +3057,9 @@ def main():
                     cur = load_current(b.path, temp_col=args.temp_col,
                                        key_col=args.key_col, val_col=args.cur_col)
                 except Exception as e:                # noqa: B902
-                    failed.append((b, f"{type(e).__name__}: {e}"))
-                    print(f"  {chip}: 读失败 —— {type(e).__name__}: {e}")
+                    why = f"{type(e).__name__}: {e}{xlsx_shape(b.path)}"
+                    failed.append((b, why))
+                    print(f"  {chip}: 读失败 —— {why}")
                     continue
                 notes[id(b)] = f"{cur.n_rows}行×{cur.n_cols}列"
                 # ★ 一个测量点都没有就别建页：模板复制品（表头齐、值全空）也能
