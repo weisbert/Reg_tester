@@ -1900,7 +1900,7 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
     # ★ 取值走 sweep_lib.read_values（read_only、共用一份实现，快 2～13×，
     #   也不会被"表自己声明的范围"撑爆）。keep_original 那份仍是完整读——
     #   它要拿去写「保留原表」那一页，需要样式和公式原文。
-    src_title, all_rows = read_values(path, sheet)
+    src_title, all_rows, shape_note = read_values(path, sheet)
     n_rows = len(all_rows)
     n_cols = max((len(r) for r in all_rows), default=0)
     wb = openpyxl.load_workbook(path, data_only=False) if keep_original else None

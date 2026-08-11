@@ -2670,6 +2670,12 @@ def _chart_name(ch):
 
 # ---------------------------------------------------------------- main
 
+def shape_note_of(sw):
+    """审计页那一格：多少行多少列，外加"表虚胖"那句（如果虚胖）。"""
+    n = getattr(sw, "shape_note", "")
+    return f"{sw.n_rows}行×{sw.n_cols}列" + (f"；{n}" if n else "")
+
+
 def cost_line(T):
     """一行耗时分解。
 
@@ -2920,7 +2926,7 @@ def main():
             if dsb:
                 pend += note_dsb(to_dsb(sw), chip)
             n_meas = sum(1 for lg in sw.legs for x in lg.rows if x.kind != "lock")
-            notes[id(b)] = f"{sw.n_rows}行×{sw.n_cols}列"
+            notes[id(b)] = shape_note_of(sw)
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
                   f"{n_meas} 测点 / 指标 {len(sw.items)} 个 / 排除 {len(sw.excluded)} 行"
                   f"   [{b.name}]")
@@ -3005,7 +3011,7 @@ def main():
             #   什么线索都没有。2026-08-05 就是这么崩的。
             if args.trace:
                 vsweeps.setdefault(mod, {})[chip] = sw
-            notes[id(b)] = f"{sw.n_rows}行×{sw.n_cols}列"
+            notes[id(b)] = shape_note_of(sw)
             coarse = coarse_temps(sw)
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
                   f"结论行 {sum(1 for x in rows if x['kind'] == 'result')} 条 / "

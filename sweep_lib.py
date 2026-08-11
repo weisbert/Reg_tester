@@ -485,8 +485,53 @@ class Sweep:
                        if r.temp is not None})
 
 
+# `<v ...>` / `<is ...>` 也认：漏认一种写法＝静默少读一段数据。
+# sheetData 里以 v / is 开头的元素只有这两个，不会误命中。
+_MARK_RE = re.compile(rb'<row r="(\d+)"|<v[ >]|<is[ >]')
+
+
+def last_value_row(path, part, chunk=1 << 20):
+    """扫出「最后一个带值的行号」。只在字节流上找，**不 parse**。拿不准就返回 None。
+
+    ★★ 为什么值得单独扫一遍：这条线的簿子真数据几百行，表里却写着一万行——
+      多出来的全是**只有格式、没有值**的空格子（`<c r="HG9999" s="0"/>`，一个 17 字节，
+      215 列 × 一万行 ≈ 40 MB）。openpyxl 就算 read_only 也得把这两百万个格子
+      一个个 parse 出来：真数据 139 行的一份要 3.1s，先扫出真数据到哪儿、
+      再只 parse 到那儿，0.08s——**37×**。真数据一跑 15 份簿子，读占 98% 的时间。
+    ★ 判据是**精确的**，不是猜一个"连续多少空行就停"的阈值：一行里没有 `<v>`／`<is>`
+      就是一个值都没有，读进来也是整行 None，会被"掐掉尾部空行"那一步掐掉——
+      结果一个字节都不差。（只有公式没有缓存值的行同理：data_only=True 下它本来
+      就读成 None。）
+    ★ 任何一步不成立（拿不到 part、行号没写 r、正则对不上）就返回 None，
+      调用方退回全量读。**宁可慢，不可少读。**
+    ★ 分块扫、不把整个 sheet1.xml 读进内存（40 MB 一份，这条线正为内存发愁）。
+      块与块之间留 40 字节接缝，免得标签正好被切断；重复扫到的标记不影响结果
+      （状态机对同一个标记重复处理是幂等的）。
+    """
+    import zipfile
+    cur = best = None
+    try:
+        with zipfile.ZipFile(path) as z:
+            with z.open(part) as f:
+                tail = b""
+                while True:
+                    buf = f.read(chunk)
+                    if not buf:
+                        break
+                    buf = tail + buf
+                    for m in _MARK_RE.finditer(buf):
+                        if m.group(1):
+                            cur = int(m.group(1))
+                        elif cur is not None:
+                            best = cur
+                    tail = buf[-40:]
+    except Exception:                     # noqa: B902
+        return None                       # 扫不动就当没扫过
+    return best
+
+
 def read_values(path, sheet=None):
-    """读一张表的**值**（不要样式、不要公式原文）→ (表名, 行列表，行内已补齐等长)。
+    """读一张表的**值**（不要样式、不要公式原文）→ (表名, 行列表, 一句形状备注)。
 
     取值这件事两个 loader（load_sweep / load_vco）必须是同一份实现——
     "两份实现必然漂移，漂出来的是两份报表同一个指标报不同的数"。
@@ -509,9 +554,12 @@ def read_values(path, sheet=None):
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
         ws = wb[sheet] if sheet else wb[wb.sheetnames[0]]
+        declared = ws.max_row             # 表**自己声明**的行数，可能是虚胖的
+        part = (getattr(ws, "_worksheet_path", "") or "").lstrip("/")
         ws.reset_dimensions()             # 别信表自己声明的范围
         title = ws.title
-        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        stop = last_value_row(path, part) if part else None
+        rows = [list(r) for r in ws.iter_rows(max_row=stop, values_only=True)]
     finally:
         wb.close()                        # read_only 抓着 zip 不放，读完就还
     while rows and all(v is None for v in rows[-1]):
@@ -520,7 +568,11 @@ def read_values(path, sheet=None):
     for r in rows:
         if len(r) < w:
             r.extend([None] * (w - len(r)))
-    return title, rows
+    note = ""
+    if declared and len(rows) and declared >= 2 * len(rows):
+        note = (f"表声明 {declared} 行，实际有值到第 {len(rows)} 行"
+                f"（多出来的是只有格式、没有值的空格子，没读）")
+    return title, rows, note
 
 
 def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
@@ -537,7 +589,7 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     # 读两份：一份取缓存值用来算，一份原封不动用来存。
     # 只用 data_only=True 那份去存的话，原表里若有公式会被替换成计算结果——
     # 「第 1 页保留原始 excel」就不成立了。
-    src_title, all_rows = read_values(path, sheet)
+    src_title, all_rows, shape_note = read_values(path, sheet)
     n_rows = len(all_rows)
     n_cols = max((len(r) for r in all_rows), default=0)
     wb, ws = None, None
@@ -674,7 +726,7 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                  ti_name=ti_name, ti_col=ti_col, keep_ti=keep_ti, keep_mode=keep_mode,
                  rows=rows, items=items, dropped=dropped, legs=legs, orphan=orphan,
                  excluded=excluded, warnings=warnings, spur_notes=spur_notes,
-                 room_t=room_temp(legs),
+                 room_t=room_temp(legs), shape_note=shape_note,
                  n_rows=n_rows, n_cols=n_cols)
 
 
