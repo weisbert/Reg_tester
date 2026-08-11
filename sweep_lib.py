@@ -485,6 +485,44 @@ class Sweep:
                        if r.temp is not None})
 
 
+def read_values(path, sheet=None):
+    """读一张表的**值**（不要样式、不要公式原文）→ (表名, 行列表，行内已补齐等长)。
+
+    取值这件事两个 loader（load_sweep / load_vco）必须是同一份实现——
+    "两份实现必然漂移，漂出来的是两份报表同一个指标报不同的数"。
+
+    ★★ 用 read_only：非 read_only 会把工作簿里**每一张表**都完整解析成 Cell 对象，
+      而我们只用第一张。合成基准（400 行 × 230 列）：一张表 2.1×，六张表 12.7×。
+      顺带把内存也压下来了——同一个成因还制造过 MemoryError（见 xlsx_shape）。
+    ★★ `reset_dimensions()` 是**方法**，不是属性。写成 `ws.reset_dimensions = True`
+      只会挂一个没人看的属性：不但没生效，还会让 iter_rows **按表自己声明的宽度
+      截列**——整列套过格式的簿子声明 `A1:HG1048576`，实测就把 230 列截成 215 列。
+      静默丢列比慢严重得多，这一句写错是不会报错的。
+    ★★ read_only 的 iter_rows 是"有多少写多少"，跟非 read_only 有两处不同，
+      都得抹平，否则行号会错位（行号是要逐条打给人看的）：
+        · 行可能长短不齐 → 一律补齐到最宽那行（非 read_only 是补齐的）。
+        · 尾部全空行也照给 → 掐掉；非 read_only 的 max_row 只数到最后一个有值的格。
+      中间的全空行**必须留着**（它们占着行号）——已在合成用例上逐格对过。
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        ws = wb[sheet] if sheet else wb[wb.sheetnames[0]]
+        ws.reset_dimensions()             # 别信表自己声明的范围
+        title = ws.title
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    finally:
+        wb.close()                        # read_only 抓着 zip 不放，读完就还
+    while rows and all(v is None for v in rows[-1]):
+        rows.pop()
+    w = max((len(r) for r in rows), default=0)
+    for r in rows:
+        if len(r) < w:
+            r.extend([None] * (w - len(r)))
+    return title, rows
+
+
 def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                lock_pattern=r"_lock$", temp_col=None,
                keep_test_item=None, keep_mode=None, keep_original=True,
@@ -499,14 +537,14 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     # 读两份：一份取缓存值用来算，一份原封不动用来存。
     # 只用 data_only=True 那份去存的话，原表里若有公式会被替换成计算结果——
     # 「第 1 页保留原始 excel」就不成立了。
-    wb_val = openpyxl.load_workbook(path, data_only=True, read_only=False)
-    ws_val = wb_val[sheet] if sheet else wb_val[wb_val.sheetnames[0]]
+    src_title, all_rows = read_values(path, sheet)
+    n_rows = len(all_rows)
+    n_cols = max((len(r) for r in all_rows), default=0)
     wb, ws = None, None
     if keep_original:
         wb = openpyxl.load_workbook(path, data_only=False)
-        ws = wb[ws_val.title]
+        ws = wb[src_title]
 
-    all_rows = [list(r) for r in ws_val.iter_rows(values_only=True)]
     if len(all_rows) < header_row + 1:
         raise SweepError("表里没有数据行")
     header = all_rows[header_row - 1]
@@ -629,15 +667,15 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
         warnings.append(f"没有匹配 {lock_pattern!r} 的行，整表按一段处理")
     excluded.sort(key=lambda x: x[0])
 
-    return Sweep(path=path, wb=wb, ws=ws, wb_val=wb_val, ws_val=ws_val,
-                 src_title=ws_val.title, header=header, data=data, cols=cols,
+    return Sweep(path=path, wb=wb, ws=ws, wb_val=None, ws_val=None,
+                 src_title=src_title, header=header, data=data, cols=cols,
                  temp_name=tname, temp_col=tcol, leg_col=leg_col, leg_i=leg_i,
                  lock_pattern=lock_pattern, lock_re=lock_re,
                  ti_name=ti_name, ti_col=ti_col, keep_ti=keep_ti, keep_mode=keep_mode,
                  rows=rows, items=items, dropped=dropped, legs=legs, orphan=orphan,
                  excluded=excluded, warnings=warnings, spur_notes=spur_notes,
                  room_t=room_temp(legs),
-                 n_rows=ws_val.max_row, n_cols=ws_val.max_column)
+                 n_rows=n_rows, n_cols=n_cols)
 
 
 def _majority(data, ci, skip_re=None):

@@ -72,7 +72,7 @@ import re
 import sys
 from collections import OrderedDict
 
-from sweep_lib import attach_spur_list
+from sweep_lib import attach_spur_list, read_values
 from xlsx_formula_cache import Formula, FormulaCache
 
 try:
@@ -1897,11 +1897,14 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
     # 读两份：一份取缓存值用来算，一份原封不动用来存。
     # 只用 data_only=True 那份去存的话，原表里若有公式会被替换成计算结果——
     # 「第 1 页保留原始 excel」就不成立了。
-    wb_val = openpyxl.load_workbook(path, data_only=True)
-    ws_val = wb_val[sheet] if sheet else wb_val[wb_val.sheetnames[0]]
+    # ★ 取值走 sweep_lib.read_values（read_only、共用一份实现，快 2～13×，
+    #   也不会被"表自己声明的范围"撑爆）。keep_original 那份仍是完整读——
+    #   它要拿去写「保留原表」那一页，需要样式和公式原文。
+    src_title, all_rows = read_values(path, sheet)
+    n_rows = len(all_rows)
+    n_cols = max((len(r) for r in all_rows), default=0)
     wb = openpyxl.load_workbook(path, data_only=False) if keep_original else None
-    ws = wb[ws_val.title] if wb is not None else ws_val
-    all_rows = [list(r) for r in ws_val.iter_rows(values_only=True)]
+    ws = wb[src_title] if wb is not None else None
     if len(all_rows) < header_row + 1:
         raise VcoError("表里没有数据行")
     header = all_rows[header_row - 1]

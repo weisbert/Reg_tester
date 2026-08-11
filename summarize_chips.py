@@ -44,6 +44,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import OrderedDict
 
 from spec_book import SpecBook
@@ -2669,6 +2670,23 @@ def _chart_name(ch):
 
 # ---------------------------------------------------------------- main
 
+def cost_line(T):
+    """一行耗时分解。
+
+    ★ 为什么要它：这条线一跑十几份簿子，"慢"可能慢在读、慢在排版、慢在存盘，
+      三处的修法完全不同。没有这一行，下一步只能靠猜——而猜错一次的代价
+      是把一整套读取层改一遍却什么都没快。
+    """
+    if "t0" not in T:
+        return ""
+    t0, parts, last = T["t0"], [], T["t0"]
+    for k in ("读 PLL", "读 VCO", "读电流", "排版+存盘", "自查"):
+        if k in T:
+            parts.append(f"{k} {T[k] - last:.1f}s")
+            last = T[k]
+    return "  耗时: " + " / ".join(parts) + f"（共 {last - t0:.1f}s）"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="多芯片测试目录 → 一份给评审看的汇总 Excel")
@@ -2864,6 +2882,8 @@ def main():
     else:
         print()
         print("折算规则: 没有（相噪/杂散/频率按实测频点报）")
+    # 耗时分解：慢在读、慢在排版、还是慢在存盘——不量就只能猜
+    T = {"t0": time.perf_counter()}
     for mod in modules:
         books = grid.get(KIND_PLL, {}).get(mod, {})
         if not books:
@@ -2928,6 +2948,7 @@ def main():
                      else f"   （{who[0]}）"))
         warn_seen.clear()
 
+    T["读 PLL"] = time.perf_counter()
     # ---- 读 VCO 开环 ----
     vtables, vtemps, vsweeps = [], [], {}
     for mod in modules:
@@ -2984,7 +3005,7 @@ def main():
             #   什么线索都没有。2026-08-05 就是这么崩的。
             if args.trace:
                 vsweeps.setdefault(mod, {})[chip] = sw
-            notes[id(b)] = f"{sw.ws_val.max_row}行×{sw.ws_val.max_column}列"
+            notes[id(b)] = f"{sw.n_rows}行×{sw.n_cols}列"
             coarse = coarse_temps(sw)
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
                   f"结论行 {sum(1 for x in rows if x['kind'] == 'result')} 条 / "
@@ -3017,12 +3038,14 @@ def main():
             vtables.append((mod, vrows))
             vcharts.append((mod, vdata))
     vtemps.sort()
+    T["读 VCO"] = time.perf_counter()
 
     if not tables and not vtables:
         sys.exit("没有一份 PLL 温扫 / VCO 开环文件读成功")
 
     if args.dry_run:
         print("\n--dry-run：没有写文件。")
+        print(cost_line(T))
         return
 
     # ---- 读电流（逐级关断）----
@@ -3168,6 +3191,8 @@ def main():
                               + "，".join(outside[:12])
                               + (" …" if len(outside) > 12 else ""))
 
+    T["读电流"] = time.perf_counter()
+
     # ★★ 每一页只列**这一页真有数据**的芯片，不拿全局芯片表去铺列。
     #   性能和电流常常不是同一个人测的、测的也不是同一颗 die（一个目录只有温扫、
     #   另一个只有电流）。用全局表铺列的话，只测了电流的那颗会在 PLL / VCO 四张页上
@@ -3212,6 +3237,7 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     wb.save(out)
     n_fill, n_strip = VCACHE.inject(out)
+    T["排版+存盘"] = time.perf_counter()
     print(f"\n已写出: {os.path.abspath(out)}")
     print("  可见页: " + " / ".join(s.title for s in wb.worksheets
                                     if s.sheet_state == "visible"))
@@ -3245,6 +3271,8 @@ def main():
     print(f"  自查: {n_agg} 个汇总格子都能在同一行的格子里找到；"
           f"{n_f} 个判定公式没有留下缓存值"
           + (f"（清掉了 {n_strip} 个空缓存）" if n_strip else "") + "。")
+    T["自查"] = time.perf_counter()
+    print(cost_line(T))
     if fails:
         print()
         print("  ✗ 自查没过，这份簿子先别发出去：")
