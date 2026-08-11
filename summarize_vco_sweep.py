@@ -2095,7 +2095,11 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
             if v:
                 if fvco_opt is None:
                     fvco = v
-                    fvco_ref = cref(ws.title, fc, r.xl)
+                    # ★ 用 src_title，不是 ws.title：cref 要的只是**表名**，而 ws
+                    #   在 keep_original=False 时是 None（跨芯片汇总不读原表那份）。
+                    #   写 ws.title 的话，只有"表里有 fVCO 列且有值"时才炸——
+                    #   合成用例里没这一列，A/B 全绿，真数据上六份全挂。
+                    fvco_ref = cref(src_title, fc, r.xl)
                 break
 
     excluded.sort(key=lambda x: x[0])
