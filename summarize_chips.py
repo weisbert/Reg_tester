@@ -54,7 +54,8 @@ from sweep_lib import (
     LEG_STYLE, Columns, SweepError, apply_y, as_text, axis_bounds, blank_policy,
     DEFAULT_ROW_PT, chart_rows, col_px, cols_cm, fit_strip, fmt_num, is_blank,
     leg_series, legend_bottom,
-    load_sweep, median, nice_step, num, put, stats_all, styles, style_series, txt,
+    load_sweep, median, nice_step, num, put, read_values, stats_all, styles,
+    style_series, txt,
 )
 from xlsx_formula_cache import FormulaCache
 
@@ -288,6 +289,169 @@ def print_excluded(excluded, indent="     ", cap=14):
         print(f"{indent}…还有 {len(excluded) - cap} 行（全部内容在隐藏的 _审计 页）")
 
 
+# ---------------------------------------------------------------- 控制台
+
+# 默认只打**结论和例外**；-v 打逐份逐行的全部细节（原来的输出）。
+# ★ 为什么要分档：真数据 4 颗芯片跑下来 200 行，其中 150 行是同一句话按芯片
+#   抄了三遍（折算、杂散取自哪儿、排除了哪几行、重复列名）。行数一多，
+#   真正的那两条 ⚠⚠ 就被自己的输出冲掉了——护栏喊得太密等于没喊。
+VERBOSE = False
+
+
+def vprint(*a):
+    """只有 -v 才打的细节。"""
+    if VERBOSE:
+        print(*a)
+
+
+# 带上正负号：合并成范围时 `差 +14.59~+21.46 dB` 才读得通
+# （把 + 留在文字段里会写出 `+14.59~21.46` 这种一半带号一半不带的东西）
+_NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+
+class _Group:
+    """同一句话的一组（各芯片各一份）。只差数字的那几处合成 `min~max`。"""
+    __slots__ = ("text", "nums", "chips")
+
+    def __init__(self, line, chip):
+        self.text = _NUM_RE.split(line)          # 文字段（比数字段多一段）
+        self.nums = [[x] for x in _NUM_RE.findall(line)]
+        self.chips = [chip]
+
+    def add(self, line, chip):
+        for i, x in enumerate(_NUM_RE.findall(line)):
+            if i < len(self.nums) and x not in self.nums[i]:
+                self.nums[i].append(x)
+        if chip not in self.chips:
+            self.chips.append(chip)
+
+    def render(self):
+        out = []
+        for i, seg in enumerate(self.text):
+            out.append(seg)
+            if i < len(self.nums):
+                xs = self.nums[i]
+                out.append(xs[0] if len(xs) == 1 else
+                           "%s~%s" % (min(xs, key=float), max(xs, key=float)))
+        return "".join(out)
+
+
+class Notes:
+    """把各芯片重复的那几句归并成一句：整句一样的合成一条，只差数字的写成范围。
+
+    ★ 归并的键 ＝（这句话把数字抠掉之后的样子，它在这颗芯片里是第几次出现）。
+      带上"第几次"是必须的：`Spur@26MHz …` 和 `Spur@52MHz …` 抠掉数字长得
+      一模一样，只按文字归并会把两条不同偏移的取值说明并成一句
+      「Spur@26~52MHz」——那是**错的**，不是省。
+    ★ 数字合成 `min~max` 顺带多说一件事：各片之间散了多少，一眼就看得见。
+    ★ 归并只影响控制台。逐份逐行的原始记录照旧整份写进隐藏的 _审计 页，
+      `-v` 也照旧打全（不然就成了"看不见的省略"）。
+    """
+
+    def __init__(self):
+        self.g = OrderedDict()
+
+    def add(self, chip, lines):
+        seen = {}
+        for ln in lines:
+            ln = (ln or "").strip()
+            if not ln:
+                continue
+            t = _NUM_RE.sub("#", ln)
+            k = (t, seen.get(t, 0))
+            seen[t] = seen.get(t, 0) + 1
+            if k in self.g:
+                self.g[k].add(ln, chip)
+            else:
+                self.g[k] = _Group(ln, chip)
+
+    def lines(self, n_all, indent="  "):
+        out = []
+        for g in self.g.values():
+            if n_all <= 1:
+                tag = ""
+            elif len(g.chips) >= n_all:
+                tag = "（%d 片）" % len(g.chips)
+            else:
+                tag = "（%s）" % "/".join(g.chips)
+            out.append(indent + g.render() + tag)
+        return out
+
+    def flush(self, n_all, indent="  "):
+        if VERBOSE:                      # -v 时这几句已经逐份打过了
+            self.g.clear()
+            return
+        for ln in self.lines(n_all, indent):
+            print(ln)
+        self.g.clear()
+
+
+_HASVAL_RE = re.compile(r"（这行带 (\d+)/(\d+) 个结果值）")
+
+
+def excluded_brief(per_chip, n_all, indent="  "):
+    """排除的行合成一句：一共几行、其中**带着结果值**的是哪几行。
+
+    ★ 逐行列出来是有理由的（"只报一个排除 N 行，N 跟预期对不上时没法判断
+      丢了什么"），但那份逐行清单**整份躺在隐藏的 _审计 页上**——控制台再抄
+      一遍，就是三颗芯片同样的六行打三遍。
+    ★★ 留在控制台的判据是：**带着结果值的行被排除掉**才需要人看一眼
+      （真事故：`turn off test mux` 那一行带满 16/16 个结果值，那是另一个配置
+      下完整测的一遍，混进统计等于拿两种配置比大小）。整行空的页脚行
+      丢不丢都一样，数一个数就够了。
+    """
+    if not any(x for _c, x in per_chip):
+        return []
+    cnt = [len(x) for _c, x in per_chip]
+    head = (("%d 行/片" % cnt[0]) if len(set(cnt)) == 1
+            else ("%s 行" % "/".join(str(c) for c in cnt)))
+    withv = OrderedDict()
+    for _chip, xl in per_chip:
+        for n, why in xl:
+            m = _HASVAL_RE.search(why)
+            if not m or m.group(1) == "0":
+                continue
+            k = _HASVAL_RE.sub("", why).strip()
+            if n not in withv.setdefault(k, []):
+                withv[k].append(n)
+    segs = []
+    for why, ns in list(withv.items())[:3]:
+        segs.append("行%s %s" % ("/".join(str(x) for x in ns[:4])
+                                + ("…" if len(ns) > 4 else ""), why))
+    if segs:
+        tail = ("；其中 %d 行**带着结果值**: " % sum(len(v) for v in withv.values())
+                + "；".join(segs)
+                + ("；…" if len(withv) > 3 else "") + "。其余没有结果值")
+    else:
+        tail = "，都没有结果值（页脚/配置行）"
+    return [indent + "· 排除 " + head + tail + "。逐行见隐藏的 _审计 页"]
+
+
+def template_warn_lines(warn_all, brief=True, indent="  "):
+    """模板层面的告警（重复列名这种）：整趟打一次，不按节按份各打一遍。
+
+    ★ 重复列名是原厂模板扩列时复制粘贴留下的老问题，**每一份簿子都有**。
+      四节 × 六条 ＝ 24 行同样的话，把真正该看的东西挤下屏幕。
+    ★ 压成一句的只是"哪几个名字重了"，`-v` 照旧逐条打（哪一列并到哪一列）。
+    """
+    dup, other = [], []
+    for w, who in warn_all.items():
+        m = re.match(r"重复列名 (.+?)：", w)
+        (dup if m else other).append((m.group(1) if m else "", w, who))
+    out = []
+    if brief and len(dup) >= 3:
+        n_books = sum(len(who) for _n, _w, who in dup) // len(dup)
+        out.append(indent + "⚠ 模板里有 %d 个重复列名（%s），按名字只取到第一个"
+                            "（%d 份簿子都一样；哪一列并到哪一列见 -v）"
+                   % (len(dup), "、".join(n for n, _w, _who in dup), n_books))
+    else:
+        other = dup + other
+    for _n, w, who in other:
+        out.append(indent + "⚠ %s   （%d 份: %s）"
+                   % (w, len(who), ", ".join(sorted({c for c, _m in who}))))
+    return out
+
+
 # ---------------------------------------------------------------- 指标挑选
 
 # 只有这些进汇总表。★ 压控/片上温度/电流一律不进：
@@ -452,13 +616,15 @@ def note_scale(sinfo, kind, mod, chip, info):
       要等行算完才打得出来——当场打的话这句就落在**上一颗**芯片名下。真输出里
       第一颗片子没有温扫文件，它名下却挂着一句「折算 ×4」（那是下一颗的），
       最后一颗反而看着没折算。护栏挂错名字，等于没有护栏。
+    ★ 句子里**不带芯片名**：同一句话各片都要说一遍，芯片名由打印方（Notes）
+      归并之后统一挂在句尾。写进句子里的话，一模一样的三句永远合不起来。
     """
     if not info:
         return []
     sinfo.setdefault(kind, {})[mod] = info
     n = fmt_num(info["n"], 4)
     b, a = info["before"], info["after"]
-    return [f"     · 折算 ×{n}：频率类 {info['n_lin']} 项 ×{n}"
+    return [f"· 折算 ×{n}：频率类 {info['n_lin']} 项 ×{n}"
             + (f"（实测中位 {fmt_num(b)} → {fmt_num(a)} MHz）" if b is not None else "")
             + f"，相噪/杂散 {info['n_db']} 项 {info['db']:+.2f} dB"]
 
@@ -497,7 +663,7 @@ def to_dsb(sw):
     return n
 
 
-def ipn_order_check(sw, chip, tol=0.5):
+def ipn_order_check(sw, tol=0.5):
     """IPN_Omit 只可能比 IPN **好**（剔掉杂散再积分）。反过来就是个信号。
 
     ★ 反向差多少，就是这两次积分之间的散布下限——它们本该是同一段谱算出来的
@@ -533,16 +699,16 @@ def ipn_order_check(sw, chip, tol=0.5):
                    f"最多 {max(ds):.1f} dB）")
     if not seg:
         return []
-    return [f"{chip} {omt.label} 比 {ipn.label} **还差**：" + "；".join(seg)
+    return [f"{omt.label} 比 {ipn.label} **还差**：" + "；".join(seg)
             + "。剔掉杂散只可能更好，反过来说明这两个积分不是同一次测出来的，"
               "反向差就是这一趟的重复性下限——比它小的片间差不作数"]
 
 
-def note_dsb(n, chip):
+def note_dsb(n):
     """同 note_scale：返回给调用方，别在芯片那一行之前打。"""
     if not n:
         return []
-    return [f"     · 积分相噪 SSB→DSB：{n} 项 {DSB_DB:+.2f} dB，行名改成 IPN_DSB"]
+    return [f"· 积分相噪 SSB→DSB：{n} 项 {DSB_DB:+.2f} dB，行名改成 IPN_DSB"]
 
 
 def scale_title(info, dsb=False):
@@ -2005,11 +2171,13 @@ def load_current(path, temp_col=None, key_col=None, val_col=None):
       用形状判不用文字判——顺带这个复测点还是这趟数据的可信度证据
       （它应该回到全开基线附近）。
     """
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    ws = wb[wb.sheetnames[0]]
-    rows = [list(r) for r in ws.iter_rows(values_only=True)]
-    wb.close()
+    # ★★ 取值走 read_values（跟 PLL/VCO 两条线同一份实现）：它先在字节流上扫出
+    #   "最后一个有值的行"再 parse。真数据的电流簿跟温扫簿一样虚胖——表里写着
+    #   一万行、真数据两百行，自己 iter_rows 会把上百万个只有格式没有值的空格子
+    #   一个个 parse 出来（真数据三份 10.5s，占整趟的七成；本地复刻的虚胖簿 27×）。
+    # ★ 顺带修掉一个静默的坑：自己读没调 reset_dimensions()，
+    #   整列套过格式的簿子会按它**自己声明的宽度截列**（不报错）。
+    _title, rows, _shape = read_values(path)
     if len(rows) < 2:
         raise SweepError("表里没有数据行")
     out = CurBook()
@@ -2119,7 +2287,7 @@ def _mode_note(key, mode):
     return "" if (k and k in re.sub(r"[^0-9a-z]", "", m.lower())) else m
 
 
-def run_quality(cur, chip):
+def run_quality(cur):
     """这一趟数据的可信度：恢复后复测有没有回到全开基线。
 
     ★ 逐级关断测出来的是**差值**，差值的误差下限就是"同一个状态测两次差多少"。
@@ -2136,42 +2304,74 @@ def run_quality(cur, chip):
         · 差得比**每一个**台阶都大 → 这个数说不了重复性，只说明"没恢复回去"。
           阶梯本身的 ΔI 还在（关断发生在恢复之前），但这一趟**没有任何观测**
           能说出它们的误差有多大——别把它读成"这一列全是错的"，也别读成"没问题"。
-    返回控制台/审计页用的字符串列表；一条都没有就是这趟干净。
+    ★ 返回的是**记录**不是句子：同一批判断要出两种长度（控制台默认一行、
+      -v 和审计页整句），两处各写一遍判据必然漂移——漂出来的是"控制台说没事、
+      审计页说出事了"。判据只此一份，句子由 q_line / q_brief 渲染。
+    一条记录都没有就是这趟干净。
     """
     out = []
     for t in cur.temps:
         run = cur.runs[t]
         base, rc = run["baseline"], run.get("recheck")
         if not rc:
-            out.append(f"{chip} {fmt_num(t)}℃: 这一趟**没有恢复后复测点**，"
-                       f"没法判断差值的误差下限")
+            out.append({"t": t, "no_rc": True, "broke": False})
             continue
         d = rc[3] - base
         if not base:
             continue
         steps = run["steps"]
         small = [k for k, _m, _i, dd in steps if abs(dd) < abs(d)]
-        pct = abs(d) / abs(base) * 100.0
         if abs(d) < abs(base) * 0.01 and not small:
             continue                       # 回到基线的 1% 以内，且没有更小的台阶
-        # 比每一个台阶都大 ＝ 这个数不可能是"重复性"，只能是没恢复回去
-        broke = bool(steps) and len(small) == len(steps)
-        msg = (f"{chip} {fmt_num(t)}℃: 恢复后复测 {fmt_num(rc[3], 4)} mA，"
-               f"全开基线 {fmt_num(base, 4)} mA，差 {d:+.4f}（{pct:.1f}%）"
-               + ("——这一趟**没恢复回去**" if broke else "——差值的误差下限就是这个数"))
-        if run.get("tail_n", 0) > 1:
-            msg += f"（阶梯后面共 {run['tail_n']} 个点，取的是最后一个）"
-        if small:
-            msg += (f"；{len(small)}/{len(steps)} 个台阶比它还小"
-                    + (f"（{', '.join(small[:6])}"
-                       + (" …" if len(small) > 6 else "") + "）" if small else ""))
-        if broke:
-            msg += ("。它比**每一个**台阶都大，所以这个数说不了重复性；"
-                    "阶梯的 ΔI 还在（关断发生在恢复之前），但这一趟没有任何观测"
-                    "能说出它们的误差有多大——这个温度的那一列，"
-                    "发出去之前得先弄清恢复那一步为什么没生效")
-        out.append(msg)
+        out.append({
+            "t": t, "no_rc": False, "rc": rc[3], "base": base, "d": d,
+            "pct": abs(d) / abs(base) * 100.0, "small": small,
+            "n": len(steps), "tail_n": run.get("tail_n", 0),
+            # 比每一个台阶都大 ＝ 这个数不可能是"重复性"，只能是没恢复回去
+            "broke": bool(steps) and len(small) == len(steps)})
     return out
+
+
+def q_line(r, chip):
+    """一条记录 → 完整那句话（-v 与审计页用）。"""
+    if r["no_rc"]:
+        return (f"{chip} {fmt_num(r['t'])}℃: 这一趟**没有恢复后复测点**，"
+                f"没法判断差值的误差下限")
+    small, steps, broke = r["small"], r["n"], r["broke"]
+    msg = (f"{chip} {fmt_num(r['t'])}℃: 恢复后复测 {fmt_num(r['rc'], 4)} mA，"
+           f"全开基线 {fmt_num(r['base'], 4)} mA，差 {r['d']:+.4f}"
+           f"（{r['pct']:.1f}%）"
+           + ("——这一趟**没恢复回去**" if broke else "——差值的误差下限就是这个数"))
+    if r["tail_n"] > 1:
+        msg += f"（阶梯后面共 {r['tail_n']} 个点，取的是最后一个）"
+    if small:
+        msg += (f"；{len(small)}/{steps} 个台阶比它还小"
+                f"（{', '.join(small[:6])}" + (" …" if len(small) > 6 else "") + "）")
+    if broke:
+        msg += ("。它比**每一个**台阶都大，所以这个数说不了重复性；"
+                "阶梯的 ΔI 还在（关断发生在恢复之前），但这一趟没有任何观测"
+                "能说出它们的误差有多大——这个温度的那一列，"
+                "发出去之前得先弄清恢复那一步为什么没生效")
+    return msg
+
+
+def q_lines(recs, chip):
+    return [q_line(r, chip) for r in recs]
+
+
+def q_brief(recs, chip):
+    """没出事的那几趟合成一行：差多少、有几个台阶比它还小。
+
+    ★ 出事的（没恢复回去 / 没有复测点）**不走这条路**，它们照旧整句打——
+      压缩要压的是"每次都一样的那句话"，不是"这次不一样的那句话"。
+    """
+    seg = [f"{fmt_num(r['t'])}℃ {r['d']:+.4f} mA（{len(r['small'])}/{r['n']} "
+           f"个台阶比它还小）"
+           for r in recs if not r["broke"] and not r["no_rc"]]
+    if not seg:
+        return ""
+    return (f"{chip} 恢复后复测−全开基线 ＝ 这一趟差值的误差下限"
+            f"（比它小的片间差不作数）: " + " / ".join(seg))
 
 
 def current_rows(cur, parts, total_name="", chip_note=""):
@@ -2370,7 +2570,7 @@ def implied_scale(sw, kind):
     return {"target": tgt, "meas": meas, "ratio": tgt / meas}
 
 
-def check_scale(imp, n, chip, kind_label, tol=0.10):
+def check_scale(imp, n, kind_label, tol=0.10):
     """配的倍数 vs 簿子自己声明的比值。对不上就喊，没配也喊。
 
     ★ 只在比值**贴近一个整数**时才开口。VCO 簿的实测频率本来就扫了一整个调谐
@@ -2387,11 +2587,11 @@ def check_scale(imp, n, chip, kind_label, tol=0.10):
         return []
     if n and n != 1.0:
         if abs(n0 - n) > 1e-9:
-            return [f"     ⚠⚠ {chip}: 折算配的是 ×{fmt_num(n, 4)}，但这份簿子自己说的是 "
+            return [f"⚠⚠ 折算配的是 ×{fmt_num(n, 4)}，但这份簿子自己说的是 "
                     f"{fmt_num(imp['target'])} ÷ 实测 {fmt_num(imp['meas'])} ≈ "
                     f"×{n0} —— 两个只有一个是对的，别就这么发出去"]
     elif n0 > 1:
-        return [f"     ⚠⚠ {chip}: **没配折算**，但这份 {kind_label} 簿子自己写着目标频点 "
+        return [f"⚠⚠ **没配折算**，但这份 {kind_label} 簿子自己写着目标频点 "
                 f"{fmt_num(imp['target'])} MHz、实测才 {fmt_num(imp['meas'])} MHz "
                 f"（≈ ×{n0}）。相噪/杂散没折算到真实载波上就跟 spec 对不上——"
                 f"要么在 {CONFIG_NAME} 里配 scale，要么确认这份就该按实测报"]
@@ -2769,9 +2969,14 @@ def main():
                     help="VCO 工作点调谐电压 V（默认取 CT 扫钉住的那个值）")
     ap.add_argument("--no-audit", action="store_true", help="连隐藏的 _审计 页都不要")
     ap.add_argument("--dry-run", action="store_true", help="只清点和核对识别结果")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="逐份逐行打全部细节（折算/取值依据/排除的每一行/每份簿子的"
+                         "重复列名）。默认只打结论和例外，细节整份写在隐藏的 _审计 页")
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
+    global VERBOSE
+    VERBOSE = bool(args.verbose)
     if not os.path.isdir(root):
         sys.exit(f"不是目录: {root}")
     try:
@@ -2895,11 +3100,16 @@ def main():
         if not books:
             continue
         data = {}
-        print(f"\n=== {mod} PLL 温扫 ===")
+        # ★ "谁没有这类文件"顶上的清单已经逐行报过了，这里并进小标题一句话，
+        #   别每颗芯片占一行——四节下来就是四行"没有这个模块的温扫文件"。
+        miss_mod = [c for c in chips if c not in books]
+        print(f"\n=== {mod} PLL 温扫 ==="
+              + (f"   （{', '.join(miss_mod)} 没有这个模块的温扫文件）"
+                 if miss_mod else ""))
+        info, alarm, excl = Notes(), Notes(), []
         for chip in chips:
             b = books.get(chip)
             if b is None:
-                print(f"  {chip}: 没有这个模块的温扫文件")
                 continue
             try:
                 sw = load_sweep(b.path, leg_col=args.leg_col,
@@ -2914,45 +3124,48 @@ def main():
             data[chip] = sw
             # ★ 这几句都**攒着**，等芯片那一行打完再打：它们必须在算行之前做，
             #   当场打就落在上一颗芯片名下（见 note_scale 的注释）。
-            pend = []
-            for _q in ipn_order_check(sw, chip):
-                pend.append(f"     ⚠ {_q}")
+            pend, warn = [], []
+            for _q in ipn_order_check(sw):
+                warn.append(f"⚠ {_q}")
                 quality_all.append((chip, mod, KIND_LABEL[KIND_PLL],
-                                    [("IPN vs IPN_Omit", _q)]))
+                                    [("IPN vs IPN_Omit", f"{chip} {_q}")]))
             imp = implied_scale(sw, KIND_PLL)          # 必须在折算之前算
             n_scale = scale_of(scale_rules, mod, KIND_PLL)
             pend += note_scale(sinfo, KIND_PLL, mod, chip, scale_book(sw, n_scale))
-            pend += check_scale(imp, n_scale, chip, KIND_LABEL[KIND_PLL])
+            warn += check_scale(imp, n_scale, KIND_LABEL[KIND_PLL])
             if dsb:
-                pend += note_dsb(to_dsb(sw), chip)
+                pend += note_dsb(to_dsb(sw))
             n_meas = sum(1 for lg in sw.legs for x in lg.rows if x.kind != "lock")
             notes[id(b)] = shape_note_of(sw)
             print(f"  {chip}: {len(sw.legs)} 段 / {len(sw.temps)} 档温度 / "
                   f"{n_meas} 测点 / 指标 {len(sw.items)} 个 / 排除 {len(sw.excluded)} 行"
                   f"   [{b.name}]")
-            for ln in pend:
-                print(ln)
-            for sn in getattr(sw, "spur_notes", ()):
-                print(f"     · {sn}")
-            print_excluded(sw.excluded)
+            pend += [f"· {sn}" for sn in getattr(sw, "spur_notes", ())]
             excl_all.append((chip, mod, KIND_LABEL[KIND_PLL], sw.excluded))
             flos = {txt(x.raw[sw.cols.idx('fLO_MHz')])
                     for lg in sw.legs for x in lg.rows
                     if sw.cols.idx('fLO_MHz') is not None} - {""}
             if len(flos) > 1:
-                print(f"     ⚠ 这份簿里有多个 fLO：{sorted(flos)}"
-                      f"——汇总把它们并成一行了，要分频点报的话得分块（本版未做）")
+                warn.append(f"⚠ 这份簿里有多个 fLO：{sorted(flos)}"
+                            f"——汇总把它们并成一行了，要分频点报的话得分块"
+                            f"（本版未做）")
+            for ln in warn + pend:                    # -v: 逐份逐条照旧
+                vprint(f"     {ln}")
+            if VERBOSE:
+                print_excluded(sw.excluded)
+            alarm.add(chip, warn)
+            info.add(chip, pend)
+            excl.append((chip, sw.excluded))
             for w in sw.warnings:
-                warn_seen.setdefault(w, []).append(chip)
+                warn_seen.setdefault(w, []).append((chip, mod))
         if data:
             tables.append((mod, data))
-        # 告警按条汇总打印：重名列这种模板老问题每份簿都会报，
-        # 逐份逐条打 = 30 行同样的话，真正要看的东西反而被冲掉
-        for w, who in warn_seen.items():
-            print(f"  ⚠ {w}"
-                  + (f"   （{len(who)}/{len(data)} 份都有）" if len(who) > 1
-                     else f"   （{who[0]}）"))
-        warn_seen.clear()
+        # 例外先打、说明后打：⚠ 要压在这一节最显眼的地方
+        alarm.flush(len(data))
+        info.flush(len(data))
+        if not VERBOSE:
+            for ln in excluded_brief(excl, len(data)):
+                print(ln)
 
     T["读 PLL"] = time.perf_counter()
     # ---- 读 VCO 开环 ----
@@ -2962,14 +3175,17 @@ def main():
         if not books or args.no_vco:
             continue
         vdata, vrows = {}, {}
+        miss_mod = [c for c in chips if c not in books]
         print()
-        print("=== %s VCO 开环 ===" % mod)
+        print("=== %s VCO 开环 ===" % mod
+              + ("   （%s 没有这个模块的开环文件）" % ", ".join(miss_mod)
+                 if miss_mod else ""))
+        info, alarm, excl = Notes(), Notes(), []
         op = None
         sw = None
         for chip in chips:
             b = books.get(chip)
             if b is None:
-                print(f"  {chip}: 没有这个模块的开环文件")
                 continue
             # ★ 先放手上一份簿子，再读下一份：不放手的话 `sw` 一直指着上一份，
             #   load_vco 建新的那一刻内存里是**两份**，峰值白涨一倍。
@@ -2994,9 +3210,9 @@ def main():
             n_scale = scale_of(scale_rules, mod, KIND_VCO)
             # ★ 攒着，等芯片那一行打完再打（见 note_scale 的注释）
             pend = note_scale(sinfo, KIND_VCO, mod, chip, scale_book(sw, n_scale))
-            pend += check_scale(imp, n_scale, chip, KIND_LABEL[KIND_VCO])
+            warn = check_scale(imp, n_scale, KIND_LABEL[KIND_VCO])
             if dsb:
-                pend += note_dsb(to_dsb(sw), chip)  # 要在 vco_rows 之前
+                pend += note_dsb(to_dsb(sw))        # 要在 vco_rows 之前
             # 工作点用第一颗芯片的（CT 扫钉住的那个 Vtune）统一喂给全部芯片：
             # 否则各片的组名会变成「@ Vtune 0.4V」「@ Vtune 0.45V」，行对不齐
             if op is None:
@@ -3015,31 +3231,37 @@ def main():
             coarse = coarse_temps(sw)
             print(f"  {chip}: 温度 {[fmt_num(t) for t in temps]} / "
                   f"结论行 {sum(1 for x in rows if x['kind'] == 'result')} 条 / "
-                  f"指标 {len(sw.items)} 个   [{b.name}]")
-            for ln in pend:
-                print(ln)
+                  f"指标 {len(sw.items)} 个 / 排除 {len(sw.excluded)} 行   [{b.name}]")
             if coarse:
-                print(f"     · CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
-                      f"（只测几个码）")
+                pend.append(f"· CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
+                            f"（只测几个码）")
             for t, sp, med in flat_vtune_temps(sw):
-                print(f"     ⚠⚠ {fmt_num(t)}℃ 的 Vtune 扫**频率几乎没动**："
-                      f"全程只变了 {fmt_num(sp, 4)} MHz，其他温度是 {fmt_num(med, 1)} MHz。"
-                      f"这个温度多半没真正切到开环（环路还锁着／DAC 没驱动／testmux "
-                      f"没切），它的 Kvco 会算出接近 0 的值——那不是低温增益低。"
-                      f"对照 Kvco 组里 F(Vtune=…) 那两行就能确认")
-            print(f"     排除 {len(sw.excluded)} 行:")
-            for sn in getattr(sw, "spur_notes", ()):
-                print(f"     · {sn}")
-            print_excluded(sw.excluded)
+                warn.append(f"⚠⚠ {fmt_num(t)}℃ 的 Vtune 扫**频率几乎没动**："
+                            f"全程只变了 {fmt_num(sp, 4)} MHz，其他温度是 "
+                            f"{fmt_num(med, 1)} MHz。这个温度多半没真正切到开环"
+                            f"（环路还锁着／DAC 没驱动／testmux 没切），它的 Kvco "
+                            f"会算出接近 0 的值——那不是低温增益低。对照 Kvco 组里 "
+                            f"F(Vtune=…) 那两行就能确认")
+            pend += [f"· {sn}" for sn in getattr(sw, "spur_notes", ())]
+            for ln in warn + pend:                    # -v: 逐份逐条照旧
+                vprint(f"     {ln}")
+            if VERBOSE:
+                print(f"     排除 {len(sw.excluded)} 行:")
+                print_excluded(sw.excluded)
+            alarm.add(chip, warn)
+            info.add(chip, pend)
+            excl.append((chip, sw.excluded))
             excl_all.append((chip, mod, KIND_LABEL[KIND_VCO], sw.excluded))
             for w in sw.warnings:
-                warn_seen.setdefault(w, []).append(chip)
+                warn_seen.setdefault(w, []).append((chip, mod))
             for t in temps:
                 if t not in vtemps:
                     vtemps.append(t)
-        for w, who in warn_seen.items():
-            print(f"  ⚠ {w}   （{'/'.join(who)}）")
-        warn_seen.clear()
+        alarm.flush(len(vrows))
+        info.flush(len(vrows))
+        if not VERBOSE:
+            for ln in excluded_brief(excl, len(vrows)):
+                print(ln)
         if vrows:
             vtables.append((mod, vrows))
             vcharts.append((mod, vdata))
@@ -3050,6 +3272,9 @@ def main():
         sys.exit("没有一份 PLL 温扫 / VCO 开环文件读成功")
 
     if args.dry_run:
+        for ln in template_warn_lines(warn_seen, brief=not VERBOSE):
+            print(ln)
+        warn_seen.clear()
         print("\n--dry-run：没有写文件。")
         print(cost_line(T))
         return
@@ -3077,6 +3302,7 @@ def main():
         cdata = {}
         print()
         print("=== 逐级关断电流 ===")
+        cexcl, cinfo = [], Notes()
         for mod, books in sorted(grid.get(KIND_CUR, {}).items()):
             for chip in chips:
                 b = books.get(chip)
@@ -3120,25 +3346,49 @@ def main():
                         ctemps.append(t)
                     run = cur.runs[t]
                     rc = run.get("recheck")
-                    print(f"  {chip} {fmt_num(t)}℃: 基线 {fmt_num(run['baseline'], 4)} mA"
-                          f" / 关断 {len(run['steps'])} 步"
-                          + (f" / 恢复后复测 {fmt_num(rc[3], 4)} mA"
-                             f"（与基线差 {fmt_num(rc[3] - run['baseline'], 4)}）"
-                             if rc else " / **没有恢复后复测点**"))
+                    vprint(f"  {chip} {fmt_num(t)}℃: 基线 "
+                           f"{fmt_num(run['baseline'], 4)} mA"
+                           f" / 关断 {len(run['steps'])} 步"
+                           + (f" / 恢复后复测 {fmt_num(rc[3], 4)} mA"
+                              f"（与基线差 {fmt_num(rc[3] - run['baseline'], 4)}）"
+                              if rc else " / **没有恢复后复测点**"))
+                # 一片一行：几趟温度、各关断几步、基线各是多少（复测差在下面那句里）
+                nstep = [len(cur.runs[t]["steps"]) for t in cur.temps]
+                if not VERBOSE:
+                    # ★ fmt_num 整数时还给的是 int，join 之前一律 str()
+                    print("  %s: %s℃ %s / 基线 %s mA   [%s]"
+                          % (chip, "/".join(str(fmt_num(t)) for t in cur.temps),
+                             ("各关断 %d 步" % nstep[0] if len(set(nstep)) == 1
+                              else "关断 %s 步" % "/".join(str(x) for x in nstep)),
+                             "/".join(str(fmt_num(cur.runs[t]["baseline"], 4))
+                                      for t in cur.temps), b.name))
                 # ★ 可信度那句话走这里，不进正表（正表出现 ⚠ 一定被追问）
-                q = run_quality(cur, chip)
-                for line in q:
-                    print(f"     ⚠ {line}")
+                recs = run_quality(cur)
+                q = q_lines(recs, chip)
                 if q:
                     quality_all.append((chip, mod, KIND_LABEL[KIND_CUR],
                                         [("这一趟的可信度", line) for line in q]))
+                if VERBOSE:
+                    for line in q:
+                        print(f"     ⚠ {line}")
+                else:
+                    # ★ 出事的（没恢复回去／没有复测点）**整句照打**：它每次都
+                    #   不一样，而且要人去查。只有"每次都一样的那句"才压缩。
+                    for r in recs:
+                        if r["broke"] or r["no_rc"]:
+                            print(f"     ⚠⚠ {q_line(r, chip)}")
+                    brief = q_brief(recs, chip)
+                    if brief:
+                        print(f"     ⚠ {brief}")
+                cexcl.append((chip, [(n, why) for n, why, _k in cur.excluded]))
                 if cur.excluded:
-                    print(f"     排除 {len(cur.excluded)} 行:")
-                    print_excluded([(n, why) for n, why, _k in cur.excluded])
                     excl_all.append((chip, mod, KIND_LABEL[KIND_CUR],
                                      [(n, why) for n, why, _k in cur.excluded]))
+                    if VERBOSE:
+                        print(f"     排除 {len(cur.excluded)} 行:")
+                        print_excluded([(n, why) for n, why, _k in cur.excluded])
                 for w in cur.warnings:
-                    print(f"     ⚠ {w}")
+                    warn_seen.setdefault(w, []).append((chip, mod))
         ctemps.sort()
         if cdata:
             # 电流簿一份就同时装着两个 PLL 的步骤，所以这里的"组"来自清单、
@@ -3175,9 +3425,9 @@ def main():
                 for k in ks:
                     g = guess_key(k, avail)
                     tips.append(f"{k}" + (f"（是不是 {g}？）" if g else ""))
-                print(f"  ⚠ {chip}: 清单里这些步骤在文件里没找到（或没有电流值）: "
-                      + "，".join(tips[:10])
-                      + (f" …共 {len(ks)} 个" if len(ks) > 10 else ""))
+                cinfo.add(chip, ["⚠ 清单里这些步骤在文件里没找到（或没有电流值）: "
+                                 + "，".join(tips[:10])
+                                 + (f" …共 {len(ks)} 个" if len(ks) > 10 else "")])
             # ★ 反方向也要说：**文件里有、清单里没有**的步骤。它们仍然在
             #   「全部关断步骤」那张全量表上，但不进任何一份总功耗——
             #   该进而漏掉了的话，两份报告就少算了电流，而且一声不响。
@@ -3192,10 +3442,19 @@ def main():
                             if k not in inlist and k not in outside:
                                 outside.append(k)
                     if outside:
-                        print(f"  · {chip}: 文件里另有 {len(outside)} 步不在任何一份"
-                              f"总功耗里（只出现在「全部关断步骤」表上）: "
-                              + "，".join(outside[:12])
-                              + (" …" if len(outside) > 12 else ""))
+                        cinfo.add(chip, [f"· 文件里另有 {len(outside)} 步不在任何一份"
+                                         f"总功耗里（只出现在「全部关断步骤」表上）: "
+                                         + "，".join(outside[:12])
+                                         + (" …" if len(outside) > 12 else "")])
+        cinfo.flush(len(cdata))
+        for ln in ([] if VERBOSE else excluded_brief(cexcl, len(cdata))):
+            print(ln)
+
+    # 重复列名这种模板老问题**每一份簿子都有**：按节按份打就是 24 行同样的话。
+    # 整趟收在一起打一次，-v 时逐条打。
+    for ln in template_warn_lines(warn_seen, brief=not VERBOSE):
+        print(ln)
+    warn_seen.clear()
 
     T["读电流"] = time.perf_counter()
 
