@@ -858,9 +858,9 @@ def main():
                     help="该列匹配这个正则的行 = 一次重锁（默认 _lock$）")
     ap.add_argument("--temp-col", default=None, help="温度列（默认自动找含 Temperature 的列）")
     ap.add_argument("--spur-add", default="",
-                    help="除了模板声明的频点，再报这几个杂散分量（MHz，逗号分隔，"
-                         "如 2,4,6,20）：模板里没有这几列，值只从表尾杂散清单里挑，"
-                         "某一行没搜到就留空")
+                    help="要报的杂散频点（MHz，逗号分隔，如 \"<1,2,4,6,20\"）："
+                         "模板里没有这几列，值只从表尾杂散清单里挑，某一行没搜到就"
+                         "留空；`<1` ＝ 1 MHz 以内只报一行、取里面最大的那条")
     ap.add_argument("--spur-tol", type=float, default=2.0,
                     help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
                          "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
@@ -898,7 +898,9 @@ def main():
                         temp_col=args.temp_col, keep_test_item=args.keep_test_item,
                         keep_mode=args.keep_mode, keep_original=True,
                         spur_tol=args.spur_tol,
-                        spur_targets=[float(x) for x in
+                        # ★ 不转 float：`<1` 这种频带写法是字符串，
+                        #   统一交给 sweep_lib.parse_spur_targets
+                        spur_targets=[x.strip() for x in
                                       args.spur_add.replace("，", ",").split(",")
                                       if x.strip()])
     except SweepError as e:

@@ -255,6 +255,52 @@ def find_spur_list(header, rows, min_pairs=2):
     return pairs, ""
 
 
+def parse_spur_targets(v):
+    """配置/命令行里的写法 → (点频 [MHz…], 频带 [(下界, 上界)…])。
+
+    认这几种：`2` / `2.0` / `"2"` / `"2M"` / `"2MHz"` ＝ 点频；
+    `"<1"` / `"<1M"` / `"<1MHz"` ＝ **频带**：这个偏移以内的杂散只报一行，
+    取里面最大的那条。
+    ★ 为什么要频带：近端（<1 MHz）的杂散是一串——参考泄漏、电源纹波、DBB
+      时钟的边带，各温度各片出现的位置还不一样。逐个报成行没人看得过来，
+      而评审要的就是一句"最近端最坏多少"。
+    """
+    pts, bands = [], []
+    for x in (v or ()):
+        if isinstance(x, (int, float)):
+            pts.append(float(x))
+            continue
+        t = str(x).strip().lower().replace("mhz", "").replace("m", "").strip()
+        if t.startswith("<"):
+            hi = float(t[1:])
+            bands.append((0.0, hi))
+        elif t:
+            pts.append(float(t))
+    return pts, bands
+
+
+def spur_band_picker(pairs, lo, hi):
+    """频带里取幅度最大的那一条（跟点频同一个"取最坏"口径）。
+
+    ★ 逐行各取各的：同一行里 0.19 与 0.39 两条都在带内就取大的那条，
+      下一行可能只有一条、也可能一条都没有——那一格就空着。
+    """
+    def pick(raw):
+        best = None
+        for fc, lc in pairs:
+            f = num(raw[fc]) if fc < len(raw) else None
+            v = num(raw[lc]) if lc < len(raw) else None
+            if f is None or v is None:
+                continue
+            a = abs(f)                      # 偏移可能记成负数（载波下边那侧）
+            if not (lo < a < hi):
+                continue
+            if best is None or v > best[1]:
+                best = (lc, v)
+        return best[0] if best else None
+    return pick
+
+
 def spur_picker(pairs, target, tol):
     """在标称频点 ±tol 的窗口里，挑**幅度最大**（dBc 最靠近 0）的那一条。
 
@@ -359,19 +405,28 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
             continue                    # 标称频点在这份簿里不唯一，不动它
         declared[it] = tgts.pop()
 
-    extra = sorted({float(t) for t in (targets or ()) if t is not None})
+    extra, bands = parse_spur_targets(targets)
+    extra = sorted(set(extra))
+    bands = sorted(set(bands))
     wins = spur_windows(list(declared.values()) + extra, tol)
 
-    def attach(it, t):
-        it.pick = spur_picker(pairs, t, wins[t])
-        it.pick_note = (f"杂散清单 {where} 里 {fmt_num(t)}±{fmt_num(wins[t], 2)} MHz "
-                        f"内最大的一条")
+    def attach(it, t, band=None):
+        if band is None:
+            it.pick = spur_picker(pairs, t, wins[t])
+            it.pick_note = (f"杂散清单 {where} 里 {fmt_num(t)}±"
+                            f"{fmt_num(wins[t], 2)} MHz 内最大的一条")
+        else:
+            it.pick = spur_band_picker(pairs, band[0], band[1])
+            it.pick_note = (f"杂散清单 {where} 里偏移 <{fmt_num(band[1])} MHz "
+                            f"的全部杂散里最大的一条")
         # 实测偏移落在哪儿 —— 报表备注要写它（"你这 26M 是在哪测的"）。
         # 在这里算是因为两个读取层都调这个函数，算一次两边都有。
         offs = [num(r[c - 1]) for r in rows for c in (it.pick(r),)
                 if c is not None and c - 1 < len(r)]
-        it.pick_stats = {"target": t, "tol": wins[t], "off": median(offs),
-                         "n": len(offs)}
+        # ★ 频带没有"标称频点"，`tol` 留空——spur_off_warn 那条哨兵靠它区分
+        #   （频带本来就不该拿"离标称多远"来判）。target 填上界，只为排序。
+        it.pick_stats = {"target": t, "tol": None if band else wins[t],
+                         "band": band, "off": median(offs), "n": len(offs)}
         # 文本型数字要重判：现在读的是清单那几列，不是原来那一格
         it.text_src = any(
             isinstance(r[c], str) and num(r[c]) is not None
@@ -399,7 +454,17 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
         else:
             # 没有清单就没有值，但这一行照样存在（pick_stats 留着，
             # 备注和控制台才说得出"标称多少、为什么空"）
-            it.pick_stats = {"target": t, "tol": wins[t], "off": None, "n": 0}
+            it.pick_stats = {"target": t, "tol": wins[t], "band": None,
+                             "off": None, "n": 0}
+        items.append(it)
+    for lo, hi in bands:
+        nxt += 1
+        it = type(items[0])("Spur", f"Spur@<{fmt_hz(hi)}", "dBc", nxt, "")
+        if pairs:
+            attach(it, hi, band=(lo, hi))
+        else:
+            it.pick_stats = {"target": hi, "tol": None, "band": (lo, hi),
+                             "off": None, "n": 0}
         items.append(it)
 
     # ★ Spur@ 那一族按频点排好再交出去：模板声明的（26/52）和加出来的
@@ -407,8 +472,11 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
     #   评审第一句就是"这表怎么回事"。整族原地重排，别的行一个都不动。
     sp = [i for i, it in enumerate(items) if it.label.startswith("Spur@")]
     if sp:
+        # 频带（<1M）排在同上界的点频前面：它盖的是 0~1，本来就在最前
         block = sorted((items[i] for i in sp),
-                       key=lambda it: (it.pick_stats or {}).get("target", 1e9))
+                       key=lambda it: ((it.pick_stats or {}).get("target", 1e9),
+                                       0 if (it.pick_stats or {}).get("band")
+                                       else 1))
         rest = [it for i, it in enumerate(items) if i not in set(sp)]
         items[:] = rest[:sp[0]] + block + rest[sp[0]:]
 
@@ -428,6 +496,13 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
     # ★ 反方向也要说：清单里有、却没有任何标称频点收走的偏移。
     #   不说的话，"我要的那个分量到底在不在这份数据里"只能靠猜。
     claimed = [(t, w) for t, w in wins.items()]
+    for t, w in list(claimed):
+        for lo, hi in bands:
+            if t - w < hi:
+                notes.append("⚠ 点频 %s 的窗口（±%s）伸进了 <%s MHz 那个频带，"
+                             "同一条杂散可能在两行里各报一次"
+                             % (fmt_num(t), fmt_num(w, 2), fmt_num(hi)))
+                break
     loose = {}
     for r in rows:
         for fc, lc in pairs:
@@ -436,7 +511,8 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
             if f is None or v is None:
                 continue
             a = abs(f)
-            if any(abs(a - t) <= w for t, w in claimed):
+            if any(abs(a - t) <= w for t, w in claimed) or \
+                    any(lo < a < hi for lo, hi in bands):
                 continue
             k = round(a, 1)
             loose[k] = loose.get(k, 0) + 1
@@ -836,17 +912,22 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
             # 模板里压根没有这个频点：没有"原来那一格"可比，只报取自哪儿、命中几行
             # ★ 一条都没搜到也**保留这一行**（用户原话「没有的就留空」）：
             #   两个模块的表行集合一样才横着比得了。
+            band = it.pick_stats.get("band")
+            rangetxt = (f"<{fmt_num(band[1])} MHz 内" if band else
+                        f"{fmt_num(it.pick_stats['target'])}±"
+                        f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内")
             if not new:
                 spur_notes.append(
-                    f"{it.label}: 清单里 {fmt_num(it.pick_stats['target'])}±"
-                    f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内**一条都没有**"
+                    f"{it.label}: 清单里 {rangetxt}**一条都没有**"
                     f"（0/{len(rows)} 行）——表上这一行留空")
                 continue
             spur_notes.append(
-                f"{it.label}: 模板没有这个频点，只从清单取（"
-                f"{fmt_num(it.pick_stats['target'])}±"
-                f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内最大的一条，实测偏移中位 "
-                f"{fmt_num(offs)} MHz），中位 {fmt_num(median(new), 2)} dBc；"
+                f"{it.label}: "
+                + (f"{rangetxt}的杂散只报**最大的那一条**（逐行各取各的），"
+                   f"实测偏移中位 {fmt_num(offs)} MHz" if band else
+                   f"模板没有这个频点，只从清单取（{rangetxt}最大的一条，"
+                   f"实测偏移中位 {fmt_num(offs)} MHz）")
+                + f"，中位 {fmt_num(median(new), 2)} dBc；"
                 f"{len(new)}/{len(rows)} 行命中，其余行留空")
             continue
         spur_notes.append(

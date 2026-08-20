@@ -2067,10 +2067,15 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
                 continue
             n_hit = sum(1 for r in rows if r.vals.get(it.col) is not None)
             if not n_hit and not it.has_cell:
-                spur_notes.append("%s: 清单里 %s±%s MHz 内**一条都没有**"
+                _b = it.pick_stats.get("band")
+                spur_notes.append("%s: 清单里 %s 内**一条都没有**"
                                   "（0/%d 行）——表上这一行留空"
-                                  % (it.label, fmt_num(it.pick_stats["target"]),
-                                     fmt_num(it.pick_stats["tol"], 2), len(rows)))
+                                  % (it.label,
+                                     ("<%s MHz" % fmt_num(_b[1])) if _b else
+                                     ("%s±%s MHz"
+                                      % (fmt_num(it.pick_stats["target"]),
+                                         fmt_num(it.pick_stats["tol"], 2))),
+                                     len(rows)))
                 continue
             spur_notes.append("%s 改从%s取（%d/%d 行命中%s）"
                               % (it.label, it.pick_note, n_hit, len(rows),
@@ -2197,9 +2202,9 @@ def main():
                     help="工作点调谐电压 V（默认取 CT 扫用的那个值）。相噪/功率这些"
                          "按这个点报，不跨整个扫描取极值——不同 Vtune 是不同振荡频率")
     ap.add_argument("--spur-add", default="",
-                    help="除了模板声明的频点，再报这几个杂散分量（MHz，逗号分隔，"
-                         "如 2,4,6,20）：模板里没有这几列，值只从表尾杂散清单里挑，"
-                         "某一行没搜到就留空")
+                    help="要报的杂散频点（MHz，逗号分隔，如 \"<1,2,4,6,20\"）："
+                         "模板里没有这几列，值只从表尾杂散清单里挑，某一行没搜到就"
+                         "留空；`<1` ＝ 1 MHz 以内只报一行、取里面最大的那条")
     ap.add_argument("--spur-tol", type=float, default=2.0,
                     help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
                          "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
@@ -2249,7 +2254,9 @@ def main():
                       keep_test_item=args.keep_test_item, ref_temp=args.ref_temp,
                       fvco_opt=args.fvco, x_round=args.x_round,
                       show_addr=args.show_addr, spur_tol=args.spur_tol,
-                      spur_targets=[float(x) for x in
+                      # ★ 不转 float：`<1` 这种频带写法是字符串，
+                      #   统一交给 sweep_lib.parse_spur_targets
+                      spur_targets=[x.strip() for x in
                                     args.spur_add.replace("，", ",").split(",")
                                     if x.strip()])
     except VcoError as e:

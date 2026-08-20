@@ -50,6 +50,7 @@ from collections import OrderedDict
 from spec_book import SpecBook
 from summarize_vco_sweep import load_vco
 from sweep_lib import (
+    parse_spur_targets,
     COLOR_FLAG, COLOR_MUTED, COLOR_PASS, FILL_FAIL, FILL_PASS,
     LEG_STYLE, Columns, SweepError, apply_y, as_text, axis_bounds, blank_policy,
     DEFAULT_ROW_PT, chart_rows, col_px, cols_cm, fit_strip, fmt_num, is_blank,
@@ -471,11 +472,16 @@ ND = {"MHz": 3}
 
 
 def _off_key(label):
-    """SpotPN@100kHz / Spur@26MHz -> 按 offset 数值排序。"""
-    m = re.search(r"@([\d.]+)(k|M)Hz", label)
+    """SpotPN@100kHz / Spur@26MHz / Spur@<1MHz -> 按 offset 数值排序。
+
+    ★ `<1MHz` 这种频带行盖的是 0~1，要排在 1MHz **之前**（减一点点就够了）。
+      不认它的话它会掉到 1e9，跑到全表最后去。
+    """
+    m = re.search(r"@(<?)([\d.]+)(k|M)Hz", label)
     if not m:
         return 1e9
-    return float(m.group(1)) * (0.001 if m.group(2) == "k" else 1.0)
+    v = float(m.group(2)) * (0.001 if m.group(3) == "k" else 1.0)
+    return v - 1e-9 if m.group(1) else v
 
 
 def canon_items(sweeps):
@@ -733,7 +739,7 @@ def spur_note(data_or_sw, label):
       各片实测偏移不一样就都列出来，别只报第一片的。
     """
     sws = data_or_sw.values() if isinstance(data_or_sw, dict) else [data_or_sw]
-    offs, tgt, tol = [], None, None
+    offs, tgt, tol, band = [], None, None, None
     for sw in sws:
         if sw is None:
             continue
@@ -741,16 +747,22 @@ def spur_note(data_or_sw, label):
         if it is None or not it.pick_stats:
             continue
         tgt, tol = it.pick_stats.get("target"), it.pick_stats.get("tol")
+        band = it.pick_stats.get("band")
         o = it.pick_stats.get("off")
         if o is not None and fmt_num(o) not in offs:
             offs.append(fmt_num(o))
     if tgt is None:
         return ""
+    rng = (f"<{fmt_num(tgt)} MHz 内" if band else
+           f"标称 {fmt_num(tgt)} MHz ±{fmt_num(tol)} MHz 内")
     if not offs:
         # ★ 配了这个频点、却一条都没搜到：备注必须写出来。
         #   正表上一行空白不写原因，评审只会问"这行怎么回事"。
-        return (f"标称 {fmt_num(tgt)} MHz：清单里 ±{fmt_num(tol)} MHz 内"
-                f"没搜到（各片都没有，所以这一行是空的）")
+        return f"{rng}没搜到（各片都没有，所以这一行是空的）"
+    if band:
+        # 频带行：逐行取带内最大的那一条，所以"取自哪个偏移"逐行都可能不同
+        return (f"取 <{fmt_num(tgt)} MHz 内**最大的那一条**（逐行各取各的）；"
+                f"实测偏移 {' / '.join(str(x) for x in offs)} MHz")
     return (f"实测偏移 {' / '.join(str(x) for x in offs)} MHz"
             f"（标称 {fmt_num(tgt)}，取 ±{fmt_num(tol)} MHz 内最大的一条）")
 
@@ -2543,12 +2555,14 @@ def targets_from_cfg(v, mod):
     """
     if not v:
         return []
+    # ★ 不在这儿转 float：`"<1"` 这种频带写法是字符串，
+    #   统一交给 sweep_lib.parse_spur_targets 解析（那里是唯一一份写法定义）。
     if isinstance(v, dict):
         for k in (mod, "*"):
             if k in v:
-                return [float(x) for x in (v[k] or [])]
+                return list(v[k] or [])
         return []
-    return [float(x) for x in v]
+    return list(v)
 
 
 def unknown_target_mods(v, modules):
@@ -3015,7 +3029,9 @@ def main():
     ap.add_argument("--no-spec", action="store_true",
                     help="七列一律留空给人手填（盖掉配置里的 spec）")
     ap.add_argument("--spur-add", default="",
-                    help="要报的杂散频点（MHz，逗号分隔，如 2,4,6,20）。"
+                    help="要报的杂散频点（MHz，逗号分隔，如 \"<1,2,4,6,20\"）。"
+                         "写 `<1` ＝ 1 MHz 以内只报一行、取里面最大的那条"
+                         "（PowerShell 里整串带引号，< 是重定向符）。"
                          "所有 Spur@ 行都从表尾那段杂散清单取值、规则相同；"
                          "模板自己声明的频点每份簿子都带着，不用在这儿重复写"
                          "（写了也不会重复出行）。某一行清单里没有这个分量就留空。"
@@ -3070,7 +3086,7 @@ def main():
     ref_temp = float(pick_opt(args.ref_temp, "ref_temp", 25.0))
     spur_tol = float(pick_opt(args.spur_tol, "spur_tol", 2.0))
     # 命令行给的是一张清单（所有模块通用）；配置里可以按模块分开写
-    spur_cfg = [float(x) for x in args.spur_add.replace("，", ",").split(",")
+    spur_cfg = [x.strip() for x in args.spur_add.replace("，", ",").split(",")
                 if x.strip()] or cfg.get("spur_targets") or []
     op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
     dsb = bool(pick_opt(args.dsb, "dsb", False))
@@ -3171,6 +3187,12 @@ def main():
     def spur_of(mod):
         return targets_from_cfg(spur_cfg, mod)
 
+    def spur_show(v):
+        """打给人看：`<1` 原样，数字去掉多余的小数点。"""
+        pts, bands = parse_spur_targets(v)
+        return "/".join(["<%s" % fmt_num(hi) for _lo, hi in sorted(bands)]
+                        + [str(fmt_num(t)) for t in sorted(pts)])
+
     bad_mods = unknown_target_mods(spur_cfg, modules)
     if bad_mods:
         print(f"  ⚠⚠ spur_targets 里这几个键一个模块都对不上: {', '.join(bad_mods)}"
@@ -3192,13 +3214,11 @@ def main():
             print("杂散频点（按模块）:" + src)
             for mod in modules:
                 got = spur_of(mod)
-                print("  %-8s %s" % (mod, ("/".join(str(fmt_num(t)) for t in
-                                                    sorted(got)) + " MHz")
+                print("  %-8s %s" % (mod, (spur_show(got) + " MHz")
                                      if got else "只报模板声明的那几个"))
             print("  " + tail)
         else:
-            print("杂散频点: "
-                  + "/".join(str(fmt_num(t)) for t in sorted(spur_of("")))
+            print("杂散频点: " + spur_show(spur_of(""))
                   + " MHz + " + tail + src)
     # 耗时分解：慢在读、慢在排版、还是慢在存盘——不量就只能猜
     T = {"t0": time.perf_counter()}
