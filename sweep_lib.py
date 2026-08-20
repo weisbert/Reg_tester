@@ -160,6 +160,22 @@ class Item:
         """跨簿子对齐用的键。列位置在不同芯片的簿子里可能不同，名字才是身份。"""
         return self.label
 
+    @property
+    def has_cell(self):
+        """这一行在原表里有没有自己的列。
+
+        ★★ False ＝ 值只能逐行从表尾杂散清单里挑（`spur_targets` 加出来的频点，
+          模板里根本没有这一列）。此时 `col` 是个**超出表宽的合成号**，只当
+          `vals` / `src` 的键用，不是列号：
+            · 拿它去 `raw[it.col]` 会 IndexError（守卫都写着 `it.col < len(raw)`）；
+            · 要拼引用只能走 `row.col_of(it)`（那里记着这一行真正读的那一格）；
+            · 它也没有"模板那一格"可以退回去，所以整份没搜到就不出这一行。
+        ★ 判据别各处自己写 `not it.src`：它有 7 处要用，散着写就是 7 处各自
+          记住一条没名字的约定——而这份代码里所有"静默错值"都是这么来的。
+        """
+        return bool(self.src)
+
+
 
 SIMPLE_ITEMS = [
     # (表头, 分类, 单位)
@@ -303,7 +319,7 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
     for it in items:
         if not it.label.startswith("Spur@"):
             continue
-        fc = cols.idx(it.src.replace("Result", "Freq")) if it.src else None
+        fc = cols.idx(it.src.replace("Result", "Freq")) if it.has_cell else None
         if fc is None:
             continue
         tgts = {num(r[fc]) for r in rows if fc < len(r) and num(r[fc]) is not None}
@@ -399,7 +415,7 @@ def drop_empty_picks(items, rows, dropped):
     """
     keep, gone = [], []
     for it in items:
-        if it.src or it.pick is None or \
+        if it.has_cell or it.pick is None or \
                 any(r.vals.get(it.col) is not None for r in rows):
             keep.append(it)
         else:
@@ -794,7 +810,7 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
         it.pick_stats.update(new=median(new), old=median(old) if old else None)
         offs = it.pick_stats.get("off")
         d = (median(new) - median(old)) if (new and old) else None
-        if not it.src:
+        if not it.has_cell:
             # 模板里压根没有这个频点：没有"原来那一格"可比，只报取自哪儿、命中几行
             spur_notes.append(
                 f"{it.label}: 模板没有这个频点，只从清单取（"
@@ -826,7 +842,7 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     #   分不出来，得看它带不带结果。
     # 分母只数**表上真有那一列**的指标：杂散清单加出来的行没有自己的列
     #   （值是逐行从清单里挑的），把它们算进分母会让"4/16"莫名其妙变成"4/20"。
-    n_sheet = sum(1 for it in items if it.src)
+    n_sheet = sum(1 for it in items if it.has_cell)
     for xl, why, raw in cut:
         k = sum(1 for it in items
                 if it.col < len(raw) and num(raw[it.col]) is not None)

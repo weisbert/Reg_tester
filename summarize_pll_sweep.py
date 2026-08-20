@@ -928,7 +928,7 @@ def main():
     for it in items:
         # src 为空 ＝ 模板里没有这一列，值是逐行从表尾杂散清单里挑的
         print(f"    [{it.cat:<12}] {it.label:<18} {it.unit:<7} "
-              + (f"<- 列 {it.src}" if it.src else "<- 表尾杂散清单（逐行挑）")
+              + (f"<- 列 {it.src}" if it.has_cell else "<- 表尾杂散清单（逐行挑）")
               + ("   ⚠ 原始列是文本型数字，引用已加双负号转数值" if it.text_src else ""))
     txts = [it.src for it in items if it.text_src]
     if txts:

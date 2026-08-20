@@ -308,6 +308,21 @@ class Item:
         self.pick_note = ""
         self.pick_stats = None
 
+    @property
+    def has_cell(self):
+        """这一行在原表里有没有自己的列。
+
+        ★★ False ＝ 值只能逐行从表尾杂散清单里挑（`spur_targets` 加出来的频点，
+          模板里根本没有这一列）。此时 `col` 是个**超出表宽的合成号**，只当
+          `vals` / `src` 的键用，不是列号：
+            · 拿它去 `raw[it.col]` 会 IndexError（守卫都写着 `it.col < len(raw)`）；
+            · 要拼引用只能走 `row.col_of(it)`（那里记着这一行真正读的那一格）；
+            · 它也没有"模板那一格"可以退回去，所以整份没搜到就不出这一行。
+        ★ 判据别各处自己写 `not it.src`：它有 7 处要用，散着写就是 7 处各自
+          记住一条没名字的约定——而这份代码里所有"静默错值"都是这么来的。
+        """
+        return bool(self.src)
+
 
 SIMPLE_ITEMS = [
     # (表头, 分类, 单位)
@@ -2045,7 +2060,7 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
             spur_notes.append("%s 改从%s取（%d/%d 行命中%s）"
                               % (it.label, it.pick_note, n_hit, len(rows),
                                  "；模板里没有这个频点，其余行留空"
-                                 if not it.src else ""))
+                                 if not it.has_cell else ""))
         for it in spur_gone:
             spur_notes.append("%s: 清单里 %s±%s MHz 内**一条都没有**（0/%d 行），"
                               "这份不进表"
@@ -2056,7 +2071,7 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
     # ★ 被过滤掉的行到底有没有带测量结果，必须说出来（同 sweep_lib.load_sweep）。
     #   "排除了 N 行"这句话本身不足以判断有没有丢数据。
     # 分母只数表上真有那一列的（杂散清单加出来的行没有自己的列）——见 sweep_lib
-    n_sheet = sum(1 for it in items if it.src)
+    n_sheet = sum(1 for it in items if it.has_cell)
     for xl0, why, raw0 in cut:
         k = sum(1 for it in items
                 if it.col < len(raw0) and num(raw0[it.col]) is not None)
@@ -2264,7 +2279,8 @@ def main():
         # src 为空 ＝ 模板里没有这一列，值是逐行从表尾杂散清单里挑的
         print("    [%-12s] %-18s %-7s %s"
               % (it.cat, it.label, it.unit,
-                 ("<- 列 %s" % it.src) if it.src else "<- 表尾杂散清单（逐行挑）"))
+                 ("<- 列 %s" % it.src) if it.has_cell
+                 else "<- 表尾杂散清单（逐行挑）"))
     if dropped:
         print("  跳过的空列 %d 个: %s" % (len(dropped), ", ".join(k for k, _ in dropped)))
     print("分组 %d 组:" % len(groups))
