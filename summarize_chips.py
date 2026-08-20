@@ -1050,7 +1050,10 @@ def _judge_formula(r):
     over = f"AND(COUNT({dmax})>0,COUNT({smax})>0,{smax}>{dmax})"
     under = f"AND(COUNT({dmin})>0,COUNT({smin})>0,{smin}<{dmin})"
     both = f"IF(OR({over},{under}),\"FAIL\",\"PASS\")"
-    return (f"=IF(COUNT({dmin},{dmax})=0,\"\","
+    # ★ 汇总列一个数都没有时也不判：杂散这类"仪器搜到才有"的行，某个分量
+    #   整行没搜到是完全可能的（见 spur_targets）。此时 le/ge 那两条的
+    #   COUNT 守卫会让它输出 **PASS** —— 把"没测到"报成"合格"，比留空糟得多。
+    return (f"=IF(OR(COUNT({dmin},{dmax})=0,COUNT({smin},{smax})=0),\"\","
             f"IF({lim}=\"≤\",{le},IF({lim}=\"≥\",{ge},{both})))")
 
 
@@ -1684,6 +1687,32 @@ def write_vco_summary(wb, vtables, chips, st, vtemps, slim=False,
                               sinfo=sinfo, dsb=dsb, spec=spec)
 
 
+def _sort_offset_runs(order):
+    """同一分组里**连续的同族 @offset 行**按频点排（Spur@ 一族、SpotPN@ 一族）。
+
+    ★★ 为什么需要：行序是各片"先到先得"union 出来的，而各片报得出的杂散分量
+      不一样（某片的清单里就是没有 4M 那条）。A 片给 2/6、B 片再补进 4，
+      union 出来就是 2 → 6 → 4：频点跳着走，评审第一句就是"这表怎么回事"。
+    ★ 只动**连续同族**那一段，别整组重排——组里别的行（Freq/Power/IPN…）
+      的顺序是逐轮改出来的，不许被这条规则碰到。
+    """
+    out, i = [], 0
+    while i < len(order):
+        cat, item = order[i][0], order[i][1]
+        pre = item.split("@")[0] + "@" if _off_key(item) < 1e9 else None
+        if pre is None:
+            out.append(order[i])
+            i += 1
+            continue
+        j = i
+        while (j < len(order) and order[j][0] == cat
+               and order[j][1].startswith(pre) and _off_key(order[j][1]) < 1e9):
+            j += 1
+        out += sorted(order[i:j], key=lambda d: _off_key(d[1]))
+        i = j
+    return out
+
+
 def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
                        slim=False, item_w=26, note_w=46, sinfo=None, dsb=False,
                        spec=None):
@@ -1782,6 +1811,7 @@ def write_grouped_page(wb, sheet, title_fmt, vtables, chips, st, vtemps,
                     seen.add(key)
                     order.append((d["cat"], d["item"], d["unit"], d["dir"],
                               d["kind"], d.get("nd"), d.get("strong", False)))
+        order = _sort_offset_runs(order)
         j0 = None
         cur_cat = None
         band0 = None
@@ -2948,6 +2978,11 @@ def main():
                          "从填好的簿子里读出来的）。不给＝用配置文件里的 spec 块")
     ap.add_argument("--no-spec", action="store_true",
                     help="七列一律留空给人手填（盖掉配置里的 spec）")
+    ap.add_argument("--spur-add", default="",
+                    help="除了模板声明的那几个频点，再报这几个杂散分量（MHz，逗号"
+                         "分隔，如 2,4,6,20）。它们在模板里没有列，值只从表尾的"
+                         "杂散清单里挑；某一行清单里没有就留空。"
+                         "也可以写进配置的 spur_targets，就不用每次敲")
     ap.add_argument("--spur-tol", type=float, default=None,
                     help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
                          "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
@@ -2997,6 +3032,8 @@ def main():
 
     ref_temp = float(pick_opt(args.ref_temp, "ref_temp", 25.0))
     spur_tol = float(pick_opt(args.spur_tol, "spur_tol", 2.0))
+    spur_tg = [float(x) for x in args.spur_add.replace("，", ",").split(",")
+               if x.strip()] or [float(x) for x in (cfg.get("spur_targets") or [])]
     op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
     dsb = bool(pick_opt(args.dsb, "dsb", False))
     chart_w = float(pick_opt(args.chart_w, "chart_w", CHART_W_CM))
@@ -3093,6 +3130,13 @@ def main():
     else:
         print()
         print("折算规则: 没有（相噪/杂散/频率按实测频点报）")
+    if spur_tg:
+        # ★ 跟折算规则一样：加了哪几个频点、从哪儿来的，第一屏就得看得见。
+        #   模板声明的那几个（真数据是 26/52）照旧自动带着，不用配。
+        print("杂散加报: " + "/".join(str(fmt_num(t)) for t in sorted(spur_tg))
+              + " MHz（模板声明的那几个照旧自动带着）"
+              + ("" if args.spur_add else
+                 f"   ←{os.path.basename(cfg_path or CONFIG_NAME)}"))
     # 耗时分解：慢在读、慢在排版、还是慢在存盘——不量就只能猜
     T = {"t0": time.perf_counter()}
     for mod in modules:
@@ -3115,7 +3159,7 @@ def main():
                 sw = load_sweep(b.path, leg_col=args.leg_col,
                                 lock_pattern=args.lock_pattern,
                                 temp_col=args.temp_col, keep_original=False,
-                                spur_tol=spur_tol)
+                                spur_tol=spur_tol, spur_targets=spur_tg)
             except Exception as e:                    # noqa: B902
                 why = f"{type(e).__name__}: {e}{xlsx_shape(b.path)}"
                 failed.append((b, why))
@@ -3196,7 +3240,7 @@ def main():
             gc.collect()
             try:
                 sw = load_vco(b.path, temp_col=args.temp_col, keep_original=False,
-                              spur_tol=spur_tol)
+                              spur_tol=spur_tol, spur_targets=spur_tg)
             except Exception as e:                    # noqa: B902
                 why = f"{type(e).__name__}: {e}{xlsx_shape(b.path)}"
                 failed.append((b, why))

@@ -72,7 +72,7 @@ import re
 import sys
 from collections import OrderedDict
 
-from sweep_lib import attach_spur_list, read_values
+from sweep_lib import attach_spur_list, drop_empty_picks, read_values
 from xlsx_formula_cache import Formula, FormulaCache
 
 try:
@@ -1886,7 +1886,8 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
              lock_pattern=r"lock$|close.?loop", sweep_mode_opt=None,
              temp_col=None, vtune_col=None, ct_col_opt=None,
              keep_test_item=None, ref_temp=25.0, fvco_opt=None, x_round=6,
-             show_addr=False, keep_original=True, spur_tol=2.0):
+             show_addr=False, keep_original=True, spur_tol=2.0,
+             spur_targets=()):
     """把一份开环压控扫描簿读成 VcoSweep（行已过滤、组已切好、指标已识别）。
 
     从 main() 原样抽出来的——跨芯片汇总要用同一套识别与分组口径，
@@ -2015,11 +2016,11 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
         raise VcoError("没识别出任何有数据的结果列")
     # ★ 杂散：模板固定频点那一格量到的常常是噪底，真值在表尾的杂散清单里。
     #   认不出清单就退回原来的行为（attach_spur_list 什么都不做，只回一句原因）。
-    spur_why = attach_spur_list(cols, [r.raw for r in rows + locked + others],
-                                items, tol=spur_tol)
-    spur_notes = ["没认出表尾的杂散清单（%s），Spur 仍按模板固定频点那一格取"
-                  % spur_why] if spur_why else \
-        ["%s 改从%s取" % (it.label, it.pick_note) for it in items if it.pick_note]
+    #   `spur_targets` 是模板里没有的分量（2/4/6/20…），它们只在清单里，
+    #   一行有没有随缘——挑不到就留空（见 attach_spur_list）。
+    spur_why, spur_extra = attach_spur_list(
+        cols, [r.raw for r in rows + locked + others], items,
+        tol=spur_tol, targets=spur_targets)
     for r in rows + locked + others:
         for it in items:
             if it.pick is not None:
@@ -2030,14 +2031,37 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
                 r.vals[it.col] = num(r.raw[pc]) if ok else None
             else:
                 r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+    # 一条都没挑到的**加出来的**杂散行不进表，但要报出来
+    spur_gone = drop_empty_picks(items, rows + locked + others, dropped)
+    if spur_why:
+        spur_notes = ["没认出表尾的杂散清单（%s），Spur 仍按模板固定频点那一格取"
+                      % spur_why]
+    else:
+        spur_notes = []
+        for it in items:
+            if not it.pick_note:
+                continue
+            n_hit = sum(1 for r in rows if r.vals.get(it.col) is not None)
+            spur_notes.append("%s 改从%s取（%d/%d 行命中%s）"
+                              % (it.label, it.pick_note, n_hit, len(rows),
+                                 "；模板里没有这个频点，其余行留空"
+                                 if not it.src else ""))
+        for it in spur_gone:
+            spur_notes.append("%s: 清单里 %s±%s MHz 内**一条都没有**（0/%d 行），"
+                              "这份不进表"
+                              % (it.label, fmt_num(it.pick_stats["target"]),
+                                 fmt_num(it.pick_stats["tol"], 2), len(rows)))
+        spur_notes += spur_extra
 
     # ★ 被过滤掉的行到底有没有带测量结果，必须说出来（同 sweep_lib.load_sweep）。
     #   "排除了 N 行"这句话本身不足以判断有没有丢数据。
+    # 分母只数表上真有那一列的（杂散清单加出来的行没有自己的列）——见 sweep_lib
+    n_sheet = sum(1 for it in items if it.src)
     for xl0, why, raw0 in cut:
         k = sum(1 for it in items
                 if it.col < len(raw0) and num(raw0[it.col]) is not None)
         # 带 4/15 跟带 15/15 是两件事——见 sweep_lib 里同一处的说明
-        excluded.append((xl0, why + ("（这行带 %d/%d 个结果值）" % (k, len(items))
+        excluded.append((xl0, why + ("（这行带 %d/%d 个结果值）" % (k, n_sheet)
                                      if k else "（这行没有任何结果值）")))
 
     # 扫描序列之外但确实量到东西的行：单列一页，别让「排除了 N 行」看着像丢了数据
@@ -2143,6 +2167,10 @@ def main():
     ap.add_argument("--op-vtune", type=float, default=None,
                     help="工作点调谐电压 V（默认取 CT 扫用的那个值）。相噪/功率这些"
                          "按这个点报，不跨整个扫描取极值——不同 Vtune 是不同振荡频率")
+    ap.add_argument("--spur-add", default="",
+                    help="除了模板声明的频点，再报这几个杂散分量（MHz，逗号分隔，"
+                         "如 2,4,6,20）：模板里没有这几列，值只从表尾杂散清单里挑，"
+                         "某一行没搜到就留空")
     ap.add_argument("--spur-tol", type=float, default=2.0,
                     help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
                          "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
@@ -2191,7 +2219,10 @@ def main():
                       vtune_col=args.vtune_col, ct_col_opt=args.ct_col,
                       keep_test_item=args.keep_test_item, ref_temp=args.ref_temp,
                       fvco_opt=args.fvco, x_round=args.x_round,
-                      show_addr=args.show_addr, spur_tol=args.spur_tol)
+                      show_addr=args.show_addr, spur_tol=args.spur_tol,
+                      spur_targets=[float(x) for x in
+                                    args.spur_add.replace("，", ",").split(",")
+                                    if x.strip()])
     except VcoError as e:
         sys.exit(str(e))
     by_kind, ct_addr, ct_name, ct_why = sw.by_kind, sw.ct_addr, sw.ct_name, sw.ct_why
@@ -2230,7 +2261,10 @@ def main():
         print("扫描模式: %r（闭环/锁定行另列；其余行排除）" % sweep_mode)
     print("识别指标 %d 个:" % len(items))
     for it in items:
-        print("    [%-12s] %-18s %-7s <- 列 %s" % (it.cat, it.label, it.unit, it.src))
+        # src 为空 ＝ 模板里没有这一列，值是逐行从表尾杂散清单里挑的
+        print("    [%-12s] %-18s %-7s %s"
+              % (it.cat, it.label, it.unit,
+                 ("<- 列 %s" % it.src) if it.src else "<- 表尾杂散清单（逐行挑）"))
     if dropped:
         print("  跳过的空列 %d 个: %s" % (len(dropped), ", ".join(k for k, _ in dropped)))
     print("分组 %d 组:" % len(groups))

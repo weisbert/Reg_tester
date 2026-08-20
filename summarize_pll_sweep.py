@@ -857,6 +857,10 @@ def main():
     ap.add_argument("--lock-pattern", default=r"_lock$",
                     help="该列匹配这个正则的行 = 一次重锁（默认 _lock$）")
     ap.add_argument("--temp-col", default=None, help="温度列（默认自动找含 Temperature 的列）")
+    ap.add_argument("--spur-add", default="",
+                    help="除了模板声明的频点，再报这几个杂散分量（MHz，逗号分隔，"
+                         "如 2,4,6,20）：模板里没有这几列，值只从表尾杂散清单里挑，"
+                         "某一行没搜到就留空")
     ap.add_argument("--spur-tol", type=float, default=2.0,
                     help="杂散取值窗口 ±MHz（默认 2）：真实杂散不落在标称频点上，"
                          "从表尾的杂散清单里在标称频点这个窗口内取幅度最大的一条。"
@@ -893,7 +897,10 @@ def main():
                         leg_col=args.leg_col, lock_pattern=args.lock_pattern,
                         temp_col=args.temp_col, keep_test_item=args.keep_test_item,
                         keep_mode=args.keep_mode, keep_original=True,
-                        spur_tol=args.spur_tol)
+                        spur_tol=args.spur_tol,
+                        spur_targets=[float(x) for x in
+                                      args.spur_add.replace("，", ",").split(",")
+                                      if x.strip()])
     except SweepError as e:
         sys.exit(str(e))
 
@@ -919,7 +926,9 @@ def main():
         print(f"主模式  : {keep_mode!r}（+ 重锁行；其余行排除）")
     print(f"识别指标 {len(items)} 个:")
     for it in items:
-        print(f"    [{it.cat:<12}] {it.label:<18} {it.unit:<7} <- 列 {it.src}"
+        # src 为空 ＝ 模板里没有这一列，值是逐行从表尾杂散清单里挑的
+        print(f"    [{it.cat:<12}] {it.label:<18} {it.unit:<7} "
+              + (f"<- 列 {it.src}" if it.src else "<- 表尾杂散清单（逐行挑）")
               + ("   ⚠ 原始列是文本型数字，引用已加双负号转数值" if it.text_src else ""))
     txts = [it.src for it in items if it.text_src]
     if txts:

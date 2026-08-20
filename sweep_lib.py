@@ -259,39 +259,154 @@ def spur_picker(pairs, target, tol):
     return pick
 
 
-def attach_spur_list(cols, rows, items, tol=2.0):
-    """把 Spur@<标称> 那几行的取值改成"从尾部杂散清单里挑"。
+def spur_windows(targets, tol):
+    """每个标称偏移各自的窗口半宽 {标称: 半宽}。
 
-    标称频点仍然从模板的 `OtherSpurFreq<i>` 来（那是这份测试要看哪几个频点的声明），
-    只是**值**不再读它旁边那一格。找不到清单就什么都不做，退回原来的行为。
+    ★★ 默认就是 tol，但**两个标称频点的窗口不许重叠**：2/4/6 MHz 这种彼此只差
+      2 MHz 的分量，用默认 ±2 会让同一条杂散**同时落进相邻两行**——两行报同一个
+      数，而且从表上一点看不出来。相邻间距 d 时半宽最多 0.45d
+      （留一点缝，正好落在两者中间的那条谁也不进，宁可漏报不要重报）。
+    ★ 只收窄不放宽：26/52 这种间距大的照旧 ±tol —— 老簿子的数一格都不动。
+    """
+    ts = sorted({float(t) for t in targets if t is not None})
+    out = {}
+    for i, t in enumerate(ts):
+        gaps = ([t - ts[i - 1]] if i else []) + \
+               ([ts[i + 1] - t] if i + 1 < len(ts) else [])
+        out[t] = min([tol] + [g * 0.45 for g in gaps])
+    return out
+
+
+def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
+    """把 Spur@<标称> 那几行的取值改成"从尾部杂散清单里挑"，并按需要**加几行**。
+
+    标称频点有两个来源：
+      ① 模板的 `OtherSpurFreq<i>`（这份测试原本声明要看哪几个，真数据是 26/52）；
+      ② `targets`＝额外要报的分量（2/4/6/20…）。**模板里根本没有这几列**，
+         但它们在仪器搜出来的清单里，所以照样报得出来：给每个标称建一行，
+         逐行在窗口里挑最大的那一条。
+    ★★ 某一行清单里没有这个分量，那一格就**留空**——不是 0、也不是噪底。
+      "有些行只有 2M、有些只有 4M、有些两个都有"就是这么落到表上的。
+    找不到清单就什么都不做，退回原来的行为。
+
+    返回 (why, notes)：why＝认不出清单时卡在哪一条；notes＝要打给人看的几句
+    （窗口被收窄了 / 清单里还有哪些偏移没人认领）。
     """
     pairs, why = find_spur_list(cols.header, rows)
     if not pairs:
-        return why
+        return why, []
     from openpyxl.utils import get_column_letter as gl
     where = f"{gl(pairs[0][0] + 1)}..{gl(pairs[-1][1] + 1)}（{len(pairs)} 对）"
+
+    # ① 模板声明的标称频点（每个对应一个已经建好的 Spur@ 行）
+    declared = OrderedDict()
     for it in items:
         if not it.label.startswith("Spur@"):
             continue
-        fc = cols.idx(it.src.replace("Result", "Freq"))
+        fc = cols.idx(it.src.replace("Result", "Freq")) if it.src else None
         if fc is None:
             continue
         tgts = {num(r[fc]) for r in rows if fc < len(r) and num(r[fc]) is not None}
         if len(tgts) != 1:
             continue                    # 标称频点在这份簿里不唯一，不动它
-        t = tgts.pop()
-        it.pick = spur_picker(pairs, t, tol)
-        it.pick_note = f"杂散清单 {where} 里 {fmt_num(t)}±{fmt_num(tol)} MHz 内最大的一条"
+        declared[it] = tgts.pop()
+
+    extra = sorted({float(t) for t in (targets or ()) if t is not None})
+    wins = spur_windows(list(declared.values()) + extra, tol)
+
+    def attach(it, t):
+        it.pick = spur_picker(pairs, t, wins[t])
+        it.pick_note = (f"杂散清单 {where} 里 {fmt_num(t)}±{fmt_num(wins[t], 2)} MHz "
+                        f"内最大的一条")
         # 实测偏移落在哪儿 —— 报表备注要写它（"你这 26M 是在哪测的"）。
         # 在这里算是因为两个读取层都调这个函数，算一次两边都有。
         offs = [num(r[c - 1]) for r in rows for c in (it.pick(r),)
                 if c is not None and c - 1 < len(r)]
-        it.pick_stats = {"target": t, "tol": tol, "off": median(offs), "n": len(offs)}
+        it.pick_stats = {"target": t, "tol": wins[t], "off": median(offs),
+                         "n": len(offs)}
         # 文本型数字要重判：现在读的是清单那几列，不是原来那一格
         it.text_src = any(
             isinstance(r[c], str) and num(r[c]) is not None
             for r in rows for c in (it.pick(r),) if c is not None and c < len(r))
-    return ""
+
+    for it, t in declared.items():
+        attach(it, t)
+
+    # ② 模板里没有的分量：新建一行。col 给一个**超出表宽**的合成号——
+    #    它只当 vals/src 的键用（不是真列），取值走 pick，引用走 row.src 里
+    #    记下的那个真格子。★ 合成号必须超出表宽：负数会被 raw[-1] 绕回最后一列，
+    #    而 `it.col < len(raw)` 这种判据在别处到处都是。
+    nxt = max([len(cols.header)] + [len(r) for r in rows]
+              + [it.col + 1 for it in items])
+    for t in extra:
+        if any(abs(t - d) <= wins[t] for d in declared.values()):
+            continue                    # 模板已经声明过这个频点，别报两遍
+        nxt += 1
+        # 用现有 item 的类来建：两个读取层各有一份 Item（同形不同类），
+        # 这里写死哪一个都会在另一边埋一颗雷。
+        it = type(items[0])("Spur", f"Spur@{fmt_hz(t)}", "dBc", nxt, "")
+        attach(it, t)
+        items.append(it)
+
+    # ★ Spur@ 那一族按频点排好再交出去：模板声明的（26/52）和加出来的
+    #   （2/4/6/20）本来一前一后，不排就是 26 → 52 → 2 → 20。频点跳着走的表，
+    #   评审第一句就是"这表怎么回事"。整族原地重排，别的行一个都不动。
+    sp = [i for i, it in enumerate(items) if it.label.startswith("Spur@")]
+    if sp:
+        block = sorted((items[i] for i in sp),
+                       key=lambda it: (it.pick_stats or {}).get("target", 1e9))
+        rest = [it for i, it in enumerate(items) if i not in set(sp)]
+        items[:] = rest[:sp[0]] + block + rest[sp[0]:]
+
+    notes = []
+    narrowed = [t for t in wins if wins[t] < tol - 1e-9]
+    if narrowed:
+        notes.append("杂散窗口：%s MHz 这几个彼此挨得近，窗口各自收到 ±%s"
+                     "（不收的话同一条杂散会同时进相邻两行）"
+                     % ("/".join(str(fmt_num(t)) for t in sorted(narrowed)),
+                        fmt_num(min(wins[t] for t in narrowed), 2)))
+    # ★ 反方向也要说：清单里有、却没有任何标称频点收走的偏移。
+    #   不说的话，"我要的那个分量到底在不在这份数据里"只能靠猜。
+    claimed = [(t, w) for t, w in wins.items()]
+    loose = {}
+    for r in rows:
+        for fc, lc in pairs:
+            f = num(r[fc]) if fc < len(r) else None
+            v = num(r[lc]) if lc < len(r) else None
+            if f is None or v is None:
+                continue
+            a = abs(f)
+            if any(abs(a - t) <= w for t, w in claimed):
+                continue
+            k = round(a, 1)
+            loose[k] = loose.get(k, 0) + 1
+    if loose:
+        top = sorted(loose.items(), key=lambda kv: -kv[1])[:8]
+        notes.append("清单里还有这些偏移没被任何标称频点收走（要报的话加进 "
+                     "spur_targets）: "
+                     + "，".join("%s MHz×%d 行" % (fmt_num(k), n) for k, n in top)
+                     + ("，…共 %d 种" % len(loose) if len(loose) > 8 else ""))
+    return "", notes
+
+
+def drop_empty_picks(items, rows, dropped):
+    """一个数都没挑到的**加出来的**杂散行不进表：整行空白不是信息，是噪声。
+
+    ★ 只丢 targets 加出来的（`src` 为空那种）。模板声明的那几行照旧留着——
+      它们本来就在这份测试的口径里，空着也是结论（"这次没搜到"），
+      而且动它就等于动老簿子的行为。
+    ★★ 丢了必须**报出来**："我要的 20M 呢"的答案就在那一句里。
+    """
+    keep, gone = [], []
+    for it in items:
+        if it.src or it.pick is None or \
+                any(r.vals.get(it.col) is not None for r in rows):
+            keep.append(it)
+        else:
+            gone.append(it)
+            dropped.append((it.label, "清单里这个偏移一条都没有"))
+    items[:] = keep
+    return gone
 
 
 def build_items(cols, rows):
@@ -578,7 +693,7 @@ def read_values(path, sheet=None):
 def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                lock_pattern=r"_lock$", temp_col=None,
                keep_test_item=None, keep_mode=None, keep_original=True,
-               spur_tol=2.0):
+               spur_tol=2.0, spur_targets=()):
     """把一份扫描簿读成 Sweep（行已过滤、段已切好、指标已识别）。
 
     keep_original=True 时额外用 data_only=False 再读一遍工作簿并挂在 .wb 上，
@@ -653,7 +768,8 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
         raise SweepError("没识别出任何有数据的结果列")
     # ★ 杂散：模板固定频点那一格量到的常常是噪底，真值在表尾的杂散清单里。
     #   认不出清单就退回原来的行为，并把卡在哪一条说出来。
-    spur_why = attach_spur_list(cols, [r.raw for r in rows], items, tol=spur_tol)
+    spur_why, spur_extra = attach_spur_list(cols, [r.raw for r in rows], items,
+                                            tol=spur_tol, targets=spur_targets)
     for r in rows:
         for it in items:
             if it.pick is not None:
@@ -664,6 +780,8 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                     else None
             else:
                 r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+    # 一条都没挑到的**加出来的**杂散行不进表，但要报出来（见 drop_empty_picks）
+    spur_gone = drop_empty_picks(items, rows, dropped)
     # 换了取值口径就得报出来差多少：这一改动的全部意义就在那个差值上，
     # 不打出来没人知道它真的生效了、也没法判断窗口开得合不合适。
     spur_notes = []
@@ -676,12 +794,27 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
         it.pick_stats.update(new=median(new), old=median(old) if old else None)
         offs = it.pick_stats.get("off")
         d = (median(new) - median(old)) if (new and old) else None
+        if not it.src:
+            # 模板里压根没有这个频点：没有"原来那一格"可比，只报取自哪儿、命中几行
+            spur_notes.append(
+                f"{it.label}: 模板没有这个频点，只从清单取（"
+                f"{fmt_num(it.pick_stats['target'])}±"
+                f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内最大的一条，实测偏移中位 "
+                f"{fmt_num(offs)} MHz），中位 {fmt_num(median(new), 2)} dBc；"
+                f"{len(new)}/{len(rows)} 行命中，其余行留空")
+            continue
         spur_notes.append(
             f"{it.label}: 取清单里 {fmt_num(offs)} MHz 那条，中位 "
             f"{fmt_num(median(new), 2)} dBc（{it.src} 那一格中位 "
             f"{fmt_num(median(old), 2) if old else '空'}"
             + (f"，差 {d:+.2f} dB）" if d is not None else "）")
             + f"；{len(new)}/{len(rows)} 行命中")
+    for it in spur_gone:
+        spur_notes.append(
+            f"{it.label}: 清单里 {fmt_num(it.pick_stats['target'])}±"
+            f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内**一条都没有**"
+            f"（0/{len(rows)} 行），这份不进表")
+    spur_notes += spur_extra
     if spur_why:
         spur_notes.append(f"没认出表尾的杂散清单（{spur_why}），"
                           f"Spur 仍按模板固定频点那一格取")
@@ -691,13 +824,16 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
     #   追加页脚/图例行（条件列全空），那种排掉是对的；但旁路自检行是**带部分
     #   结果值**的，把它算进相邻那一段会把段的走向和极值带偏。两者只看行号
     #   分不出来，得看它带不带结果。
+    # 分母只数**表上真有那一列**的指标：杂散清单加出来的行没有自己的列
+    #   （值是逐行从清单里挑的），把它们算进分母会让"4/16"莫名其妙变成"4/20"。
+    n_sheet = sum(1 for it in items if it.src)
     for xl, why, raw in cut:
         k = sum(1 for it in items
                 if it.col < len(raw) and num(raw[it.col]) is not None)
         # 带 4/16 跟带 16/16 是两件事：前者是配置行顺手回读了几个量，
         # 后者是**另一个配置下的一整套测量**（比如关掉 test mux 再测一遍）。
         # 只打绝对个数分不出来，分母必须给。
-        excluded.append((xl, why + (f"（这行带 {k}/{len(items)} 个结果值）" if k else
+        excluded.append((xl, why + (f"（这行带 {k}/{n_sheet} 个结果值）" if k else
                                     "（这行没有任何结果值）")))
 
     # 没有任何结果值的行（纯配置行）也踢掉
