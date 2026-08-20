@@ -72,7 +72,7 @@ import re
 import sys
 from collections import OrderedDict
 
-from sweep_lib import attach_spur_list, drop_empty_picks, read_values
+from sweep_lib import attach_spur_list, read_values, spur_off_warn
 from xlsx_formula_cache import Formula, FormulaCache
 
 try:
@@ -791,14 +791,21 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
     rows = []
 
     def add(cat, item, unit, direction, fn, fml=None, kind="result", note="",
-            key=False, rid=None):
+            key=False, rid=None, always=False):
+        """算不出来的行默认不出（派生量算不出来就是没有）。
+
+        ★ `always=True` 是给**人点名要的**行留的口子：`spur_targets` 里配的频点
+          即使一个温度都没搜到，那一行也得在表上留空——不然同一份簿子里
+          两个模块的表行集合不一样，横着没法比，看着还像 bug。
+          （用户原话：「没有的就留空」。）
+        """
         vals = {}
         for t in temps:
             try:
                 vals[t] = fn(t)
             except Exception:
                 vals[t] = None
-        if any(v is not None for v in vals.values()):
+        if always or any(v is not None for v in vals.values()):
             rows.append({"cat": cat, "item": item, "unit": unit, "dir": direction,
                          "kind": kind, "vals": vals, "note": note, "key": key,
                          "id": rid, "fml": fml})
@@ -1135,7 +1142,9 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
 
             add(cat, it.label, it.unit, "≤" if d == "max" else "≥",
                 at_op, fml=at_op_f,
-                note="Vtune 扫里 %s 那一点的实测值" % _V(_op))
+                note="Vtune 扫里 %s 那一点的实测值" % _V(_op),
+                # 人点名要的杂散频点：一条都没搜到也留一行空的（见 add 的说明）
+                always=not getattr(it, "has_cell", True))
     return rows, temps
 
 
@@ -2046,26 +2055,31 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
                 r.vals[it.col] = num(r.raw[pc]) if ok else None
             else:
                 r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
-    # 一条都没挑到的**加出来的**杂散行不进表，但要报出来
-    spur_gone = drop_empty_picks(items, rows + locked + others, dropped)
     if spur_why:
+        # ★ 配的那几个频点没有值，但行还在（见 attach_spur_list）——
+        #   spur_extra 里那句会说清为什么空
         spur_notes = ["没认出表尾的杂散清单（%s），Spur 仍按模板固定频点那一格取"
-                      % spur_why]
+                      % spur_why] + spur_extra
     else:
         spur_notes = []
         for it in items:
             if not it.pick_note:
                 continue
             n_hit = sum(1 for r in rows if r.vals.get(it.col) is not None)
+            if not n_hit and not it.has_cell:
+                spur_notes.append("%s: 清单里 %s±%s MHz 内**一条都没有**"
+                                  "（0/%d 行）——表上这一行留空"
+                                  % (it.label, fmt_num(it.pick_stats["target"]),
+                                     fmt_num(it.pick_stats["tol"], 2), len(rows)))
+                continue
             spur_notes.append("%s 改从%s取（%d/%d 行命中%s）"
                               % (it.label, it.pick_note, n_hit, len(rows),
                                  "；模板里没有这个频点，其余行留空"
                                  if not it.has_cell else ""))
-        for it in spur_gone:
-            spur_notes.append("%s: 清单里 %s±%s MHz 内**一条都没有**（0/%d 行），"
-                              "这份不进表"
-                              % (it.label, fmt_num(it.pick_stats["target"]),
-                                 fmt_num(it.pick_stats["tol"], 2), len(rows)))
+        for it in items:
+            _w = spur_off_warn(it)
+            if _w:
+                spur_notes.append("⚠ " + _w)
         spur_notes += spur_extra
 
     # ★ 被过滤掉的行到底有没有带测量结果，必须说出来（同 sweep_lib.load_sweep）。

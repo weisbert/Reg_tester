@@ -275,22 +275,52 @@ def spur_picker(pairs, target, tol):
     return pick
 
 
-def spur_windows(targets, tol):
-    """每个标称偏移各自的窗口半宽 {标称: 半宽}。
+# 窗口不许超过标称频点自身的这个比例（见 spur_windows 第 ③ 条）
+SPUR_REL_TOL = 0.25
 
-    ★★ 默认就是 tol，但**两个标称频点的窗口不许重叠**：2/4/6 MHz 这种彼此只差
-      2 MHz 的分量，用默认 ±2 会让同一条杂散**同时落进相邻两行**——两行报同一个
-      数，而且从表上一点看不出来。相邻间距 d 时半宽最多 0.45d
-      （留一点缝，正好落在两者中间的那条谁也不进，宁可漏报不要重报）。
-    ★ 只收窄不放宽：26/52 这种间距大的照旧 ±tol —— 老簿子的数一格都不动。
+
+def spur_windows(targets, tol):
+    """每个标称偏移各自的窗口半宽 {标称: 半宽}。三条取最小：
+
+    ① `tol`（默认 ±2 MHz，是从 26/52 那两个频点来的老默认值）。
+    ② **两个标称频点的窗口不许重叠**：2/4/6 这种彼此只差 2 MHz 的分量，用 ±2
+      会让同一条杂散**同时落进相邻两行**——两行报同一个数，表上一点看不出来。
+      相邻间距 d 时半宽最多 0.45d（留一点缝，正好落在中间的那条谁也不进）。
+    ③ ★★**不许伸到标称自身的 25% 之外**。②只挡得住"另一个标称频点"，挡不住
+      "清单里真有、但你没配"的那一条：只配 `[4, 20]` 时，`Spur@4MHz` 用 ±2 会把
+      **2.006 MHz 那条**捞进来（|2.006−4|<2）——这一行报的根本不是 4M，
+      **取了别人的数，还挂着 4M 的名字**。按标称成比例收之后 4M 窗口是 ±1，
+      够容下 4.011 那种偏差，又够把 2.006 挡在外面。
+    ★ 三条都只收窄不放宽：26/52（0.25×26=6.5、0.25×52=13 都大于 tol）照旧 ±tol
+      —— 老簿子的数一格不动。
+    ★ 宁可漏报不要错报：窗口收紧顶多让某一行"0/N 行命中"，那句控制台会打；
+      而报错一条只在备注的"实测偏移"上留一行痕，很容易滑过去。
     """
     ts = sorted({float(t) for t in targets if t is not None})
     out = {}
     for i, t in enumerate(ts):
         gaps = ([t - ts[i - 1]] if i else []) + \
                ([ts[i + 1] - t] if i + 1 < len(ts) else [])
-        out[t] = min([tol] + [g * 0.45 for g in gaps])
+        out[t] = min([tol, abs(t) * SPUR_REL_TOL] + [g * 0.45 for g in gaps])
     return out
+
+
+def spur_off_warn(it):
+    """取到的那条离标称有多远——远到半个窗口以外就喊一句。
+
+    ★ 窗口收紧之后这种事应该很少，但"我叫它 4M、它其实是别的那条"这个错
+      **只在备注的实测偏移上留一行痕**，不主动喊就会被当成 4M 的数发出去。
+    """
+    st = it.pick_stats or {}
+    t, off, w = st.get("target"), st.get("off"), st.get("tol")
+    if t is None or off is None or not w:
+        return ""
+    if abs(abs(off) - t) <= w * 0.5:
+        return ""
+    return ("%s: 取到的那条在 %s MHz，离标称 %s 有 %s MHz——确认这是不是你要的"
+            "那个分量（窗口现在是 ±%s，要更严就调 --spur-tol）"
+            % (it.label, fmt_num(off), fmt_num(t), fmt_num(abs(abs(off) - t), 2),
+               fmt_num(w, 2)))
 
 
 def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
@@ -308,11 +338,13 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
     返回 (why, notes)：why＝认不出清单时卡在哪一条；notes＝要打给人看的几句
     （窗口被收窄了 / 清单里还有哪些偏移没人认领）。
     """
-    pairs, why = find_spur_list(cols.header, rows)
-    if not pairs:
-        return why, []
     from openpyxl.utils import get_column_letter as gl
-    where = f"{gl(pairs[0][0] + 1)}..{gl(pairs[-1][1] + 1)}（{len(pairs)} 对）"
+    pairs, why = find_spur_list(cols.header, rows)
+    # ★★ 认不出清单也照样把 targets 那几行建出来（只是没有值）：两个模块的表
+    #   要能横着比，行集合就得一样。少一行看着像 bug，空一行至少能问"为什么空"
+    #   ——而"为什么空"控制台正好写着。
+    where = (f"{gl(pairs[0][0] + 1)}..{gl(pairs[-1][1] + 1)}（{len(pairs)} 对）"
+             if pairs else "")
 
     # ① 模板声明的标称频点（每个对应一个已经建好的 Spur@ 行）
     declared = OrderedDict()
@@ -345,8 +377,9 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
             isinstance(r[c], str) and num(r[c]) is not None
             for r in rows for c in (it.pick(r),) if c is not None and c < len(r))
 
-    for it, t in declared.items():
-        attach(it, t)
+    if pairs:
+        for it, t in declared.items():
+            attach(it, t)
 
     # ② 模板里没有的分量：新建一行。col 给一个**超出表宽**的合成号——
     #    它只当 vals/src 的键用（不是真列），取值走 pick，引用走 row.src 里
@@ -361,7 +394,12 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
         # 用现有 item 的类来建：两个读取层各有一份 Item（同形不同类），
         # 这里写死哪一个都会在另一边埋一颗雷。
         it = type(items[0])("Spur", f"Spur@{fmt_hz(t)}", "dBc", nxt, "")
-        attach(it, t)
+        if pairs:
+            attach(it, t)
+        else:
+            # 没有清单就没有值，但这一行照样存在（pick_stats 留着，
+            # 备注和控制台才说得出"标称多少、为什么空"）
+            it.pick_stats = {"target": t, "tol": wins[t], "off": None, "n": 0}
         items.append(it)
 
     # ★ Spur@ 那一族按频点排好再交出去：模板声明的（26/52）和加出来的
@@ -375,6 +413,12 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
         items[:] = rest[:sp[0]] + block + rest[sp[0]:]
 
     notes = []
+    if not pairs:
+        if extra:
+            notes.append("认不出表尾的杂散清单，配的 %s MHz 这几行只能**整列留空**"
+                         "（模板声明的那几个还能退回模板那一格）"
+                         % "/".join(str(fmt_num(t)) for t in extra))
+        return why, notes
     narrowed = [t for t in wins if wins[t] < tol - 1e-9]
     if narrowed:
         notes.append("杂散窗口：%s MHz 这几个彼此挨得近，窗口各自收到 ±%s"
@@ -403,26 +447,6 @@ def attach_spur_list(cols, rows, items, tol=2.0, targets=()):
                      + "，".join("%s MHz×%d 行" % (fmt_num(k), n) for k, n in top)
                      + ("，…共 %d 种" % len(loose) if len(loose) > 8 else ""))
     return "", notes
-
-
-def drop_empty_picks(items, rows, dropped):
-    """一个数都没挑到的**加出来的**杂散行不进表：整行空白不是信息，是噪声。
-
-    ★ 只丢 targets 加出来的（`src` 为空那种）。模板声明的那几行照旧留着——
-      它们本来就在这份测试的口径里，空着也是结论（"这次没搜到"），
-      而且动它就等于动老簿子的行为。
-    ★★ 丢了必须**报出来**："我要的 20M 呢"的答案就在那一句里。
-    """
-    keep, gone = [], []
-    for it in items:
-        if it.has_cell or it.pick is None or \
-                any(r.vals.get(it.col) is not None for r in rows):
-            keep.append(it)
-        else:
-            gone.append(it)
-            dropped.append((it.label, "清单里这个偏移一条都没有"))
-    items[:] = keep
-    return gone
 
 
 def build_items(cols, rows):
@@ -796,8 +820,6 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                     else None
             else:
                 r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
-    # 一条都没挑到的**加出来的**杂散行不进表，但要报出来（见 drop_empty_picks）
-    spur_gone = drop_empty_picks(items, rows, dropped)
     # 换了取值口径就得报出来差多少：这一改动的全部意义就在那个差值上，
     # 不打出来没人知道它真的生效了、也没法判断窗口开得合不合适。
     spur_notes = []
@@ -812,6 +834,14 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
         d = (median(new) - median(old)) if (new and old) else None
         if not it.has_cell:
             # 模板里压根没有这个频点：没有"原来那一格"可比，只报取自哪儿、命中几行
+            # ★ 一条都没搜到也**保留这一行**（用户原话「没有的就留空」）：
+            #   两个模块的表行集合一样才横着比得了。
+            if not new:
+                spur_notes.append(
+                    f"{it.label}: 清单里 {fmt_num(it.pick_stats['target'])}±"
+                    f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内**一条都没有**"
+                    f"（0/{len(rows)} 行）——表上这一行留空")
+                continue
             spur_notes.append(
                 f"{it.label}: 模板没有这个频点，只从清单取（"
                 f"{fmt_num(it.pick_stats['target'])}±"
@@ -825,11 +855,10 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
             f"{fmt_num(median(old), 2) if old else '空'}"
             + (f"，差 {d:+.2f} dB）" if d is not None else "）")
             + f"；{len(new)}/{len(rows)} 行命中")
-    for it in spur_gone:
-        spur_notes.append(
-            f"{it.label}: 清单里 {fmt_num(it.pick_stats['target'])}±"
-            f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内**一条都没有**"
-            f"（0/{len(rows)} 行），这份不进表")
+    for it in items:
+        _w = spur_off_warn(it)
+        if _w:
+            spur_notes.append("⚠ " + _w)
     spur_notes += spur_extra
     if spur_why:
         spur_notes.append(f"没认出表尾的杂散清单（{spur_why}），"

@@ -744,8 +744,13 @@ def spur_note(data_or_sw, label):
         o = it.pick_stats.get("off")
         if o is not None and fmt_num(o) not in offs:
             offs.append(fmt_num(o))
-    if not offs or tgt is None:
+    if tgt is None:
         return ""
+    if not offs:
+        # ★ 配了这个频点、却一条都没搜到：备注必须写出来。
+        #   正表上一行空白不写原因，评审只会问"这行怎么回事"。
+        return (f"标称 {fmt_num(tgt)} MHz：清单里 ±{fmt_num(tol)} MHz 内"
+                f"没搜到（各片都没有，所以这一行是空的）")
     return (f"实测偏移 {' / '.join(str(x) for x in offs)} MHz"
             f"（标称 {fmt_num(tgt)}，取 ±{fmt_num(tol)} MHz 内最大的一条）")
 
@@ -2526,6 +2531,37 @@ def load_config(root, path=None):
     return cfg, p
 
 
+def targets_from_cfg(v, mod):
+    """`spur_targets` → 这个模块要报哪几个频点。
+
+    两种写法：
+      [2, 4, 6, 20]                      所有模块一样
+      {"模块A": [2,4,6,20], "模块B": [1,10], "*": [20]}   按模块分开，`*` 是缺省
+    ★ 为什么要按模块分：两个模块的时钟规划不一样（分频比都差 4 倍），
+      该看哪几个分量本来就可能不同。把一份清单硬套给两边，
+      表上会多出一堆"整行没搜到"的空行，或者少报真正该看的那个。
+    """
+    if not v:
+        return []
+    if isinstance(v, dict):
+        for k in (mod, "*"):
+            if k in v:
+                return [float(x) for x in (v[k] or [])]
+        return []
+    return [float(x) for x in v]
+
+
+def unknown_target_mods(v, modules):
+    """配置里写了、但一个模块都对不上的那几个键。
+
+    ★ 配置会过期、会打错：模块名是从**文件名前缀**认出来的，改个文件名它就变了。
+      写错的那个键会**一声不响地什么都不报**——这条线上所有静默错值都是这么来的。
+    """
+    if not isinstance(v, dict):
+        return []
+    return [k for k in v if k != "*" and k not in set(modules)]
+
+
 def scale_from_cfg(m):
     """配置里的 {"模块:类型": 倍数} -> parse_scale 那套三元组。"""
     out = []
@@ -3033,8 +3069,9 @@ def main():
 
     ref_temp = float(pick_opt(args.ref_temp, "ref_temp", 25.0))
     spur_tol = float(pick_opt(args.spur_tol, "spur_tol", 2.0))
-    spur_tg = [float(x) for x in args.spur_add.replace("，", ",").split(",")
-               if x.strip()] or [float(x) for x in (cfg.get("spur_targets") or [])]
+    # 命令行给的是一张清单（所有模块通用）；配置里可以按模块分开写
+    spur_cfg = [float(x) for x in args.spur_add.replace("，", ",").split(",")
+                if x.strip()] or cfg.get("spur_targets") or []
     op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
     dsb = bool(pick_opt(args.dsb, "dsb", False))
     chart_w = float(pick_opt(args.chart_w, "chart_w", CHART_W_CM))
@@ -3131,18 +3168,38 @@ def main():
     else:
         print()
         print("折算规则: 没有（相噪/杂散/频率按实测频点报）")
-    if spur_tg:
+    def spur_of(mod):
+        return targets_from_cfg(spur_cfg, mod)
+
+    bad_mods = unknown_target_mods(spur_cfg, modules)
+    if bad_mods:
+        print(f"  ⚠⚠ spur_targets 里这几个键一个模块都对不上: {', '.join(bad_mods)}"
+              f" —— 认出来的模块是 {', '.join(modules)}"
+              f"（模块名＝文件名里 PLL/VCO/Current 前面那一截，改过文件名就会变）。"
+              f"写错的键**什么都不会报**，这几个频点就这么没了")
+    if spur_cfg:
         # ★ 跟折算规则一样：报哪几个频点、从哪儿来的，第一屏就得看得见。
         # ★★ 措辞要说清"它们是同一种东西"：所有 Spur@ 行都从表尾同一段清单、
         #   用同一个规则取值。配置里只需要写**模板没声明的那几个**，
         #   因为模板声明的每份簿子自己带着（写重了自动去重，写全也行）。
         #   第一版这句写的是"杂散加报"，用户当场问"26M/52M 不也是 spur 吗，
         #   为什么不在一个列表里"——名字暗示了两类东西，就一定会被这么读。
-        print("杂散频点: " + "/".join(str(fmt_num(t)) for t in sorted(spur_tg))
-              + " MHz + 每份簿子在模板里自己声明的那几个"
-              + "（同一段清单、同一个取法；两边写重了自动去重）"
-              + ("" if args.spur_add else
-                 f"   ←{os.path.basename(cfg_path or CONFIG_NAME)}"))
+        src = ("" if args.spur_add else
+               f"   ←{os.path.basename(cfg_path or CONFIG_NAME)}")
+        tail = ("每份簿子在模板里自己声明的那几个也照旧带着"
+                "（同一段清单、同一个取法；两边写重了自动去重）")
+        if isinstance(spur_cfg, dict):
+            print("杂散频点（按模块）:" + src)
+            for mod in modules:
+                got = spur_of(mod)
+                print("  %-8s %s" % (mod, ("/".join(str(fmt_num(t)) for t in
+                                                    sorted(got)) + " MHz")
+                                     if got else "只报模板声明的那几个"))
+            print("  " + tail)
+        else:
+            print("杂散频点: "
+                  + "/".join(str(fmt_num(t)) for t in sorted(spur_of("")))
+                  + " MHz + " + tail + src)
     # 耗时分解：慢在读、慢在排版、还是慢在存盘——不量就只能猜
     T = {"t0": time.perf_counter()}
     for mod in modules:
@@ -3165,7 +3222,7 @@ def main():
                 sw = load_sweep(b.path, leg_col=args.leg_col,
                                 lock_pattern=args.lock_pattern,
                                 temp_col=args.temp_col, keep_original=False,
-                                spur_tol=spur_tol, spur_targets=spur_tg)
+                                spur_tol=spur_tol, spur_targets=spur_of(mod))
             except Exception as e:                    # noqa: B902
                 why = f"{type(e).__name__}: {e}{xlsx_shape(b.path)}"
                 failed.append((b, why))
@@ -3246,7 +3303,7 @@ def main():
             gc.collect()
             try:
                 sw = load_vco(b.path, temp_col=args.temp_col, keep_original=False,
-                              spur_tol=spur_tol, spur_targets=spur_tg)
+                              spur_tol=spur_tol, spur_targets=spur_of(mod))
             except Exception as e:                    # noqa: B902
                 why = f"{type(e).__name__}: {e}{xlsx_shape(b.path)}"
                 failed.append((b, why))
