@@ -806,6 +806,32 @@ def read_values(path, sheet=None):
     return title, rows, note
 
 
+def drop_empty_picks(items, rows, dropped):
+    """这份簿子里**一个数都没挑到**的加行不进表，但要报出来。
+
+    ★★ 两种"没有"要分清，用户逐条纠正过两轮：
+      · 某几行/某几片/某几个温度没搜到 → **留空**（那是数据本身的稀疏，
+        表上的空格子是结论的一部分）。这一条走不到这里——只要有一格有数，
+        item 就留着。
+      · 整张表（这个模块的全部芯片）一个数都没有 → **删掉这一行**。
+        RSMC 的 2/4/6/20 就是这种：四行全空「不太好看」，而且空一整行
+        说不出任何东西。跨芯片汇总的行是各片取并集，所以只要有一片有，
+        行就还在——这里按**单份簿子**丢是安全的。
+    ★ 只丢 `spur_targets` 加出来的（`has_cell` 为假那种）。模板声明的那几行
+      照旧留着：它们本来就在这份测试的口径里，空着也是结论。
+    ★★ 丢了必须**报出来**：「我要的 20M 呢」的答案就在那一句里。
+    """
+    keep, gone = [], []
+    for it in items:
+        if it.has_cell or any(r.vals.get(it.col) is not None for r in rows):
+            keep.append(it)
+        else:
+            gone.append(it)
+            dropped.append((it.label, "这份簿子里一条都没搜到"))
+    items[:] = keep
+    return gone
+
+
 def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                lock_pattern=r"_lock$", temp_col=None,
                keep_test_item=None, keep_mode=None, keep_original=True,
@@ -896,6 +922,7 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
                     else None
             else:
                 r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+    spur_gone = drop_empty_picks(items, rows, dropped)
     # 换了取值口径就得报出来差多少：这一改动的全部意义就在那个差值上，
     # 不打出来没人知道它真的生效了、也没法判断窗口开得合不合适。
     spur_notes = []
@@ -916,11 +943,6 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
             rangetxt = (f"<{fmt_num(band[1])} MHz 内" if band else
                         f"{fmt_num(it.pick_stats['target'])}±"
                         f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内")
-            if not new:
-                spur_notes.append(
-                    f"{it.label}: 清单里 {rangetxt}**一条都没有**"
-                    f"（0/{len(rows)} 行）——表上这一行留空")
-                continue
             spur_notes.append(
                 f"{it.label}: "
                 + (f"{rangetxt}的杂散只报**最大的那一条**（逐行各取各的），"
@@ -940,6 +962,14 @@ def load_sweep(path, sheet=None, header_row=1, leg_col="Mode",
         _w = spur_off_warn(it)
         if _w:
             spur_notes.append("⚠ " + _w)
+    for it in spur_gone:
+        _b = (it.pick_stats or {}).get("band")
+        spur_notes.append(
+            f"{it.label}: 清单里"
+            + (f" <{fmt_num(_b[1])} MHz 内" if _b else
+               f" {fmt_num(it.pick_stats['target'])}±"
+               f"{fmt_num(it.pick_stats['tol'], 2)} MHz 内")
+            + f"**一条都没有**（0/{len(rows)} 行），这份不进表")
     spur_notes += spur_extra
     if spur_why:
         spur_notes.append(f"没认出表尾的杂散清单（{spur_why}），"

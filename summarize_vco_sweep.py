@@ -72,7 +72,8 @@ import re
 import sys
 from collections import OrderedDict
 
-from sweep_lib import attach_spur_list, read_values, spur_off_warn
+from sweep_lib import (attach_spur_list, drop_empty_picks,
+                       read_values, spur_off_warn)
 from xlsx_formula_cache import Formula, FormulaCache
 
 try:
@@ -1142,9 +1143,7 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
 
             add(cat, it.label, it.unit, "≤" if d == "max" else "≥",
                 at_op, fml=at_op_f,
-                note="Vtune 扫里 %s 那一点的实测值" % _V(_op),
-                # 人点名要的杂散频点：一条都没搜到也留一行空的（见 add 的说明）
-                always=not getattr(it, "has_cell", True))
+                note="Vtune 扫里 %s 那一点的实测值" % _V(_op))
     return rows, temps
 
 
@@ -2055,9 +2054,8 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
                 r.vals[it.col] = num(r.raw[pc]) if ok else None
             else:
                 r.vals[it.col] = num(r.raw[it.col]) if it.col < len(r.raw) else None
+    spur_gone = drop_empty_picks(items, rows + locked + others, dropped)
     if spur_why:
-        # ★ 配的那几个频点没有值，但行还在（见 attach_spur_list）——
-        #   spur_extra 里那句会说清为什么空
         spur_notes = ["没认出表尾的杂散清单（%s），Spur 仍按模板固定频点那一格取"
                       % spur_why] + spur_extra
     else:
@@ -2066,17 +2064,6 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
             if not it.pick_note:
                 continue
             n_hit = sum(1 for r in rows if r.vals.get(it.col) is not None)
-            if not n_hit and not it.has_cell:
-                _b = it.pick_stats.get("band")
-                spur_notes.append("%s: 清单里 %s 内**一条都没有**"
-                                  "（0/%d 行）——表上这一行留空"
-                                  % (it.label,
-                                     ("<%s MHz" % fmt_num(_b[1])) if _b else
-                                     ("%s±%s MHz"
-                                      % (fmt_num(it.pick_stats["target"]),
-                                         fmt_num(it.pick_stats["tol"], 2))),
-                                     len(rows)))
-                continue
             spur_notes.append("%s 改从%s取（%d/%d 行命中%s）"
                               % (it.label, it.pick_note, n_hit, len(rows),
                                  "；模板里没有这个频点，其余行留空"
@@ -2085,6 +2072,16 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
             _w = spur_off_warn(it)
             if _w:
                 spur_notes.append("⚠ " + _w)
+        for it in spur_gone:
+            _b = (it.pick_stats or {}).get("band")
+            spur_notes.append("%s: 清单里 %s 内**一条都没有**（0/%d 行），"
+                              "这份不进表"
+                              % (it.label,
+                                 ("<%s MHz" % fmt_num(_b[1])) if _b else
+                                 ("%s±%s MHz"
+                                  % (fmt_num(it.pick_stats["target"]),
+                                     fmt_num(it.pick_stats["tol"], 2))),
+                                 len(rows)))
         spur_notes += spur_extra
 
     # ★ 被过滤掉的行到底有没有带测量结果，必须说出来（同 sweep_lib.load_sweep）。

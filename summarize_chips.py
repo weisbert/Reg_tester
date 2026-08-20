@@ -792,18 +792,15 @@ def spur_note(data_or_sw, label):
             offs.append(fmt_num(o))
     if tgt is None:
         return ""
-    rng = (f"<{fmt_num(tgt)} MHz 内" if band else
-           f"标称 {fmt_num(tgt)} MHz ±{fmt_num(tol)} MHz 内")
+    # ★ 备注要短：标称频点**行名里已经写着**（Spur@2MHz），这里只回答
+    #   "这个数是在哪儿量到的"。取法（窗口内最大 / 带内最大）各片各行都一样，
+    #   逐行重复一遍就是 40 行同样的话——那属于口径，不属于这一格。
     if not offs:
-        # ★ 配了这个频点、却一条都没搜到：备注必须写出来。
-        #   正表上一行空白不写原因，评审只会问"这行怎么回事"。
-        return f"{rng}没搜到（各片都没有，所以这一行是空的）"
+        return f"清单里没搜到（±{fmt_num(tol)} MHz 内）"
+    at = " / ".join(str(x) for x in offs)
     if band:
-        # 频带行：逐行取带内最大的那一条，所以"取自哪个偏移"逐行都可能不同
-        return (f"取 <{fmt_num(tgt)} MHz 内**最大的那一条**（逐行各取各的）；"
-                f"实测偏移 {' / '.join(str(x) for x in offs)} MHz")
-    return (f"实测偏移 {' / '.join(str(x) for x in offs)} MHz"
-            f"（标称 {fmt_num(tgt)}，取 ±{fmt_num(tol)} MHz 内最大的一条）")
+        return f"<{fmt_num(tgt)}M 内最大的一条，实测 {at} MHz"
+    return f"实测 {at} MHz"
 
 
 def temp_view(sw, item):
