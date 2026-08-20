@@ -45,7 +45,7 @@ import os
 import re
 import sys
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 from spec_book import SpecBook
 from summarize_vco_sweep import load_vco
@@ -308,13 +308,17 @@ def vprint(*a):
 # 带上正负号：合并成范围时 `差 +14.59~+21.46 dB` 才读得通
 # （把 + 留在文字段里会写出 `+14.59~21.46` 这种一半带号一半不带的东西）
 _NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+# 逗号段里同型的段重复到这个数 ＝ 它是一串清单（见 _Group.listy）
+LISTY_REPEAT = 3
 
 
 class _Group:
     """同一句话的一组（各芯片各一份）。只差数字的那几处合成 `min~max`。"""
-    __slots__ = ("text", "nums", "chips")
+    __slots__ = ("text", "nums", "chips", "raw", "raws")
 
     def __init__(self, line, chip):
+        self.raw = line                          # 原样留一份（清单型的句子要用）
+        self.raws = OrderedDict([(line, [chip])])
         self.text = _NUM_RE.split(line)          # 文字段（比数字段多一段）
         self.nums = [[x] for x in _NUM_RE.findall(line)]
         self.chips = [chip]
@@ -323,8 +327,26 @@ class _Group:
         for i, x in enumerate(_NUM_RE.findall(line)):
             if i < len(self.nums) and x not in self.nums[i]:
                 self.nums[i].append(x)
+        self.raws.setdefault(line, []).append(chip)
         if chip not in self.chips:
             self.chips.append(chip)
+
+    @property
+    def listy(self):
+        """这句是**一串清单**（各片列的是不同的东西），不是一句带测量值的话。
+
+        ★★ 判据是**结构**不是逗号个数：把每个逗号段抠掉数字，有 ≥3 段长得
+          一模一样（`# MHz×# 行` 重复了 8 遍）＝这是一串同型的项，各片列的是
+          不同的东西，按位置并成范围出来的 `31.9~83.7 MHz×44~52 行` 什么都不是。
+        ★ 反例（不能误判成清单）：`Spur@2MHz: 模板没有这个频点，只从清单取
+          （2±0.5 MHz 内…），中位 -80.97 dBc；38/53 行命中，其余行留空`——
+          逗号也有四个，但每一段的样子都不同，每个数字槽在各片之间是**同一个量**，
+          合成范围正是我们要的。第一版按逗号个数判，把它也当成清单，
+          于是三颗芯片各打一行（2026-08-20 在 mock 上当场看见）。
+        """
+        segs = [_NUM_RE.sub("#", x) for x in self.raw.split("，")]
+        rep_max = max(Counter(segs).values()) if segs else 0
+        return rep_max >= LISTY_REPEAT and any(len(x) > 1 for x in self.nums)
 
     def render(self):
         out = []
@@ -358,24 +380,41 @@ class Notes:
             ln = (ln or "").strip()
             if not ln:
                 continue
+            # ★★ 键里带上**冒号前那截原文**（行名），不能只按"抠掉数字的样子"归并：
+            #   各片报得出的杂散分量不一样，A 片的第 2 句是 Spur@4MHz、B 片的第 2 句
+            #   是 Spur@6MHz——只按位置对齐会并成一句 `Spur@4~6MHz`，那是**凭空
+            #   造出来的一行**。真数据上就是这么打出来的（2026-08-20）。
+            head = re.split(r"[:：]", ln, 1)[0]
             t = _NUM_RE.sub("#", ln)
-            k = (t, seen.get(t, 0))
-            seen[t] = seen.get(t, 0) + 1
+            k = (head, t, seen.get((head, t), 0))
+            seen[(head, t)] = seen.get((head, t), 0) + 1
             if k in self.g:
                 self.g[k].add(ln, chip)
             else:
                 self.g[k] = _Group(ln, chip)
 
+    def _tag(self, chips, n_all):
+        if n_all <= 1:
+            return ""
+        if len(chips) >= n_all:
+            return "（%d 片）" % len(chips)
+        return "（%s）" % "/".join(chips)
+
     def lines(self, n_all, indent="  "):
         out = []
         for g in self.g.values():
-            if n_all <= 1:
-                tag = ""
-            elif len(g.chips) >= n_all:
-                tag = "（%d 片）" % len(g.chips)
-            else:
-                tag = "（%s）" % "/".join(g.chips)
-            out.append(indent + g.render() + tag)
+            if g.listy:
+                # ★ 各片各打一行：只打一片等于把别片列的那些**丢了**，
+                #   而这句话的用处正是"还有哪些频点你没配"——丢一片就少一批。
+                for i, (raw, chips) in enumerate(g.raws.items()):
+                    if i >= 3:
+                        out.append(indent + "  …还有 %d 片各自的清单，见 -v"
+                                   % sum(len(c) for c in
+                                         list(g.raws.values())[3:]))
+                        break
+                    out.append(indent + raw + self._tag(chips, n_all))
+                continue
+            out.append(indent + g.render() + self._tag(g.chips, n_all))
         return out
 
     def flush(self, n_all, indent="  "):
