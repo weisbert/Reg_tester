@@ -879,8 +879,10 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
         return (max(s.values()) - min(s.values())) if len(s) >= 2 else None
 
     def steps(k, t):
+        """逐档 ΔF/Δ码，★带符号：CT 码加大频率是往上还是往下走，是要报的结论
+        本身（电容阵列接反、码序反了，都只在符号上露馅）。取绝对值会把它抹掉。"""
         g = _g(k, t)
-        return [abs(s[1]) for s in slopes(g, freq_item)] if (g and freq_item) else []
+        return [s[1] for s in slopes(g, freq_item)] if (g and freq_item) else []
 
     # ---- 条件行 ----
     def f_temp(t, R):
@@ -984,13 +986,14 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
         note="F(%s) − F(%s)，CT 码固定不动" % (_V(_vmax), _V(_vmin)))
     add("CT Band", "CT Band Step (avg)", "MHz/code", "",
         lambda t: (sum(steps("c", t)) / len(steps("c", t))) if steps("c", t) else None,
-        fml=lambda t, R: ('=IF(COUNT(%s)=0,"",ABS(AVERAGE(%s)))'
+        fml=lambda t, R: ('=IF(COUNT(%s)=0,"",AVERAGE(%s))'
                           % (srng("c", t), srng("c", t))) if srng("c", t) else None,
-        rid="step_avg", note="相邻两个码的频率差 |ΔF/ΔCT| 的平均")
+        rid="step_avg", note="相邻两个码的频率差 ΔF/ΔCT 的平均，带符号")
     add("CT Band", "CT Band Step (max)", "MHz/code", "≤",
-        lambda t: max(steps("c", t)) if steps("c", t) else None,
-        fml=lambda t, R: f_absmax(srng("c", t)) if srng("c", t) else None, rid="step_max",
-        note="相邻两个码的频率差 |ΔF/ΔCT| 的最大值")
+        lambda t: max(steps("c", t), key=abs) if steps("c", t) else None,
+        fml=lambda t, R: f_signed_absmax(srng("c", t)) if srng("c", t) else None,
+        rid="step_max",
+        note="相邻两个码的频率差里最大的那一档，带符号（Spec 按符号填对应那一边）")
 
     # ---- 温漂 ----
     ref_t = min(temps, key=lambda t: abs(t - ref_temp)) if temps else None
@@ -1012,12 +1015,16 @@ def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
             fml=f_drift, rid="drift",
             note="同一 Vtune 下 F(T) − F(%s℃)，取 |ΔF| 最大的那个点，带符号" % rt)
         add("Temp Drift", "Drift in CT Codes", "code", "≤",
-            lambda t: (abs(drift(t)) / (sum(steps("c", ref_t)) / len(steps("c", ref_t))))
-            if (t != ref_t and drift(t) is not None and steps("c", ref_t)) else None,
-            fml=lambda t, R: '=IF(N(%s)=0,"",ABS(%s)/%s)' % (R("step_avg", ref_t),
-                                                             R("drift", t),
-                                                             R("step_avg", ref_t)),
-            note="|Freq Drift| ÷ CT Band Step 平均（%s℃）" % rt)
+            # 折合几个码是个"要挪多少档"的量，只看大小 → 分子分母都取绝对值。
+            # ★ step_avg 现在带符号（CT 扫多半是负斜率），分母不套 ABS 会出负码数。
+            lambda t: (abs(drift(t))
+                       / abs(sum(steps("c", ref_t)) / len(steps("c", ref_t))))
+            if (t != ref_t and drift(t) is not None and steps("c", ref_t)
+                and abs(sum(steps("c", ref_t))) > 1e-12) else None,
+            fml=lambda t, R: '=IF(N(%s)=0,"",ABS(%s)/ABS(%s))' % (R("step_avg", ref_t),
+                                                                  R("drift", t),
+                                                                  R("step_avg", ref_t)),
+            note="|Freq Drift| ÷ |CT Band Step 平均|（%s℃）" % rt)
 
     # ---- 压控增益 ----
     # ★ 先摆两个**实测端点**：CT 码钉住不动，Vtune 扫到最低 / 最高时的频率。

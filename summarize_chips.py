@@ -1971,7 +1971,7 @@ VCO_TITLE = {"v": "频率 vs Vtune", "k": "Kvco vs Vtune", "c": "频率 vs CT �
 VCO_XLABEL = {"v": "Vtune (V)", "k": "Vtune (V)", "c": "CT code", "d": "CT code"}
 VCO_YHEAD = {"v": "F", "k": "Kvco", "c": "F", "d": "δf"}
 VCO_YAXIS = {"v": "F (MHz)", "k": "Kvco (MHz/V)", "c": "F (MHz)",
-             "d": "|δf| (MHz/code)"}
+             "d": "δf (MHz/code)"}
 # 四张图都给**全图最低/最高两点**打数值标注。值图（F-vs-Vtune / F-vs-CT）的曲线
 # 是单调的，全图最低/最高点正好落在两个端点上，要的就是它们；
 # 斜率图上则是最平和最陡的那两个区间。
@@ -2001,8 +2001,10 @@ def _vco_series(sw, temps):
             elif kind == "ct":
                 fc[g.temp] = pts
                 if g.temp not in coarse:
-                    fd[g.temp] = [(sl[0], abs(sl[1]))
-                                  for sl in slopes(g, sw.freq_item)]
+                    # ★ 带符号，别取绝对值（用户 2026-08-24）。CT 码加大频率往哪
+                    #   走是这张图要回答的问题本身；子带里往上爬、翻档时往下掉，
+                    #   取了绝对值那个负跳变会被翻成正的尖峰，方向全丢了。
+                    fd[g.temp] = [(sl[0], sl[1]) for sl in slopes(g, sw.freq_item)]
     return fv, kv, fc, fd
 
 
