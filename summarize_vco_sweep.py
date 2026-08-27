@@ -765,6 +765,23 @@ def _at(ser, x0):
     return ser[x], x
 
 
+def blank_temp_warns(sw):
+    """「这个温度整段没有数」的告警句。单簿脚本和跨芯片脚本共用一份措辞。
+
+    放这儿而不是各写各的：这句话要说清三件事——多少行、为什么不是脚本筛的、
+    去哪儿确认。抄两份必然漂移。
+    """
+    out = []
+    for t in sorted(getattr(sw, "blank_temps", None) or {}):
+        out.append("⚠⚠ %s℃ 的 %d 行扫描行**整行一个测量值都没有**，这个温度整段"
+                   "没进表（结论页那一列会是空的、图上也没有这条线）。这不是脚本"
+                   "筛掉的——那些行的 Mode / Test Item 都对，就是格子里没数。"
+                   "多半是这一趟没测到这个温度、或者数据没回填进簿子；"
+                   "打开原表翻到那几行确认一下"
+                   % (fmt_num(t), sw.blank_temps[t]))
+    return out
+
+
 def build_conclusion(by_kind, items, freq_item, ref_temp, fvco, fvco_ref, LAY,
                      op_vtune=None):
     """把两种扫描合起来，推出真能下判断的几行。
@@ -2107,15 +2124,28 @@ def load_vco(path, sheet=None, header_row=1, mode_col="Mode",
     extra += [(r, "其他模式") for r in others if any(v is not None for v in r.vals.values())]
     extra.sort(key=lambda x: x[0].xl)
 
-    keep = []
+    keep, void = [], []
     for r in rows:
         if all(v is None for v in r.vals.values()):
             excluded.append((r.xl, "所有结果列都是空的（配置/开关行，不是测量点）"))
+            void.append(r)
         else:
             keep.append(r)
     rows = keep
     if not rows:
         raise VcoError("过滤完没有测量点了，检查 --sweep-mode / --keep-test-item")
+
+    # ★★ 整个温度段一行数都没有：这不是"页脚/配置行"，是**这个温度根本没测**
+    #   （或者数据没回填进簿子）。不喊出来的话它只表现为「排除 310 行」这个
+    #   大一点的数字，和结论页上安静空着的两列——2026-08-26 就是这么漏过去的：
+    #   六颗芯片横着比才发现某片的 GNSS VCO 只剩 −40℃ 一列。
+    #   判据要的是"这个温度**一行都没留下**"，不是"这个温度有空行"：
+    #   每一段温度前面本来就有配置/开关行，那是正常的。
+    _kept_t = {r.temp for r in rows}
+    blank_temps = {}
+    for r in void:
+        if r.temp is not None and r.temp not in _kept_t:
+            blank_temps[r.temp] = blank_temps.get(r.temp, 0) + 1
 
     groups = segment(rows)
     # 横轴值大面积重复 = 组里还藏着另一个在动的变量（最常见：CT 列没识别出来，
@@ -2314,6 +2344,9 @@ def main():
     if extra:
         print("扫描序列之外带测量值的 %d 行（列在「闭环锁定点」页）: %s"
               % (len(extra), ", ".join("%d/%s" % (r.xl, k) for r, k in extra[:12])))
+    # ★ 摆在「排除 N 行」前面：那个大数字的成因就是这个，先说结论再列明细
+    for _w in blank_temp_warns(sw):
+        print("  %s" % _w)
     if excluded:
         print("排除 %d 行:" % len(excluded))
         for xl, why in excluded:

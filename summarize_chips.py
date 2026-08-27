@@ -48,7 +48,7 @@ import time
 from collections import Counter, OrderedDict
 
 from spec_book import SpecBook
-from summarize_vco_sweep import load_vco
+from summarize_vco_sweep import blank_temp_warns, load_vco
 from sweep_lib import (
     parse_spur_targets,
     COLOR_FLAG, COLOR_MUTED, COLOR_PASS, FILL_FAIL, FILL_PASS,
@@ -3400,6 +3400,9 @@ def main():
             if coarse:
                 pend.append(f"· CT 粗码温度 {[fmt_num(t) for t in sorted(coarse)]}"
                             f"（只测几个码）")
+            # ★ 整段没数的温度：跟「Vtune 扫没动」一样是"这个温度的数据不可用"，
+            #   走同一条 ⚠⚠ 通道，就打在这颗芯片那一行下面
+            warn += blank_temp_warns(sw)
             for t, sp, med in flat_vtune_temps(sw):
                 warn.append(f"⚠⚠ {fmt_num(t)}℃ 的 Vtune 扫**频率几乎没动**："
                             f"全程只变了 {fmt_num(sp, 4)} MHz，其他温度是 "
