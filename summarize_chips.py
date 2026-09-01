@@ -1620,8 +1620,12 @@ VCO_NOTE_SET = {
 VCO_DROP_PREFIX = ("IPN",)
 
 
-def vco_rows(sw, ref_temp, op_vtune):
-    """一颗芯片一个模块的结论行 -> [(cat, item, unit, dir, kind, {温度: 值})]"""
+def vco_rows(sw, ref_temp, op_vtune, vtunes=None):
+    """一颗芯片一个模块的结论行 -> ([行…], 温度, 告警)
+
+    `vtunes` 给了就按**点名的那几个 Vtune** 各出一条温漂（见 _drift_rows）；
+    不给则退回老口径：从 CT 扫钉住的那个电压推一个工作点。
+    """
     from summarize_vco_sweep import build_conclusion
     rows, temps = build_conclusion(sw.by_kind, sw.items, sw.freq_item, ref_temp,
                                    sw.fvco, sw.fvco_ref, {}, op_vtune)
@@ -1639,8 +1643,11 @@ def vco_rows(sw, ref_temp, op_vtune):
         out.append({"cat": d["cat"], "item": d["item"], "unit": d["unit"],
                     "dir": VCO_LIMIT_FIX.get(d["item"], d["dir"]),
                     "kind": d["kind"], "vals": vals, "note": note})
-    out = _drift_at_op(out, ref_temp)
-    return out, temps
+    if vtunes:
+        out, warns = _drift_at_vtunes(out, sw, ref_temp, vtunes)
+    else:
+        out, warns = _drift_at_op(out, ref_temp), []
+    return out, temps, warns
 
 
 def _drift_at_op(out, ref_temp):
@@ -1668,6 +1675,86 @@ def _drift_at_op(out, ref_temp):
                    vals={t: fr["vals"][t] - base for t in ts if t != ref},
                    note=f"@工作点 那一行的 Freq：F(T) − F({fmt_num(ref)}℃)")
     return out
+
+
+def _freq_at_vtune(sw, v):
+    """{温度: (实际取到的 Vtune, 该点频率, 该温度扫描的相邻步长)}。
+
+    ★ 取的是**离 v 最近的那一个扫描点**——Vtune 扫是离散的，点名 0.1V 未必正好扫到。
+      所以把「实际取到多少」一并带出来：near_x 本身没有容差，不带出来就是静默取别的值。
+    ★ 同一温度有多组扫描时只认第一组，跟 build_conclusion 的 `setdefault` 一致
+      （两处口径必须一样，否则温漂和性能行会取自不同的扫描）。
+    """
+    from summarize_vco_sweep import group_series
+    out = {}
+    if sw.freq_item is None:
+        return out
+    for kind, groups in sw.by_kind:
+        if kind != "vtune":
+            continue
+        for g in groups:
+            if g.temp is None or g.temp in out:
+                continue
+            ser = group_series(g, sw.freq_item)
+            if not ser:
+                continue
+            xs = sorted(ser)
+            x = min(xs, key=lambda z: abs(z - v))
+            step = median([b - a for a, b in zip(xs, xs[1:])]) if len(xs) > 1 else None
+            out[g.temp] = (x, ser[x], step)
+    return out
+
+
+def _drift_at_vtunes(out, sw, ref_temp, vtunes):
+    """点名的每个 Vtune 各出一条温漂。返回 (行, 告警)。
+
+    ★ 为什么要点名：原来的工作点是从 CT 扫钉住的那个电压**推**出来的，
+      表上没人说得清"看的是哪个 Vtune"，而且每个温度各自找最近点，
+      三个温度可能落在三个不同的电压上——那样算出来的"温漂"里混着 ΔVtune×Kvco。
+      点名之后每一条都写明电压，而且下面这两条告警把"没扫到"和"三温不同点"喊出来。
+    """
+    di = next((k for k, x in enumerate(out)
+               if x["item"].startswith("Freq Drift")), None)
+    rows, warns = [], []
+    for v in vtunes:
+        fa = _freq_at_vtune(sw, v)
+        if not fa:
+            warns.append(f"⚠ Vtune={fmt_num(v)}V：这份簿子没有能用的 Vtune 扫，温漂出不来")
+            continue
+        ts = sorted(fa)
+        ref = min(ts, key=lambda t: abs(t - ref_temp))
+        tag = f"@ Vtune {fmt_num(v)}V"
+        rows.append({"cat": "Temp Drift", "item": f"Freq {tag}", "unit": "MHz",
+                     "dir": "", "kind": "cond",
+                     "vals": {t: fa[t][1] for t in ts},
+                     "note": f"Vtune 扫里离 {fmt_num(v)}V 最近的那一点的频率"})
+        rows.append({"cat": "Temp Drift",
+                     "item": f"Freq Drift vs {fmt_num(ref)}℃ {tag}", "unit": "MHz",
+                     "dir": "≤", "kind": "result",
+                     "vals": {t: fa[t][1] - fa[ref][1] for t in ts if t != ref},
+                     "note": f"F(T) − F({fmt_num(ref)}℃)，两项都在上面「Freq {tag}」那一行"})
+        # ★ 告警一：点名的电压根本没扫到。判据用**半个步长**，不写死阈值——
+        #   落在两个采样点之间（≤半步）是正常的离散化，超过半步就是这条扫描没覆盖它。
+        far = [(t, fa[t][0], fa[t][2]) for t in ts
+               if fa[t][2] and abs(fa[t][0] - v) > fa[t][2] / 2.0]
+        if far:
+            warns.append(
+                "⚠ Vtune=%sV 没扫到：%s——扫描步长约 %s V，取到的点离点名值超过半步，"
+                "这一条温漂看的不是你要的那个电压"
+                % (fmt_num(v),
+                   "／".join(f"{fmt_num(t)}℃ 实际取 {fmt_num(x, 4)}V" for t, x, _s in far),
+                   fmt_num(median([s for _t, _x, s in far]), 4)))
+        # ★ 告警二：三个温度落在不同的电压上 → 温漂里混进了 ΔVtune×Kvco
+        xs = {fa[t][0] for t in ts}
+        if len(xs) > 1:
+            warns.append(
+                "⚠ Vtune=%sV 三个温度取到的不是同一个点（%s）——这条温漂里混着"
+                " ΔVtune×Kvco，不是纯温度效应"
+                % (fmt_num(v),
+                   "／".join(f"{fmt_num(t)}℃ {fmt_num(fa[t][0], 4)}V" for t in ts)))
+    if di is None:
+        return out + rows, warns
+    return out[:di] + rows + out[di + 1:], warns
 
 
 def flat_vtune_temps(sw, ratio=0.1):
@@ -1712,6 +1799,25 @@ def coarse_temps(sw):
                 continue
             if min(b - a for a, b in zip(xs, xs[1:])) > 1:
                 out.add(g.temp)
+    return out
+
+
+def parse_vtunes(spec):
+    """`0.1,0.4,0.7` -> [0.1, 0.4, 0.7]。给一个数也行。空/None 返回 []。"""
+    if spec is None or spec == "":
+        return []
+    if isinstance(spec, (int, float)):
+        return [float(spec)]
+    if isinstance(spec, (list, tuple)):
+        raw = list(spec)
+    else:
+        raw = [x for x in str(spec).replace("，", ",").split(",") if x.strip()]
+    out = []
+    for x in raw:
+        try:
+            out.append(float(x))
+        except (TypeError, ValueError):
+            sys.exit(f"--op-vtune 里这一段不是数：{x!r}（写法 0.1,0.4,0.7）")
     return out
 
 
@@ -3059,7 +3165,9 @@ def main():
     ap.add_argument("--config", default=None,
                     help=f"配置文件（默认自动找 <根目录>/{CONFIG_NAME}）。"
                          "里面可以放 scale / groups / modules / chips / "
-                         "op_vtune / ref_temp / spur_tol，命令行给了就以命令行为准。"
+                         "ref_temp / spur_tol，命令行给了就以命令行为准；"
+                         "drift_vtune（温漂看哪几个 Vtune）和 op_vtune（性能块"
+                         "钉在哪个 Vtune）只在配置里写。"
                          "★含真实模块名，跟数据放一起，别提交")
     ap.add_argument("--spec", default=None,
                     help="Spec / 仿真 / Limit 那七列的来源 JSON（spec_from_xlsx.py "
@@ -3091,8 +3199,6 @@ def main():
                     help="不做 VCO 两页（只出 PLL 温扫那两页）")
     ap.add_argument("--ref-temp", type=float, default=None,
                     help="VCO 温漂的参考温度（默认 25）")
-    ap.add_argument("--op-vtune", type=float, default=None,
-                    help="VCO 工作点调谐电压 V（默认取 CT 扫钉住的那个值）")
     ap.add_argument("--no-audit", action="store_true", help="连隐藏的 _审计 页都不要")
     ap.add_argument("--dry-run", action="store_true", help="只清点和核对识别结果")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -3126,7 +3232,18 @@ def main():
     # 命令行给的是一张清单（所有模块通用）；配置里可以按模块分开写
     spur_cfg = [x.strip() for x in args.spur_add.replace("，", ",").split(",")
                 if x.strip()] or cfg.get("spur_targets") or []
-    op_vtune_cfg = pick_opt(args.op_vtune, "op_vtune")
+    # ★★ 两个 Vtune 是**两件事**，键分开：
+    #   drift_vtune  = 温漂看哪几个电压（可以给多个，各出一条）
+    #   op_vtune     = 性能块（Power / SpotPN 那一组）钉在哪个电压（至多一个）
+    #   合成一个键会出这种事：温漂配了 [0.1,0.4,0.7]，性能块就跟着列表**第一个**
+    #   跑到 0.1V 去了——只因为它排在前面。性能块该待在哪儿跟温漂看几个点无关。
+    # ★ 都只从配置读，不给命令行开关：它们是项目的固定事实，跟 scale / groups 同类。
+    op_vtune_cfg = parse_vtunes(cfg.get("op_vtune"))
+    if len(op_vtune_cfg) > 1:
+        sys.exit(f"配置里 op_vtune 只能给一个电压（性能块的工作点），"
+                 f"现在给了 {len(op_vtune_cfg)} 个：{op_vtune_cfg}。"
+                 f"想让温漂看多个点，用 drift_vtune")
+    drift_vtunes = parse_vtunes(cfg.get("drift_vtune"))
     dsb = bool(pick_opt(args.dsb, "dsb", False))
     chart_w = float(pick_opt(args.chart_w, "chart_w", CHART_W_CM))
 
@@ -3381,8 +3498,9 @@ def main():
             # 工作点用第一颗芯片的（CT 扫钉住的那个 Vtune）统一喂给全部芯片：
             # 否则各片的组名会变成「@ Vtune 0.4V」「@ Vtune 0.45V」，行对不齐
             if op is None:
-                op = op_vtune_cfg if op_vtune_cfg else op_vtune_of(sw)
-            rows, temps = vco_rows(sw, ref_temp, op)
+                op = op_vtune_cfg[0] if op_vtune_cfg else op_vtune_of(sw)
+            rows, temps, dwarn = vco_rows(sw, ref_temp, op, drift_vtunes)
+            warn += dwarn
             fv, kv, fc, fd = _vco_series(sw, temps)
             vrows[chip] = rows
             vdata[chip] = {"v": fv, "k": kv, "c": fc, "d": fd}
@@ -3699,7 +3817,8 @@ def main():
               f"横着容易数不清第几片。加 --slim 每片只显示常温列"
               f"（其余折起来，点 ＋ 就能展开核对）。")
     if args.trace:
-        trace_item(args.trace, tables, vsweeps, sinfo, dsb, op_vtune_cfg, out)
+        trace_item(args.trace, tables, vsweeps, sinfo, dsb,
+                   op_vtune_cfg[0] if op_vtune_cfg else None, out)
     fails, n_agg, n_f = selfcheck(out)
     print(f"  自查: {n_agg} 个汇总格子都能在同一行的格子里找到；"
           f"{n_f} 个判定公式没有留下缓存值"
