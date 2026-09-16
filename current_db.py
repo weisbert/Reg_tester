@@ -626,8 +626,42 @@ def classify_raw(raw, factor_to_ma):
     return out, temp_first
 
 
+def parse_warns(sw, prefix="        "):
+    """实测段里两类**静默错值**的哨兵——措辞**只在这里写一遍**（四个入口共用）。
+
+    ① 没数却被算进了别人头上（`sw.blanks`）
+    ② 有数却整段没被用上（`sw.repeats`）
+
+    ★ 这两条都不是"少了一行"那种一眼能看见的缺失：表上照样是满的，每个数都像模像样，
+      只是**指错了模块**或**来自另一遍测量**。这种错只能由脚本来喊。
+
+    ★★ 2026-09-16 的事故：某个温度下有一步的电流格子是空的，而做差的规则是
+      「上一个**有值**的行减本行」，于是它的电流被静默算进了下一步——下一步
+      从 ~600µA 变成 1322.8µA，空的那步整行从这一列消失。两个数都错，表上没痕迹。
+      现在按数据真正支持的口径合成一步报（与「一步关一组」的多编号 NO. 同语义），
+      并在这里喊一声。**没测到 ≠ 归零，更不是加到隔壁头上。**
+    """
+    out = []
+    for b in sw.blanks:
+        who = "、".join(b["lost"])
+        if b["into"]:
+            out.append(f"{prefix}⚠ 关断步 {who} 的电流格子是空的（第 {b['rows']} 行），"
+                       f"与下一步分不开 -> 合成一步「{b['into']}」报，{b['into']} 这一格"
+                       f"是这几步的合计，不是 {b['into'].split(',')[-1]} 一个模块的电流")
+        else:
+            out.append(f"{prefix}⚠ 关断步 {who} 的电流格子是空的（第 {b['rows']} 行），"
+                       f"后面再没有带值的关断步 -> 这几步这一温度没有数")
+    for rp in sw.repeats:
+        out.append(f"{prefix}⚠⚠ 这一段里还有第 {rp['seq']} 条关断链"
+                   f"（第 {rp['first']}~{rp['last']} 行，{rp['n']} 个带值的关断步），"
+                   f"按「锁定复验段」**整条忽略**了——同一个 (模式,温度) 测了两遍时，"
+                   f"表上出现的永远是第一遍，拿第二遍的原始数据怎么核都对不上")
+    return out
+
+
 def build_groups(rows, config):
-    """从 seq==1 的 OFF 行生成模块组，套用 LDO 归并。返回 (groups, absorbed_notes)。"""
+    """从 seq==1 的 OFF 行生成模块组，套用 LDO 归并。返回 (groups, absorbed_notes, sw)。
+    sw.blanks / sw.repeats 两类哨兵见 parse_warns()。"""
     reparent = {}
     for c, p in (config.get("ldo_reparent") or {}).items():
         try:
@@ -639,14 +673,37 @@ def build_groups(rows, config):
     label_groups = {str(k): (v if isinstance(v, dict) else list(v))
                     for k, v in (config.get("label_groups") or {}).items()}
 
-    steps = []
+    def _name_of(r):
+        return re.sub(r"(?i)^off\s*", "", str(r["label"] or "")).strip()
+
+    sw = types.SimpleNamespace(blanks=[], repeats=[])
+    blanks = sw.blanks
+    steps, pend = [], []
     for r in rows:
-        if r["seq"] != 1 or r["kind"] != "off" or r["delta_ma"] is None:
+        if r["seq"] != 1 or r["kind"] != "off":
             continue
-        ids = parse_ids(r["no_raw"])
-        disp = ",".join(str(i) for i in ids) if ids else str(r["no_raw"]).strip()
-        step_name = re.sub(r"(?i)^off\s*", "", str(r["label"] or "")).strip()
-        note = ""
+        if r["cur_ma"] is None:
+            pend.append(r)      # 格子是空的：攒着，并进下一个有值的步（措辞见 parse_warns）
+            continue
+        if r["delta_ma"] is None:
+            continue
+        merged, pend = pend + [r], []
+        per = [parse_ids(x["no_raw"]) for x in merged]
+        if all(p is not None for p in per):
+            ids = [i for p in per for i in p]
+            disp = ",".join(str(i) for i in ids)
+        else:                    # 空格子那步是个标签（DCO5G 之类）：编号拼不出来，按原样并列
+            ids = None
+            disp = ",".join(str(x["no_raw"]).strip() for x in merged)
+        step_name = "+".join(n for n in (_name_of(x) for x in merged) if n)
+        note = blank_note = ""
+        if len(merged) > 1:
+            blanks.append(dict(lost=[str(x["no_raw"]).strip() for x in merged[:-1]],
+                               rows="、".join(str(x["row_idx"]) for x in merged[:-1]),
+                               into=disp))
+            blank_note = (f"本格是 {len(merged)} 步的合计："
+                          + "、".join(str(x["no_raw"]).strip() for x in merged[:-1])
+                          + " 这几步的电流格子是空的，与本步分不开")
         sim_ids = list(ids) if ids else None
         sim_mode = None  # 该步仿真值来自其他仿真 Mode 时（如 DCO 标签对 CK_ADPLL_*）
         if ids is None:
@@ -662,6 +719,8 @@ def build_groups(rows, config):
                 note = f"标签 {disp} 按 config.label_groups 映射到仿真 ID {sim_ids}"
             else:
                 note = "标签未映射仿真模块（可在 current_config.json 的 label_groups 补充）"
+        if blank_note:   # 标签分支是直接赋值，合计那句必须在它之后拼，否则会被冲掉
+            note = (note + "；" if note else "") + blank_note
         steps.append(dict(row_idx=r["row_idx"], ids=ids, sim_ids=sim_ids, sim_mode=sim_mode,
                           disp=disp, step_name=step_name, delta_ua=r["delta_ma"] * 1000.0,
                           note=note))
@@ -688,7 +747,18 @@ def build_groups(rows, config):
     steps = [s for s in steps if s["row_idx"] not in absorbed]
     for order, s in enumerate(steps, 1):
         s["order"] = order
-    return steps, absorbed
+    if pend:   # 末尾的空格子后面再没有带值的关断步：并无可并，只能报"这几步没数"
+        blanks.append(dict(lost=[str(x["no_raw"]).strip() for x in pend],
+                           rows="、".join(str(x["row_idx"]) for x in pend), into=None))
+    # 第二条及以后的关断链：整条按「锁定复验段」丢掉。丢是对的——同一 (模式,温度) 只能出一个数；
+    # **不吭声不对**。2026-09-16 用户拿高温那段来核，怎么核都差着一整条链的量级。
+    for seq in sorted({r["seq"] for r in rows if r["seq"] >= 2}):
+        off = [r for r in rows
+               if r["seq"] == seq and r["kind"] == "off" and r["cur_ma"] is not None]
+        if off:
+            sw.repeats.append(dict(seq=seq, n=len(off),
+                                   first=off[0]["row_idx"], last=off[-1]["row_idx"]))
+    return steps, absorbed, sw
 
 
 def _run_ts_of(xlsx):
@@ -737,20 +807,21 @@ def _insert_run(conn, src, mode, mode_raw, chip, temp, rows, steps, absorbed, ru
 
 
 def ingest_run(conn, xlsx, mode, chip, config, sheet_name=None):
-    """单模式显式入库（ingest-run 子命令）：整表当一个序列，模式名由调用者给。"""
+    """单模式显式入库（ingest-run 子命令）：整表当一个序列，模式名由调用者给。
+    返回 (run_id, 模块组数, 温度, run_ts, sw)。"""
     wb = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)
     try:
         ws, hdr, cols = find_result_sheet(wb, sheet_name or config.get("result_sheet"))
         if ws is None:
             raise SystemExit(f"[错误] {os.path.basename(xlsx)} 里找不到含 NO./Current 表头的 tab")
         rows, temp = classify_rows(ws, hdr, cols)
-        steps, absorbed = build_groups(rows, config)
+        steps, absorbed, sw = build_groups(rows, config)
         src = os.path.abspath(xlsx)
         run_ts = _run_ts_of(xlsx)
         _delete_runs_of(conn, src, chip)
         run_id = _insert_run(conn, src, mode, mode, chip, temp, rows, steps, absorbed, run_ts)
         conn.commit()
-        return run_id, len(steps), temp, run_ts
+        return run_id, len(steps), temp, run_ts, sw
     finally:
         wb.close()
 
@@ -758,7 +829,7 @@ def ingest_run(conn, xlsx, mode, chip, config, sheet_name=None):
 def ingest_result_file(conn, xlsx, chip, config, sim_modes, folder_mode=None, sheet_name=None):
     """一个 Result 文件 -> 若干 run（全模式单文件按 (模式,温度) 分段；旧单模式文件=1 段，
     模式名取 Init 行 NO.，退无可退才用文件夹名）。
-    返回 [(run_id, mode, mode_raw, how, temp, n_steps)]。"""
+    返回 [(run_id, mode, mode_raw, how, temp, n_steps, sw)]。"""
     wb = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)
     try:
         ws, hdr, cols = find_result_sheet(wb, sheet_name or config.get("result_sheet"))
@@ -786,14 +857,14 @@ def _ingest_raw(conn, raw, factor_to_ma, src, run_ts, chip, config, sim_modes, f
     for s in segs:
         rows, temp0 = classify_raw(s["raw"], factor_to_ma)
         temp = s["temp"] if s.get("temp") is not None else temp0
-        steps, absorbed = build_groups(rows, config)
+        steps, absorbed, sw = build_groups(rows, config)
         if single_legacy:
             mode, _ = resolve_mode(folder_mode, sim_modes, mode_map)
             how = "folder"
         else:
             mode, how = resolve_mode(s["mode"], sim_modes, mode_map, folder=folder_mode)
         run_id = _insert_run(conn, src, mode, s["mode"], chip, temp, rows, steps, absorbed, run_ts)
-        out.append((run_id, mode, s["mode"], how, temp, len(steps)))
+        out.append((run_id, mode, s["mode"], how, temp, len(steps), sw))
     conn.commit()
     return out
 
@@ -2263,9 +2334,11 @@ def cmd_add_chip(args):
     results = ingest_result_file(conn, xlsx, chip, config, sim_modes, folder_mode=folder_mode)
     print(f"[实测] {os.path.basename(xlsx)}  芯片 {chip} -> {len(results)} 个 (模式,温度) 段")
     bad_map = set()
-    for run_id, mode, mode_raw, how, temp, n_steps in results:
+    for run_id, mode, mode_raw, how, temp, n_steps, sw in results:
         print(f"        {mode:<22} run#{run_id}  {n_steps} 个模块组  "
               f"{temp if temp is not None else '?'}°C  {how}")
+        for line in parse_warns(sw):
+            print(line)
         if how in ("none", "ambig"):
             bad_map.add((mode_raw, how))
     if bad_map:
@@ -2476,7 +2549,7 @@ def cmd_build(args):
     excl.append(os.path.basename(out))
     globs = result_globs(config)
     sim_modes = {r[0] for r in conn.execute("SELECT DISTINCT mode FROM sim_current")}
-    n_runs = 0
+    n_runs = n_blank = 0
     mapping = {}  # mode_raw -> (mode, how)
     fallback_chip = args.chip or "C1"
     all_xlsx = list(walk_xlsx(root, skip, excl))
@@ -2496,17 +2569,24 @@ def cmd_build(args):
         rel = os.path.relpath(f, root)
         if len(results) > 1:
             print(f"[实测] {rel}  芯片 {chip}  全模式单文件 -> {len(results)} 个 (模式,温度) 段:")
-        for run_id, mode, mode_raw, how, temp, n_steps in results:
+        for run_id, mode, mode_raw, how, temp, n_steps, sw in results:
             mapping[(mode_raw, mode)] = how
             pre = "        " if len(results) > 1 else f"[实测] {rel}  芯片 {chip}  "
             print(f"{pre}{mode:<22} run#{run_id}  {n_steps} 个模块组  "
                   f"{temp if temp is not None else '?'}°C")
+            for line in parse_warns(sw):
+                print(line)
+                n_blank += 1
     if n_runs == 0:
         print("[警告] 没有扫到任何 Result 文件")
     if dir_chips:
         print(f"[芯片] 按子目录名认出 {len(dir_chips)} 颗: {', '.join(dir_chips)}")
     if n_runs:
         print_chip_roster(conn, "入库后")   # 库里到底有什么，以这行为准
+    if n_blank:
+        # 上面那几句夹在逐段清单里（真实数据是 189 段），几十行滚过去就看不见了——再收一次口
+        print(f"[警告] {n_blank} 处「空格子 / 第二条关断链」哨兵，见上面的 ⚠ ——"
+              f"这两类都是表上看不出来的错值，别跳过")
 
     if mapping:
         print("[模式映射] 实测段标签 -> 仿真 Mode（config.mode_map 可强制指定）:")
@@ -2743,7 +2823,7 @@ def cmd_inspect(args):
         for s in segs:
             rows, temp0 = classify_raw(s["raw"], factor_to_ma)
             temp = s["temp"] if s.get("temp") is not None else temp0
-            steps, _absorbed = build_groups(rows, config)
+            steps, _absorbed, sw = build_groups(rows, config)
             if single_legacy:
                 mode, _how0 = resolve_mode(folder, sim_modes, mode_map)
                 how = "folder"
@@ -2755,6 +2835,16 @@ def cmd_inspect(args):
             print(f"    段 {s['mode']:<22} {arrow} 仿真 {mode:<22} "
                   f"{how_disp.get(how, how):<12} {temp if temp is not None else '?'}°C  "
                   f"{len(steps)} 组")
+            for line in parse_warns(sw):
+                print(line)
+            for b in sw.blanks:
+                problems.append(
+                    f"{s['mode']}@{temp}°C: 关断步 {'、'.join(b['lost'])} 的电流格子是空的"
+                    + (f"，已合进「{b['into']}」" if b["into"] else "，后面没有带值的关断步"))
+            for rp in sw.repeats:
+                problems.append(
+                    f"{s['mode']}@{temp}°C: 还有第 {rp['seq']} 条关断链（第 {rp['first']}~"
+                    f"{rp['last']} 行，{rp['n']} 步）被当成锁定复验整条忽略——表上只有第一遍")
             if how in ("ambig", "none"):
                 problems.append(f"模式 {s['mode']!r} 匹配不到仿真 Mode（{how}）"
                                 f" -> 在 config.mode_map 里指定")
@@ -2837,10 +2927,12 @@ def cmd_ingest_run(args):
     root = os.path.dirname(os.path.abspath(args.db))
     config, _, _ = load_config(root, args.config)
     conn = open_db(args.db)
-    run_id, n_steps, temp, run_ts = ingest_run(conn, args.xlsx, args.mode, args.chip, config,
-                                               sheet_name=args.sheet)
+    run_id, n_steps, temp, run_ts, sw = ingest_run(conn, args.xlsx, args.mode, args.chip,
+                                                   config, sheet_name=args.sheet)
     conn.close()
     print(f"[实测] run#{run_id} mode={args.mode} {n_steps} 个模块组 {temp}°C {run_ts}")
+    for line in parse_warns(sw, prefix="       "):
+        print(line)
 
 
 def cmd_ingest_probe(args):
@@ -2849,9 +2941,11 @@ def cmd_ingest_probe(args):
     conn = open_db(args.db)
     results = ingest_probe_json(conn, args.json, args.chip, config)
     conn.close()
-    for run_id, mode, mode_raw, how, temp, n_steps in results:
+    for run_id, mode, mode_raw, how, temp, n_steps, sw in results:
         print(f"[实测] {mode:<22} (段标签 {mode_raw}, {how})  run#{run_id}  "
               f"{n_steps} 个模块组  {temp if temp is not None else '?'}°C")
+        for line in parse_warns(sw):
+            print(line)
 
 
 def cmd_export(args):
