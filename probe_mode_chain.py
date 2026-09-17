@@ -241,8 +241,15 @@ def scan_book(path, chip_arg):
             unit = str(ws.cell(row=r, column=3).value or "").strip()
             if not name or name.startswith("Σ"):
                 continue
-            thr = 0.2 if unit.lower() == "ma" else 200.0
-            nd = 3 if unit.lower() == "ma" else 1
+            # ★ 相对门限要**分行类**，不能一个 50% 走天下：
+            #   模块行（µA）是单个块的电流，真异常通常是几倍，50% 挡得住噪声；
+            #   条件行（mA）是**整段的总电流**，同样一笔 1.5mA 的异常摊到 5.7mA 的
+            #   总电流上只有 26% —— 用 50% 去卡，等于把"总电流也高了 1.5mA"这条
+            #   旁证整条漏报掉（2026-09-17 就漏了：模块行报了，总电流行一声没吭）。
+            #   八片 −40 锁定电流实测散布只有 ±1.7%，10% 远在噪声之上。
+            ma = unit.lower() == "ma"
+            thr, rel = (0.2, 0.10) if ma else (200.0, 0.50)
+            nd = 3 if ma else 1
             for ti, t in enumerate(temps):
                 vals = {}
                 for gname, c0, _c1 in groups:
@@ -254,7 +261,7 @@ def scan_book(path, chip_arg):
                     continue
                 med = statistics.median(vals.values())
                 dev = tv - med
-                if abs(dev) <= thr or med == 0 or abs(dev) / abs(med) <= 0.5:
+                if abs(dev) <= thr or med == 0 or abs(dev) / abs(med) <= rel:
                     continue
                 n_hit += 1
                 _p(f"   {band_name:<18}{(no or name):<12}@{t:<6}"
