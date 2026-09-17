@@ -35,6 +35,75 @@ def _f(v, n=4):
     return "—" if v is None else f"{v:.{n}f}"
 
 
+# ---------------------------------------------------------------- ①' 两份原始文件逐模式对拍
+
+def collect_all(path, config):
+    """一份原始文件 -> {(canon模式, 温度): dict(mode, init, base, groups)}。
+
+    ★ 要的是**锁前**那一格。簿子的条件行只有「锁定后总电流」和「全关残留电流」，
+      锁前整个丢掉了——而"异常在写完初始寄存器时就已经存在"这件事，只有锁前能告诉你。
+    """
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws, hdr, cols = C.find_result_sheet(wb, config.get("result_sheet"))
+        if ws is None:
+            raise SystemExit(f"[错误] {os.path.basename(path)} 找不到实测表头")
+        raw = C.read_raw_rows(ws, hdr, cols)
+    finally:
+        wb.close()
+    factor = C.UNIT_TO_UA.get(cols["unit"], 1000.0) / 1000.0
+    out = {}
+    for s in C.split_allmode(raw):
+        rows, temp0 = C.classify_raw(s["raw"], factor)
+        temp = s["temp"] if s.get("temp") is not None else temp0
+        steps, _ab, _sw = C.build_groups(rows, config)
+        g1 = [r for r in rows if r["seq"] == 1]
+        ir = next((r for r in g1 if r["kind"] == "init"), None)
+        base = next((r for r in reversed(g1)
+                     if r["kind"] == "lock" and r["cur_ma"] is not None), None)
+        out[(C.canon_mode(s["mode"]), temp)] = dict(
+            mode=s["mode"],
+            init=ir["cur_ma"] if ir else None,
+            base=base["cur_ma"] if base else None,
+            groups={st["disp"]: st["delta_ua"] for st in steps})
+    return out
+
+
+def compare_all_modes(path_a, path_b, config, group):
+    """两份原始文件 **逐模式逐温度** 对拍锁前/锁定后，外加指定那一组的电流。
+
+    一张表回答"这个块是全局 init 就开着，还是只有某些模式开着"——
+    这两种结论要修的地方完全不同，而它只要读两份已经躺在盘上的文件。
+    """
+    A, B = collect_all(path_a, config), collect_all(path_b, config)
+    _p(f"\n== 逐模式对拍   A={os.path.basename(path_a)[:34]}")
+    _p(f"                B={os.path.basename(path_b)[:34]}")
+    _p(f"   {'模式':<20}{'温度':>7}{'A锁前':>9}{'B锁前':>9}{'Δ锁前':>9}"
+       f"{'A锁后':>9}{'B锁后':>9}{'Δ锁后':>9}   {group}: A / B")
+    for k in sorted(set(A) & set(B), key=lambda k: (k[0], k[1] if k[1] is not None else 0)):
+        a, b = A[k], B[k]
+        d_i = (a["init"] - b["init"]) if (a["init"] is not None and b["init"] is not None) else None
+        d_b = (a["base"] - b["base"]) if (a["base"] is not None and b["base"] is not None) else None
+        ga, gb = a["groups"].get(group), b["groups"].get(group)
+        gtxt = ("—" if ga is None else f"{ga:,.1f}") + " / " + ("—" if gb is None else f"{gb:,.1f}")
+        d_g = (ga - gb) if (ga is not None and gb is not None) else None
+        mark = "  ⚠" if (d_i is not None and abs(d_i) > 0.2) \
+            or (d_b is not None and abs(d_b) > 0.2) \
+            or (d_g is not None and abs(d_g) > 200) else ""
+        _p(f"   {a['mode']:<20}{_t(k[1]):>7}{_f(a['init'],3):>9}{_f(b['init'],3):>9}"
+           f"{('—' if d_i is None else f'{d_i:+.3f}'):>9}"
+           f"{_f(a['base'],3):>9}{_f(b['base'],3):>9}"
+           f"{('—' if d_b is None else f'{d_b:+.3f}'):>9}   {gtxt}{mark}")
+    only = (set(A) ^ set(B))
+    if only:
+        _p("   [!] 只有一边有的 (模式,温度): "
+           + "、".join(f"{m}@{t}" for m, t in sorted(only, key=str)))
+
+
+def _t(v):
+    return "?" if v is None else (f"{v:g}℃")
+
+
 # ---------------------------------------------------------------- ① 原始文件
 
 def probe_raw(path, mode_arg, config):
@@ -280,6 +349,10 @@ def main():
                     help="把 --chip 那颗片在**所有模式所有行**上对其余片比一遍，只打异常格")
     ap.add_argument("--chip", default=None, help="汇总簿里要看的那一颗芯片")
     ap.add_argument("--raw", default=None, help="原始 Result/all_mode 文件")
+    ap.add_argument("--raw2", default=None,
+                    help="第二份原始文件：与 --raw **逐模式逐温度**对拍锁前/锁定后")
+    ap.add_argument("--group", default="25,24,23",
+                    help="对拍时额外列出的那一组（默认 25,24,23）")
     ap.add_argument("--book", default=None, help="汇总簿 xlsx")
     ap.add_argument("--config", default=None, help="current_config.json（默认取 --raw 同级往上找）")
     args = ap.parse_args()
@@ -302,9 +375,20 @@ def main():
     else:
         print("[配置] 没找到 current_config.json，用内置默认（ldo_reparent 等可能与出簿不一致）")
 
+    def _fix(q):
+        if q and not os.path.exists(q) and os.path.exists(q + ".xlsx"):
+            q += ".xlsx"
+        if q and not os.path.exists(q):
+            raise SystemExit(f"[错误] 找不到 {q}")
+        return q
+
+    if args.raw and args.raw2:
+        compare_all_modes(_fix(args.raw), _fix(args.raw2), config, args.group)
+        if not args.mode:
+            return
     if args.raw:
         if not args.mode:
-            raise SystemExit("[错误] --raw 要配 --mode")
+            raise SystemExit("[错误] --raw 要配 --mode（或配 --raw2 做逐模式对拍）")
         p = args.raw
         if not os.path.exists(p) and os.path.exists(p + ".xlsx"):
             p += ".xlsx"
