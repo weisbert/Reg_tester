@@ -66,18 +66,23 @@ def probe_raw(path, mode_arg, config):
         _p(f"\n-- {s['mode']} @ {temp}℃   行 {r0}~{r1}")
         for seq in sorted({r["seq"] for r in rows if r["seq"] >= 1}):
             g = [r for r in rows if r["seq"] == seq]
-            init = next((r["row_idx"] for r in g if r["kind"] == "init"), None)
+            ir = next((r for r in g if r["kind"] == "init"), None)
+            init = ir["row_idx"] if ir else None
             lock = [r for r in g if r["kind"] == "lock"]
             off = [r for r in g if r["kind"] == "off"]
             off_v = [r for r in off if r["cur_ma"] is not None]
             base = next((r for r in reversed(lock) if r["cur_ma"] is not None), None)
             end = off_v[-1] if off_v else None
             tag = "  <= 出簿用的就是这一条" if seq == 1 else "  <= 被当成锁定复验，整条不用"
-            _p(f"   seq{seq}: Init行={init}  lock行 {len(lock)} 个"
-               f"  基线={_f(base['cur_ma']) if base else '—'}"
+            # ★ Init（锁定前）那一格要打出来：异常在**锁定前就有**还是**锁定后才有**，
+            #   是"静态偏置问题"和"跟着时钟走的问题"的分水岭，而它一直躺在原始表里没人看
+            _p(f"   seq{seq}: Init行={init} 锁前={_f(ir['cur_ma']) if ir else '—'}"
+               f"  lock {len(lock)} 行: "
+               + "/".join(_f(r["cur_ma"]) for r in lock)
+               + f"  基线={_f(base['cur_ma']) if base else '—'}"
                f"(行{base['row_idx'] if base else '-'})"
                f"  末态={_f(end['cur_ma']) if end else '—'}"
-               f"  OFF行 {len(off)} 个/带值 {len(off_v)} 个{tag}")
+               f"  OFF行 {len(off)}/带值 {len(off_v)}{tag}")
             blank = [r for r in off if r["cur_ma"] is None]
             if blank:
                 _p("           空格子的 OFF 行: "
@@ -115,14 +120,8 @@ def _merged_span(ws, row, col):
     return col, col
 
 
-def probe_book(path, mode_arg, chip_arg):
-    want = C.canon_mode(mode_arg)
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = next((w for w in wb.worksheets if w.sheet_state == "visible"), wb.worksheets[0])
-    _p(f"\n== 汇总簿 {os.path.basename(path)} / 页 {ws.title}"
-       f"  ({ws.max_row}行 × {ws.max_column}列)")
-
-    # 芯片竖条：第 1 行里不是固定表头的那些合并区
+def _book_layout(ws):
+    """(芯片竖条, 温度轴, 模式 band 行) —— probe_book 与 scan_book 共用同一套定位。"""
     groups = []
     for c in range(1, ws.max_column + 1):
         v = ws.cell(row=1, column=c).value
@@ -150,6 +149,29 @@ def probe_book(path, mode_arg, chip_arg):
         c0, c1 = _merged_span(ws, r, 1)
         if c0 == 1 and c1 >= 3:
             bands.append((r, str(v).strip()))
+    return groups, temps, bands
+
+
+def _band_rows(ws, bands, r_band):
+    """band 行的行区 [r_band+1, 下一个 band)。"""
+    return range(r_band + 1, next((r for r, _n in bands if r > r_band), ws.max_row + 1))
+
+
+def _open_book(path):
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = next((w for w in wb.worksheets if w.sheet_state == "visible"), wb.worksheets[0])
+    _p(f"\n== 汇总簿 {os.path.basename(path)} / 页 {ws.title}"
+       f"  ({ws.max_row}行 × {ws.max_column}列)")
+    return ws
+
+
+def probe_book(path, mode_arg, chip_arg):
+    want = C.canon_mode(mode_arg)
+    ws = _open_book(path)
+    lay = _book_layout(ws)
+    if lay is None:
+        return
+    groups, temps, bands = lay
     hit = [(r, n) for r, n in bands if C.canon_mode(n) == want]
     if not hit:
         _p(f"   [!] 找不到模式 {mode_arg}；A 列出现过的 band: "
@@ -192,11 +214,63 @@ def probe_book(path, mode_arg, chip_arg):
         _p(line)
 
 
+def scan_book(path, chip_arg):
+    """把这一颗片和其余片**逐格**比一遍，只打"和别人不一样"的格子。
+
+    ★ 簿子里本来就有「片间极差」两列，但出簿时自己说了"未设标色判据"——所以这个信息
+      一直躺在那儿没人看得见。这里先用一个临时判据把它翻出来（双阈值，跟仿测偏差
+      那套一个路子：光看百分比会把小电流模块放大成假红）：
+          |偏离其余片中位数| > 200µA（mA 行 0.2mA）  **且**  偏离 > ±50%
+      判据定了再挪进出簿脚本，别急着写死。
+    """
+    import statistics
+    ws = _open_book(path)
+    lay = _book_layout(ws)
+    if lay is None:
+        return
+    groups, temps, bands = lay
+    if not any(g[0] == chip_arg for g in groups):
+        _p(f"   [!] 簿子里没有芯片 {chip_arg}")
+        return
+    _p(f"\n   —— {chip_arg} 逐格对其余 {len(groups) - 1} 片（只打异常）——")
+    n_hit = 0
+    for r_band, band_name in bands:
+        for r in _band_rows(ws, bands, r_band):
+            no = str(ws.cell(row=r, column=1).value or "").strip()
+            name = str(ws.cell(row=r, column=2).value or "").strip()
+            unit = str(ws.cell(row=r, column=3).value or "").strip()
+            if not name or name.startswith("Σ"):
+                continue
+            thr = 0.2 if unit.lower() == "ma" else 200.0
+            nd = 3 if unit.lower() == "ma" else 1
+            for ti, t in enumerate(temps):
+                vals = {}
+                for gname, c0, _c1 in groups:
+                    v = ws.cell(row=r, column=c0 + ti).value
+                    if isinstance(v, (int, float)):
+                        vals[gname] = float(v)
+                tv = vals.pop(chip_arg, None)
+                if tv is None or len(vals) < 3:
+                    continue
+                med = statistics.median(vals.values())
+                dev = tv - med
+                if abs(dev) <= thr or med == 0 or abs(dev) / abs(med) <= 0.5:
+                    continue
+                n_hit += 1
+                _p(f"   {band_name:<18}{(no or name):<12}@{t:<6}"
+                   f"{chip_arg}={tv:,.{nd}f}  其余{len(vals)}片中位={med:,.{nd}f}"
+                   f"  {dev:+,.{nd}f}{unit} (×{tv / med:.1f})")
+    if not n_hit:
+        _p("   （没有一格越过判据）")
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="只读探针：一个模式的关断链，原始 vs 汇总簿")
-    ap.add_argument("--mode", required=True, help="模式名（段标签或仿真 Mode 写法都行）")
+    ap.add_argument("--mode", default=None, help="模式名（段标签或仿真 Mode 写法都行）；--scan 时可省")
+    ap.add_argument("--scan", action="store_true",
+                    help="把 --chip 那颗片在**所有模式所有行**上对其余片比一遍，只打异常格")
     ap.add_argument("--chip", default=None, help="汇总簿里要看的那一颗芯片")
     ap.add_argument("--raw", default=None, help="原始 Result/all_mode 文件")
     ap.add_argument("--book", default=None, help="汇总簿 xlsx")
@@ -222,6 +296,8 @@ def main():
         print("[配置] 没找到 current_config.json，用内置默认（ldo_reparent 等可能与出簿不一致）")
 
     if args.raw:
+        if not args.mode:
+            raise SystemExit("[错误] --raw 要配 --mode")
         p = args.raw
         if not os.path.exists(p) and os.path.exists(p + ".xlsx"):
             p += ".xlsx"
@@ -231,7 +307,14 @@ def main():
     if args.book:
         if not os.path.exists(args.book):
             raise SystemExit(f"[错误] 找不到 {args.book}")
-        probe_book(args.book, args.mode, args.chip or "")
+        if args.scan:
+            if not args.chip:
+                raise SystemExit("[错误] --scan 要配 --chip")
+            scan_book(args.book, args.chip)
+        else:
+            if not args.mode:
+                raise SystemExit("[错误] --book 不带 --scan 时要配 --mode")
+            probe_book(args.book, args.mode, args.chip or "")
     if not args.raw and not args.book:
         raise SystemExit("[错误] --raw / --book 至少给一个")
 
